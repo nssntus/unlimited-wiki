@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Wiki · 关键词解释</title>
+<style>
+:root {
+  --bg: #fdfbf7;
+  --surface: #ffffff;
+  --sidebar: #f5f1ea;
+  --text: #2d2d3f;
+  --muted: #8a8796;
+  --secondary: #5a5a6e;
+  --accent: #e07b39;
+  --accent-soft: #fef7f0;
+  --ok: #5b8c5a;
+  --ok-soft: #eef7ed;
+  --border: #e8e4dd;
+  --shadow: 0 1px 3px rgba(0,0,0,.04);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  font-family: "PingFang SC", "Noto Sans SC", "Hiragino Sans GB", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.75;
+}
+#app { display: flex; min-height: 100%; }
+.sidebar {
+  width: 280px;
+  flex-shrink: 0;
+  background: var(--sidebar);
+  border-right: 1px solid var(--border);
+  padding: 1.4rem 1.1rem 2rem;
+  overflow-y: auto;
+}
+.sidebar h1 { font-size: 1.05rem; margin: 0 0 .2rem; }
+.sidebar .sub { font-size: .75rem; color: var(--muted); margin-bottom: .75rem; }
+.nav-filter {
+  width: 100%;
+  margin-bottom: .6rem;
+  padding: .4rem .55rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+  font: inherit;
+  font-size: .8rem;
+  color: var(--text);
+}
+.nav-filter:focus { outline: none; border-color: var(--accent); }
+.topic { font-size: .68rem; letter-spacing: .06em; color: var(--muted); margin: 1rem 0 .15rem; font-weight: 700; }
+.topic-blurb { font-size: .68rem; color: var(--muted); margin: 0 0 .35rem; line-height: 1.4; }
+.nav-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  color: var(--secondary);
+  font: inherit;
+  font-size: .88rem;
+  padding: .35rem .5rem;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.nav-item:hover { background: #fff; color: var(--text); }
+.nav-item.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.main { flex: 1; padding: 2rem 2.2rem 4rem; max-width: 860px; }
+.legend { font-size: .8rem; color: var(--secondary); margin: 0 0 1.2rem; }
+.kw {
+  cursor: pointer;
+  border-radius: 3px;
+  padding: 0 .12em;
+}
+.kw.has-page {
+  color: var(--ok);
+  background: var(--ok-soft);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.kw.missing {
+  color: var(--accent);
+  background: var(--accent-soft);
+  text-decoration: underline dashed;
+  text-underline-offset: 3px;
+}
+.crumbs { display: flex; flex-wrap: wrap; gap: .4rem; margin: 0 0 .8rem; }
+.chip {
+  display: inline-block;
+  font-size: .72rem;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-soft);
+  padding: .15rem .55rem;
+  border-radius: 99px;
+}
+.article h1 { font-size: 1.7rem; margin: 0 0 .6rem; }
+.article h2 { font-size: 1.2rem; margin: 1.6rem 0 .5rem; }
+.article h3 { font-size: 1.02rem; margin: 1.2rem 0 .4rem; }
+.article p { color: var(--secondary); }
+.article blockquote {
+  margin: 1rem 0;
+  padding: .6rem .9rem;
+  background: var(--accent-soft);
+  border-left: 3px solid var(--accent);
+  color: var(--text);
+}
+.article table { border-collapse: collapse; width: 100%; font-size: .88rem; }
+.article th, .article td { border-bottom: 1px solid var(--border); padding: .4rem .55rem; text-align: left; }
+.article a { color: var(--accent); }
+.toast {
+  position: fixed;
+  inset: 0;
+  background: rgba(45,45,63,.28);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+}
+.toast.open { display: flex; }
+.card {
+  width: min(420px, 92vw);
+  background: var(--surface);
+  border-radius: 12px;
+  padding: 1.2rem 1.3rem 1rem;
+  box-shadow: var(--shadow);
+}
+.card h3 { margin: 0 0 .4rem; font-size: 1.05rem; }
+.card p { margin: 0 0 1rem; color: var(--secondary); font-size: .9rem; }
+.row { display: flex; gap: .5rem; justify-content: flex-end; }
+button.btn {
+  border: 0;
+  border-radius: 6px;
+  padding: .4rem .85rem;
+  font: inherit;
+  font-size: .85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.btn-ghost { background: transparent; color: var(--secondary); }
+.btn-primary { background: var(--accent); color: #fff; }
+.status { font-size: .72rem; color: var(--muted); margin-top: 1.2rem; }
+.empty { color: var(--muted); padding: 2rem 0; }
+.meta-bar { display: flex; flex-wrap: wrap; gap: .45rem; align-items: center; margin: 0 0 1rem; }
+.meta-bar select, .meta-bar button { font: inherit; font-size: .78rem; }
+.meta-bar select { border: 1px solid var(--border); border-radius: 6px; padding: .25rem .4rem; background: #fff; }
+.backlinks, .todo-box { margin-top: 1.4rem; padding: .9rem 1rem; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
+.backlinks h3, .todo-box h3 { margin: 0 0 .45rem; font-size: .82rem; color: var(--muted); letter-spacing: .06em; }
+.backlinks a, .todo-box button { display: block; text-align: left; }
+.chip.draft { color: #8a5a2b; background: #fff4e5; }
+.chip.ok { color: var(--ok); background: var(--ok-soft); }
+@media (max-width: 800px) {
+  #app { flex-direction: column; }
+  .sidebar { width: 100%; max-height: 34vh; }
+  .main { padding: 1.2rem 1rem 3rem; }
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <aside class="sidebar">
+    <h1>知识库</h1>
+    <div class="sub">按分类浏览 · 点击虚线词生成解释</div>
+    <input class="nav-filter" id="navFilter" type="search" placeholder="筛选条目…">
+    <nav id="nav"></nav>
+    <div class="todo-box" id="todoBox" hidden></div>
+    <div class="todo-box" id="lintBox" hidden></div>
+    <div class="status" id="status"></div>
+  </aside>
+  <main class="main">
+    <p class="legend">实线绿词 = 已有词条 · 橙色虚线 = 多次提到但尚未成页 · 页顶可改分类和状态 · Raw 打开原文</p>
+    <article class="article" id="article"><p class="empty">从左侧选一篇开始读。</p></article>
+    <div class="backlinks" id="backlinks" hidden></div>
+  </main>
+</div>
+<div class="toast" id="toast">
+  <div class="card">
+    <h3 id="toastTitle">生成解释页</h3>
+    <p id="toastBody"></p>
+    <div class="row">
+      <button class="btn btn-ghost" id="cancelBtn" type="button">取消</button>
+      <button class="btn btn-primary" id="okBtn" type="button">生成</button>
+    </div>
+  </div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script>
+const articleEl = document.getElementById("article");
+const navEl = document.getElementById("nav");
+const statusEl = document.getElementById("status");
+const toast = document.getElementById("toast");
+const toastTitle = document.getElementById("toastTitle");
+const toastBody = document.getElementById("toastBody");
+let keywords = [];
+let allArticles = [];
+let categories = [];
+let currentPath = "";
+let pending = null;
+let currentPage = null;
+
+function escapeRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function api(url, opts) {
+  const res = await fetch(url, opts);
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+function groupArticles(items) {
+  const map = new Map();
+  for (const item of items) {
+    const key = item.category || item.topic;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(item);
+  }
+  return map;
+}
+
+function renderLint(items) {
+  const box = document.getElementById("lintBox");
+  if (!items.length) {
+    box.hidden = true;
+    box.innerHTML = "";
+    return;
+  }
+  box.hidden = false;
+  const counts = {};
+  items.forEach((row) => { counts[row.kind] = (counts[row.kind] || 0) + 1; });
+  box.innerHTML = "<h3>健康检查</h3>";
+  const p = document.createElement("div");
+  p.className = "topic-blurb";
+  p.textContent = Object.entries(counts).map(([k, v]) => `${k} ${v}`).join(" · ");
+  box.appendChild(p);
+}
+
+function renderTodo(items) {
+  const box = document.getElementById("todoBox");
+  if (!items.length) {
+    box.hidden = true;
+    box.innerHTML = "";
+    return;
+  }
+  box.hidden = false;
+  box.innerHTML = "<h3>待写词条</h3>";
+  items.slice(0, 8).forEach((row) => {
+    const btn = document.createElement("button");
+    btn.className = "nav-item";
+    btn.textContent = `${row.term}（${row.mentions}）`;
+    btn.onclick = () => {
+      pending = { keyword: row.term, from_path: currentPath, heading: "", passage: "" };
+      toastTitle.textContent = "生成解释页";
+      toastBody.textContent = `「${row.term}」被提到 ${row.mentions} 次，还没有词条。现在生成？`;
+      document.getElementById("okBtn").disabled = false;
+      toast.classList.add("open");
+    };
+    box.appendChild(btn);
+  });
+}
+
+function renderNav(items) {
+  const q = (document.getElementById("navFilter").value || "").trim().toLowerCase();
+  const filtered = q
+    ? items.filter((item) => (item.title + " " + (item.category_label || "")).toLowerCase().includes(q))
+    : items;
+  navEl.innerHTML = "";
+  if (!filtered.length) {
+    const empty = document.createElement("div");
+    empty.className = "topic-blurb";
+    empty.textContent = "没有匹配的条目";
+    navEl.appendChild(empty);
+    return;
+  }
+  for (const [, list] of groupArticles(filtered)) {
+    const h = document.createElement("div");
+    h.className = "topic";
+    h.textContent = list[0].category_label || list[0].topic;
+    navEl.appendChild(h);
+    const blurb = document.createElement("div");
+    blurb.className = "topic-blurb";
+    blurb.textContent = list[0].category_blurb || "";
+    if (blurb.textContent) navEl.appendChild(blurb);
+    for (const item of list) {
+      const btn = document.createElement("button");
+      btn.className = "nav-item" + (item.path === currentPath ? " active" : "");
+      const mark = item.completeness && item.completeness !== "词条" ? ` · ${item.completeness}` : "";
+      btn.textContent = item.title + mark;
+      btn.onclick = () => openArticle(item.path);
+      navEl.appendChild(btn);
+    }
+  }
+}
+
+function resolveWikiPath(fromRel, href) {
+  const base = fromRel.split("/").slice(0, -1);
+  for (const part of href.split("/")) {
+    if (part === "..") base.pop();
+    else if (part && part !== ".") base.push(part);
+  }
+  return base.join("/");
+}
+
+function bindWikiLinks(root) {
+  root.querySelectorAll("a[href]").forEach((a) => {
+    const href = a.getAttribute("href") || "";
+    if (/^(https?:|mailto:|#)/i.test(href)) return;
+    a.addEventListener("click", (event) => {
+      event.preventDefault();
+      const resolved = resolveWikiPath(currentPath, href);
+      if (resolved === "raw" || resolved.startsWith("raw/")) {
+        openRaw(resolved);
+        return;
+      }
+      openArticle(resolved);
+    });
+  });
+}
+
+function renderMarkdown(md) {
+  if (window.marked) return marked.parse(md);
+  return md
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/^### (.+)$/gm, "<h3>$1</h3>")
+    .replace(/^## (.+)$/gm, "<h2>$1</h2>")
+    .replace(/^# (.+)$/gm, "<h1>$1</h1>")
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>')
+    .replace(/\n\n/g, "</p><p>")
+    .replace(/^/, "<p>")
+    .replace(/$/, "</p>");
+}
+
+function wrapKeywords(root) {
+  const terms = keywords
+    .flatMap((k) => [k.term, k.title, ...(k.aliases || [])].filter(Boolean).map((term) => ({
+      term,
+      path: k.path,
+      title: k.title,
+    })))
+    .sort((a, b) => b.term.length - a.term.length);
+  if (!terms.length) return;
+  const pattern = new RegExp(terms.map((t) => escapeRe(t.term)).join("|"), "g");
+  const lookup = new Map(terms.map((t) => [t.term.toLowerCase(), t]));
+  const skip = new Set(["A", "SCRIPT", "CODE", "PRE", "BUTTON"]);
+
+  const walk = (node) => {
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      if (skip.has(node.tagName) || node.classList.contains("kw")) return;
+      [...node.childNodes].forEach(walk);
+      return;
+    }
+    if (node.nodeType !== Node.TEXT_NODE) return;
+    const text = node.nodeValue;
+    pattern.lastIndex = 0;
+    if (!text || !pattern.test(text)) return;
+    pattern.lastIndex = 0;
+    const frag = document.createDocumentFragment();
+    let last = 0;
+    text.replace(pattern, (match, offset) => {
+      if (offset > last) frag.appendChild(document.createTextNode(text.slice(last, offset)));
+      const hit = lookup.get(match.toLowerCase());
+      const span = document.createElement("span");
+      const isSelf = hit && hit.path && hit.path === currentPath;
+      span.className = "kw " + (hit && hit.path ? "has-page" : "missing");
+      span.textContent = match;
+      if (!isSelf) {
+        span.dataset.term = match;
+        if (hit && hit.path) span.dataset.path = hit.path;
+      } else {
+        span.className = "";
+      }
+      frag.appendChild(span);
+      last = offset + match.length;
+      return match;
+    });
+    if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+    node.parentNode.replaceChild(frag, node);
+  };
+  walk(root);
+}
+
+function nearestHeading(el) {
+  let node = el;
+  while (node && node !== articleEl) {
+    let prev = node.previousElementSibling;
+    while (prev) {
+      if (/^H[1-4]$/.test(prev.tagName)) return prev.textContent.trim();
+      prev = prev.previousElementSibling;
+    }
+    node = node.parentElement;
+  }
+  return "";
+}
+
+function clickContext(el) {
+  const block = el.closest("p, li, td, blockquote, h1, h2, h3, h4") || el.parentElement;
+  return {
+    keyword: el.dataset.term,
+    from_path: currentPath,
+    heading: nearestHeading(el),
+    passage: ((block && block.innerText) || "").trim().slice(0, 800),
+  };
+}
+
+function bindClicks() {
+  articleEl.querySelectorAll(".kw").forEach((el) => {
+    el.addEventListener("click", () => {
+      if (el.dataset.path) {
+        openArticle(el.dataset.path);
+        return;
+      }
+      pending = clickContext(el);
+      toastTitle.textContent = "生成解释页";
+      toastBody.textContent = `将结合当前段落理解「${pending.keyword}」。优先用已有 wiki；本地讲不清这个义项时再联网补充。`;
+      document.getElementById("okBtn").disabled = false;
+      toast.classList.add("open");
+    });
+  });
+}
+
+function renderMeta(page) {
+  const bar = document.createElement("div");
+  bar.className = "meta-bar";
+  const cat = document.createElement("select");
+  categories.forEach((row) => {
+    const opt = document.createElement("option");
+    opt.value = row.id;
+    opt.textContent = row.label;
+    if (row.id === page.category) opt.selected = true;
+    cat.appendChild(opt);
+  });
+  const st = document.createElement("select");
+  ["词条", "草稿", "过时", "有争议"].forEach((name) => {
+    const opt = document.createElement("option");
+    opt.value = name === "词条" ? "" : name;
+    opt.textContent = name;
+    if ((page.status || "") === opt.value || (name === "词条" && page.completeness === "词条" && !page.status)) {
+      opt.selected = true;
+    }
+    st.appendChild(opt);
+  });
+  const save = document.createElement("button");
+  save.className = "btn btn-primary";
+  save.type = "button";
+  save.textContent = "保存分类";
+  save.onclick = async () => {
+    const next = await api("/api/meta", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: page.path, category: cat.value, status: st.value }),
+    });
+    keywords = await api("/api/keywords");
+    await openArticle(next.path);
+  };
+  bar.append(cat, st, save);
+  return bar;
+}
+
+function renderBacklinks(page) {
+  const box = document.getElementById("backlinks");
+  const links = page.backlinks || [];
+  if (!links.length) {
+    box.hidden = true;
+    box.innerHTML = "";
+    return;
+  }
+  box.hidden = false;
+  box.innerHTML = "<h3>谁提到过我</h3>";
+  links.forEach((row) => {
+    const a = document.createElement("a");
+    a.href = "#/" + row.path;
+    a.textContent = row.title;
+    a.onclick = (event) => {
+      event.preventDefault();
+      openArticle(row.path);
+    };
+    box.appendChild(a);
+  });
+}
+
+async function openRaw(rel) {
+  const page = await api("/api/raw?path=" + encodeURIComponent(rel));
+  currentPath = rel;
+  currentPage = page;
+  articleEl.innerHTML = renderMarkdown(page.markdown);
+  const crumbs = document.createElement("div");
+  crumbs.className = "crumbs";
+  crumbs.innerHTML = `<span class="chip">原文</span>`;
+  articleEl.prepend(crumbs);
+  document.getElementById("backlinks").hidden = true;
+  document.getElementById("backlinks").innerHTML = "";
+  history.replaceState({ path: rel }, page.title, "#/" + rel);
+}
+
+async function openArticle(path) {
+  currentPath = path;
+  const page = await api("/api/article?path=" + encodeURIComponent(path));
+  currentPage = page;
+  articleEl.innerHTML = renderMarkdown(page.markdown);
+  const crumbs = document.createElement("div");
+  crumbs.className = "crumbs";
+  const kind = page.completeness || "草稿";
+  crumbs.innerHTML =
+    `<span class="chip">${page.category_label || ""}</span>` +
+    `<span class="chip ${kind === "词条" ? "ok" : "draft"}">${kind}</span>`;
+  articleEl.prepend(renderMeta(page));
+  articleEl.prepend(crumbs);
+  wrapKeywords(articleEl);
+  bindWikiLinks(articleEl);
+  bindClicks();
+  renderBacklinks(page);
+  allArticles = await api("/api/articles");
+  renderNav(allArticles);
+  history.replaceState({ path }, page.title, "#/" + path);
+}
+
+async function generateKeyword(ctx) {
+  toastBody.textContent = `正在理解「${ctx.keyword}」并生成……`;
+  document.getElementById("okBtn").disabled = true;
+  try {
+    const page = await api("/api/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(ctx),
+    });
+    keywords = await api("/api/keywords");
+    renderTodo(await api("/api/todo"));
+    toast.classList.remove("open");
+    await openArticle(page.path);
+    if (page.search_failed) {
+      const note = document.createElement("p");
+      note.className = "legend";
+      note.textContent = "联网检索失败或没有可用结果，本页只根据已有 wiki 资料写成。";
+      articleEl.prepend(note);
+    }
+  } catch (err) {
+    toastBody.textContent = "生成失败：" + err.message;
+    document.getElementById("okBtn").disabled = false;
+  }
+}
+
+document.getElementById("cancelBtn").onclick = () => {
+  pending = null;
+  toast.classList.remove("open");
+};
+document.getElementById("okBtn").onclick = () => {
+  if (pending) generateKeyword(pending);
+};
+document.getElementById("navFilter").addEventListener("input", () => renderNav(allArticles));
+
+async function boot() {
+  const [status, items, kws, cats, todo, lint] = await Promise.all([
+    api("/api/status"),
+    api("/api/articles"),
+    api("/api/keywords"),
+    api("/api/categories"),
+    api("/api/todo"),
+    api("/api/lint"),
+  ]);
+  keywords = kws;
+  allArticles = items;
+  categories = cats;
+  renderNav(allArticles);
+  renderTodo(todo);
+  renderLint(lint);
+  statusEl.textContent = status.configured
+    ? `生成引擎：${status.model} @ ${status.base_url}`
+    : "未配置 LLM_BASE_URL / LLM_MODEL：点击仍会成页，内容来自现有条目摘录";
+  const hash = decodeURIComponent(location.hash.replace(/^#\/?/, ""));
+  if (hash.startsWith("raw/")) {
+    await openRaw(hash);
+  } else if (hash) {
+    await openArticle(hash);
+  } else if (items[0]) {
+    const home = items.find((item) => item.path === "ai-practice/capability-ladder.md") || items[0];
+    await openArticle(home.path);
+  }
+}
+
+boot().catch((err) => {
+  articleEl.innerHTML = `<p class="empty">无法加载 wiki：${err.message}</p>`;
+});
+</script>
+</body>
+</html>

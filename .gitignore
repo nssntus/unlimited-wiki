@@ -1,0 +1,41 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+credentials*
+secrets*
+
+# User-authored and generated knowledge content
+/wiki/
+/raw/
+
+# Project documentation, source material, and content-coupled local tests
+/*.md
+/interactive-tutorial*.html
+/test_keywords.py
+/test_wiki_ops.py
+
+# Runtime and development artifacts
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+.idea/
+.vscode/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+*~
