@@ -92,8 +92,11 @@ export type RawInboxItem = {
   size: number
   ingestable: boolean
   reason: string | null
-  status: "unlinked" | "duplicate" | "ingested" | "integrity_changed"
+  status: "unlinked" | "duplicate" | "ingested" | "integrity_changed" | "rejected"
   linked_target?: string | null
+  source_format?: string
+  extracted_chars?: number
+  used_ocr?: boolean
 }
 
 export type LintIssue = {

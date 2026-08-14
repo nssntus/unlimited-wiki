@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import io
@@ -27,6 +29,7 @@ import categories as cats
 import keywords as kw
 import websearch
 import wiki_ops
+from document_ingest import MAX_INPUT_BYTES
 from model_settings import build_config, load_model_settings, public_model_settings, save_model_settings
 from legacy_migration import migrate_legacy_workspace
 from platform_store import PlatformStore, SessionContext
@@ -37,6 +40,7 @@ ROOT = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
 PORT = 8765
 MAX_BODY = 64 * 1024
+MAX_UPLOAD_BODY = ((MAX_INPUT_BYTES + 2) // 3) * 4 + 8 * 1024
 CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
     "img-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; "
@@ -618,7 +622,7 @@ def make_handler(app: WikiApp):
             if path == "/api/article/save":
                 max_bytes = None
             elif path == "/api/ingest/upload":
-                max_bytes = 10 * 1024 * 1024 + 4096
+                max_bytes = MAX_UPLOAD_BODY
             else:
                 max_bytes = MAX_BODY
             data = self._read_json(max_bytes=max_bytes)
@@ -753,10 +757,24 @@ def make_handler(app: WikiApp):
                 self.diagnostics.refresh()
                 return self._json(200, response)
             if path == "/api/ingest/upload":
-                _fields(data, {"filename", "content"}, {"filename", "content"})
+                _fields(data, {"filename", "content", "content_base64"}, {"filename"})
+                has_text = "content" in data
+                has_binary = "content_base64" in data
+                if has_text == has_binary:
+                    raise ApiError(422, "provide exactly one of content or content_base64")
+                if has_binary:
+                    encoded = _string(data, "content_base64", maximum=((MAX_INPUT_BYTES + 2) // 3) * 4, required=True)
+                    try:
+                        content = base64.b64decode(encoded, validate=True)
+                    except (binascii.Error, ValueError) as exc:
+                        raise ApiError(422, "content_base64 is invalid") from exc
+                    if len(content) > MAX_INPUT_BYTES:
+                        raise ApiError(413, "Raw file exceeds 10 MiB")
+                else:
+                    content = _string(data, "content", maximum=MAX_INPUT_BYTES, required=True)
                 response, replay = self._idempotency(data, lambda: service.upload_raw(
                     _string(data, "filename", maximum=255, required=True),
-                    _string(data, "content", maximum=10 * 1024 * 1024, required=True),
+                    content,
                 ))
                 return self._json(200 if replay or not response["created"] else 201, response)
             if path == "/api/merge/commit":

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import base64
+import io
 import json
 import stat
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+from docx import Document
 
 
 def request_json(base: str, path: str, *, body=None, origin=True, content_type="application/json", key="test-key"):
@@ -141,3 +145,33 @@ def test_raw_upload_is_json_only_and_idempotent(live_server):
     assert replay["raw"]["path"] == first["raw"]["path"]
     status, _, _ = request_json(base, "/api/ingest/upload", body={"filename": "bad.png", "content": "x"})
     assert status == 422
+
+
+def test_binary_document_upload_and_preview(live_server):
+    _app, base = live_server
+    document = Document()
+    document.add_heading("API Word", level=1)
+    document.add_paragraph("通过二进制 API 上传的 Word 正文。")
+    output = io.BytesIO()
+    document.save(output)
+    encoded = base64.b64encode(output.getvalue()).decode("ascii")
+
+    status, _, uploaded = request_json(base, "/api/ingest/upload", body={
+        "filename": "api-word.docx", "content_base64": encoded,
+    }, key="upload-docx")
+    assert status == 201
+    assert uploaded["raw"]["source_format"] == "DOCX"
+
+    raw_status, _, raw = request_json(base, "/api/raw?path=raw/local/api-word.docx")
+    assert raw_status == 200
+    assert "通过二进制 API 上传的 Word 正文" in raw["markdown"]
+
+
+def test_binary_upload_rejects_invalid_base64_without_writing(live_server, snapshot, kb_root):
+    _app, base = live_server
+    before = snapshot(kb_root)
+    status, _, _ = request_json(base, "/api/ingest/upload", body={
+        "filename": "bad.pdf", "content_base64": "not-base64!",
+    }, key="invalid-base64")
+    assert status == 422
+    assert snapshot(kb_root) == before

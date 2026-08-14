@@ -108,6 +108,7 @@ class FileStore:
         kind: str,
         metadata: dict | None = None,
         operation_id: str | None = None,
+        must_not_exist: bool = False,
     ) -> dict:
         normalized: dict[str, bytes | None] = {}
         for rel, value in changes.items():
@@ -121,6 +122,8 @@ class FileStore:
         op_id = operation_id or uuid.uuid4().hex
         op_dir = self.history_root / op_id
         with self.locked():
+            if must_not_exist and any(self.resolve(rel).exists() for rel in normalized):
+                raise FileExistsError("transaction target already exists")
             if op_dir.exists():
                 raise FileExistsError(f"operation already exists: {op_id}")
             backups = op_dir / "before"
