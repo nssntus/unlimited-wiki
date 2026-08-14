@@ -14,7 +14,7 @@ secrets*
 /raw/
 
 # Project documentation, source material, and content-coupled local tests
-/*.md
+*.md
 !/README.md
 /interactive-tutorial*.html
 /test_keywords.py
