@@ -26,6 +26,7 @@ SEED_ALIASES = {
 }
 
 ALIAS_RE = re.compile(r"^>\s*Aliases:\s*(.+)$", re.M | re.I)
+REDIRECT_RE = re.compile(r"^>\s*Redirect:\s*(.+?)\s*$", re.M | re.I)
 
 
 def norm(term: str) -> str:
@@ -75,6 +76,23 @@ def build_title_index(project_root: Path) -> dict[str, str]:
         index[norm(title)] = rel
         for alias in parse_aliases(md):
             index.setdefault(norm(alias), rel)
+    # Redirect pages are intentionally excluded from normal article scans, but
+    # their former titles and aliases remain valid canonical lookups.
+    wiki_root = project_root / "wiki"
+    for path in sorted(wiki_root.rglob("*.md")) if wiki_root.exists() else []:
+        if path.name in {"index.md", "log.md"}:
+            continue
+        md = path.read_text(encoding="utf-8")
+        match = REDIRECT_RE.search(md[:4096])
+        if not match:
+            continue
+        source_rel = path.relative_to(wiki_root).as_posix()
+        target = _resolve_redirect_rel(source_rel, match.group(1).strip())
+        final = follow_redirect(project_root, target)
+        title = next((line[2:].strip() for line in md.splitlines() if line.startswith("# ")), path.stem)
+        index.setdefault(norm(title), final)
+        for alias in parse_aliases(md):
+            index.setdefault(norm(alias), final)
     for alias, canonical in SEED_ALIASES.items():
         target = index.get(norm(canonical))
         if target:
@@ -86,3 +104,36 @@ def resolve(project_root: Path, term: str) -> str | None:
     if not term or not term.strip():
         return None
     return build_title_index(project_root).get(norm(term))
+
+
+def _resolve_redirect_rel(source_rel: str, target: str) -> str:
+    if target.startswith("/") or "\\" in target:
+        raise ValueError("invalid redirect")
+    parts = list(Path(source_rel).parent.parts)
+    for piece in Path(target).parts:
+        if piece == "..":
+            if not parts:
+                raise ValueError("redirect escapes wiki")
+            parts.pop()
+        elif piece not in {"", "."}:
+            parts.append(piece)
+    return "/".join(parts)
+
+
+def follow_redirect(project_root: Path, rel: str, *, max_hops: int = 16) -> str:
+    wiki_root = (project_root / "wiki").resolve()
+    current = rel
+    seen: set[str] = set()
+    for _ in range(max_hops):
+        if current in seen:
+            raise ValueError("redirect cycle")
+        seen.add(current)
+        path = (wiki_root / current).resolve()
+        if not path.is_relative_to(wiki_root) or not path.is_file():
+            return current
+        md = path.read_text(encoding="utf-8")
+        match = REDIRECT_RE.search(md[:4096])
+        if not match:
+            return current
+        current = _resolve_redirect_rel(current, match.group(1).strip())
+    raise ValueError("redirect chain is too long")

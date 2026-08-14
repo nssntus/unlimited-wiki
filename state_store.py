@@ -1,0 +1,330 @@
+"""Local SQLite state for jobs, idempotency, Raw intake, and diagnostics."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+import threading
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class StateStore:
+    def __init__(self, project_root: Path):
+        self.project_root = project_root.resolve()
+        state = project_root / ".wiki-state"
+        state.mkdir(parents=True, exist_ok=True)
+        self.path = state / "state.sqlite3"
+        self._lock = threading.RLock()
+        self._init_schema()
+
+    def connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=15, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=FULL")
+        return connection
+
+    def _init_schema(self) -> None:
+        with self.connect() as db:
+            db.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS idempotency (
+                    endpoint TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    response_json TEXT,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(endpoint, key)
+                );
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    active_key TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    result_json TEXT,
+                    error_type TEXT,
+                    error_message TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_run_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS raw_records (
+                    path TEXT PRIMARY KEY,
+                    byte_hash TEXT NOT NULL,
+                    text_hash TEXT NOT NULL,
+                    target_path TEXT,
+                    disposition TEXT NOT NULL,
+                    operation_id TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS raw_records_hash ON raw_records(byte_hash);
+                """
+            )
+            db.execute("DROP INDEX IF EXISTS tasks_one_active")
+            db.execute(
+                "CREATE UNIQUE INDEX tasks_one_active ON tasks(active_key) WHERE status IN ('staged','queued','running')"
+            )
+            db.execute(
+                "UPDATE tasks SET status='queued', next_run_at=?, updated_at=? WHERE status='running'",
+                (now_iso(), now_iso()),
+            )
+            db.execute("DELETE FROM idempotency WHERE status='pending'")
+            staged = db.execute("SELECT id,payload_json FROM tasks WHERE status='staged'").fetchall()
+            for row in staged:
+                payload = json.loads(row["payload_json"])
+                path = payload.get("path")
+                if isinstance(path, str) and (self.project_root / "wiki" / path).is_file():
+                    db.execute("UPDATE tasks SET status='queued', next_run_at=?, updated_at=? WHERE id=?", (now_iso(), now_iso(), row["id"]))
+                else:
+                    db.execute("DELETE FROM tasks WHERE id=?", (row["id"],))
+
+    @staticmethod
+    def payload_hash(payload: dict) -> str:
+        packed = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(packed.encode("utf-8")).hexdigest()
+
+    def idempotency_get(self, endpoint: str, key: str, payload: dict) -> dict | None:
+        digest = self.payload_hash(payload)
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM idempotency WHERE endpoint=? AND key=?", (endpoint, key)
+            ).fetchone()
+        if not row:
+            return None
+        if row["payload_hash"] != digest:
+            raise ValueError("idempotency key was already used with a different payload")
+        if row["status"] == "done" and row["response_json"]:
+            return json.loads(row["response_json"])
+        raise RuntimeError("request with this idempotency key is still in progress")
+
+    def idempotency_begin(self, endpoint: str, key: str, payload: dict) -> bool:
+        digest = self.payload_hash(payload)
+        try:
+            with self.connect() as db:
+                db.execute(
+                    "INSERT INTO idempotency(endpoint,key,payload_hash,status,created_at) VALUES(?,?,?,?,?)",
+                    (endpoint, key, digest, "pending", now_iso()),
+                )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def idempotency_finish(self, endpoint: str, key: str, response: dict) -> None:
+        with self.connect() as db:
+            db.execute(
+                "UPDATE idempotency SET status='done', response_json=? WHERE endpoint=? AND key=?",
+                (json.dumps(response, ensure_ascii=False), endpoint, key),
+            )
+
+    def idempotency_abort(self, endpoint: str, key: str) -> None:
+        with self.connect() as db:
+            db.execute(
+                "DELETE FROM idempotency WHERE endpoint=? AND key=? AND status='pending'",
+                (endpoint, key),
+            )
+
+    def enqueue_task(self, kind: str, subject: str, payload: dict, *, staged: bool = False) -> tuple[dict, bool]:
+        active_key = f"{kind}:{subject.casefold()}"
+        task_id = uuid.uuid4().hex
+        created = now_iso()
+        with self._lock, self.connect() as db:
+            existing = db.execute(
+                "SELECT * FROM tasks WHERE active_key=? AND status IN ('staged','queued','running')",
+                (active_key,),
+            ).fetchone()
+            if existing:
+                return self._task(existing), False
+            status = "staged" if staged else "queued"
+            db.execute(
+                """INSERT INTO tasks
+                (id,kind,subject,active_key,status,payload_json,attempts,next_run_at,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (task_id, kind, subject, active_key, status, json.dumps(payload, ensure_ascii=False), 0, created, created, created),
+            )
+            row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return self._task(row), True
+
+    def activate_task(self, task_id: str) -> dict:
+        with self.connect() as db:
+            changed = db.execute(
+                "UPDATE tasks SET status='queued', next_run_at=?, updated_at=? WHERE id=? AND status='staged'",
+                (now_iso(), now_iso(), task_id),
+            ).rowcount
+        if not changed:
+            raise ValueError("task cannot be activated")
+        return self.get_task(task_id)
+
+    def delete_staged_task(self, task_id: str) -> None:
+        with self.connect() as db:
+            db.execute("DELETE FROM tasks WHERE id=? AND status='staged'", (task_id,))
+
+    def list_tasks(self, limit: int = 100) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [self._task(row) for row in rows]
+
+    def get_task(self, task_id: str) -> dict:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not row:
+            raise FileNotFoundError(task_id)
+        return self._task(row)
+
+    def claim_task(self, allowed_kinds: set[str] | None = None) -> dict | None:
+        now = now_iso()
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            kind_clause = ""
+            params: list[str] = [now]
+            if allowed_kinds is not None:
+                if not allowed_kinds:
+                    db.commit()
+                    return None
+                placeholders = ",".join("?" for _ in allowed_kinds)
+                kind_clause = f" AND kind IN ({placeholders})"
+                params.extend(sorted(allowed_kinds))
+            row = db.execute(
+                "SELECT * FROM tasks WHERE status='queued' "
+                "AND (next_run_at IS NULL OR next_run_at<=?)"
+                + kind_clause
+                + " ORDER BY created_at LIMIT 1",
+                params,
+            ).fetchone()
+            if not row:
+                db.commit()
+                return None
+            changed = db.execute(
+                "UPDATE tasks SET status='running', attempts=attempts+1, updated_at=? WHERE id=? AND status='queued'",
+                (now, row["id"]),
+            ).rowcount
+            db.commit()
+            if not changed:
+                return None
+        return self.get_task(row["id"])
+
+    def complete_task(self, task_id: str, result: dict) -> dict:
+        with self.connect() as db:
+            db.execute(
+                """UPDATE tasks SET status='succeeded', result_json=?, error_type=NULL,
+                error_message=NULL, next_run_at=NULL, updated_at=? WHERE id=? AND status='running'""",
+                (json.dumps(result, ensure_ascii=False), now_iso(), task_id),
+            )
+        return self.get_task(task_id)
+
+    def fail_task(self, task_id: str, error_type: str, message: str, *, retry: bool) -> dict:
+        task = self.get_task(task_id)
+        backoff = (5, 30, 120, 600, 3600)
+        attempts = task["attempts"]
+        should_retry = retry and attempts < len(backoff)
+        next_at = None
+        status = "failed"
+        if should_retry:
+            status = "queued"
+            next_at = (datetime.now(timezone.utc) + timedelta(seconds=backoff[attempts - 1])).isoformat(timespec="seconds")
+        with self.connect() as db:
+            db.execute(
+                """UPDATE tasks SET status=?, error_type=?, error_message=?, next_run_at=?,
+                updated_at=? WHERE id=? AND status='running'""",
+                (status, error_type, message[:500], next_at, now_iso(), task_id),
+            )
+        return self.get_task(task_id)
+
+    def cancel_task(self, task_id: str) -> dict:
+        with self.connect() as db:
+            changed = db.execute(
+                "UPDATE tasks SET status='cancelled', updated_at=? WHERE id=? AND status IN ('queued','running')",
+                (now_iso(), task_id),
+            ).rowcount
+        if not changed and self.get_task(task_id)["status"] not in {"cancelled", "succeeded", "failed"}:
+            raise ValueError("task cannot be cancelled")
+        return self.get_task(task_id)
+
+    def retry_task(self, task_id: str, *, payload: dict | None = None) -> dict:
+        task = self.get_task(task_id)
+        retryable_conflict = task["status"] == "succeeded" and bool(task.get("result", {}).get("conflict"))
+        allowed_status = task["status"] in {"failed", "cancelled"} or retryable_conflict
+        if not allowed_status:
+            raise ValueError("task cannot be retried")
+        next_payload = payload or task["payload"]
+        with self.connect() as db:
+            changed = db.execute(
+                """UPDATE tasks SET status='queued', payload_json=?, result_json=NULL,
+                error_type=NULL, error_message=NULL, next_run_at=?, updated_at=? WHERE id=?""",
+                (json.dumps(next_payload, ensure_ascii=False), now_iso(), now_iso(), task_id),
+            ).rowcount
+        if not changed:
+            raise ValueError("task cannot be retried")
+        return self.get_task(task_id)
+
+    def record_raw(
+        self,
+        path: str,
+        byte_hash: str,
+        text_hash: str,
+        disposition: str,
+        target_path: str | None,
+        operation_id: str | None,
+    ) -> None:
+        with self.connect() as db:
+            db.execute(
+                """INSERT INTO raw_records(path,byte_hash,text_hash,target_path,disposition,operation_id,created_at)
+                VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(path) DO UPDATE SET byte_hash=excluded.byte_hash,text_hash=excluded.text_hash,
+                target_path=excluded.target_path,disposition=excluded.disposition,
+                operation_id=excluded.operation_id,created_at=excluded.created_at""",
+                (path, byte_hash, text_hash, target_path, disposition, operation_id, now_iso()),
+            )
+
+    def raw_records(self) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM raw_records ORDER BY created_at DESC").fetchall()
+        return [dict(row) for row in rows]
+
+    def remap_article_path(self, old_path: str, new_path: str, *, base_revision: str | None = None) -> None:
+        """Keep Raw records and pending tasks aligned after a Wiki move."""
+        if old_path == new_path:
+            return
+        with self._lock, self.connect() as db:
+            db.execute("UPDATE raw_records SET target_path=? WHERE target_path=?", (new_path, old_path))
+            rows = db.execute(
+                "SELECT id,kind,payload_json FROM tasks WHERE status IN ('staged','queued')"
+            ).fetchall()
+            for row in rows:
+                payload = json.loads(row["payload_json"])
+                if payload.get("path") != old_path:
+                    continue
+                payload["path"] = new_path
+                if base_revision:
+                    payload["base_revision"] = base_revision
+                db.execute(
+                    "UPDATE tasks SET subject=?,active_key=?,payload_json=?,updated_at=? WHERE id=?",
+                    (
+                        new_path,
+                        f"{row['kind']}:{new_path.casefold()}",
+                        json.dumps(payload, ensure_ascii=False),
+                        now_iso(),
+                        row["id"],
+                    ),
+                )
+
+    @staticmethod
+    def _task(row: sqlite3.Row) -> dict:
+        item = dict(row)
+        item["payload"] = json.loads(item.pop("payload_json"))
+        raw_result = item.pop("result_json")
+        item["result"] = json.loads(raw_result) if raw_result else None
+        return item

@@ -173,7 +173,8 @@ PRODUCT_RE = re.compile(
     r"|Custom Instructions|Chain of Thought|Scheduled Tasks"
     r"|Triggered Automation|Plugin Directory|Office Agent|GPT Store)\b"
 )
-META_RE = re.compile(r"^>\s*(Sources|Raw|Updated|Archived):", re.I)
+META_RE = re.compile(r"^>\s*(Category|Status|Aliases|Sources|Raw|Updated|Archived|Generation|Evidence|Redirect):", re.I)
+REDIRECT_RE = re.compile(r"^>\s*Redirect:\s*(.+?)\s*$", re.M | re.I)
 CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
 
@@ -196,6 +197,12 @@ def iter_articles(project_root: Path) -> list[Path]:
     files = []
     for path in sorted(root.rglob("*.md")):
         if path.name in WIKI_SKIP:
+            continue
+        try:
+            head = path.read_text(encoding="utf-8")[:4096]
+        except (OSError, UnicodeError):
+            continue
+        if REDIRECT_RE.search(head):
             continue
         files.append(path)
     return files
@@ -301,6 +308,8 @@ def extract_from_markdown(md: str) -> set[str]:
             continue
         body_lines.append(line)
     body = "\n".join(body_lines)
+    body = re.sub(r"```.*?```", "", body, flags=re.S)
+    body = re.sub(r"~~~.*?~~~", "", body, flags=re.S)
 
     for _, heading in HEADING_RE.findall(body):
         heading = clean_heading(heading)
@@ -468,7 +477,9 @@ def excerpts_for(
 
     raw_root = project_root / "raw"
     if raw_root.exists():
-        for path in sorted(raw_root.rglob("*.md")):
+        for path in sorted(raw_root.rglob("*")):
+            if path.suffix.lower() not in {".md", ".markdown", ".txt"} or path.is_symlink():
+                continue
             md = path.read_text(encoding="utf-8")
             title = parse_title(md) or path.stem
             rel = path.relative_to(project_root).as_posix()
@@ -492,14 +503,34 @@ def about_the_term(text: str, keyword: str) -> bool:
 
 
 def coverage_sufficient(excerpts: list[dict], keyword: str) -> bool:
-    wiki = [item for item in excerpts if not item["path"].startswith("raw/")]
-    if not wiki:
-        return False
-    texts = [item["text"] for item in wiki]
-    joined = "\n".join(texts)
-    if keyword.lower() not in joined.lower():
-        return False
-    if any(about_the_term(text, keyword) for text in texts):
-        return True
-    mentions = sum(text.lower().count(keyword.lower()) for text in texts)
-    return mentions >= 2 and len(joined) >= 350
+    evidence = coverage_evidence(excerpts, keyword)
+    return evidence["sufficient"]
+
+
+def coverage_evidence(excerpts: list[dict], keyword: str) -> dict:
+    relevant = [item for item in excerpts if keyword.casefold() in item["text"].casefold()]
+    if not relevant:
+        return {"sufficient": False, "reason": "no_local_evidence", "evidence_count": 0, "document_count": 0, "char_count": 0}
+    for item in relevant:
+        if len(item["text"]) >= 80 and about_the_term(item["text"], keyword):
+            return {
+                "sufficient": True,
+                "reason": "explicit_definition",
+                "evidence_count": len(relevant),
+                "document_count": len({entry["path"] for entry in relevant}),
+                "char_count": sum(len(entry["text"]) for entry in relevant),
+            }
+    documents = {item["path"] for item in relevant}
+    joined = "\n".join(item["text"] for item in relevant)
+    mentions = sum(item["text"].casefold().count(keyword.casefold()) for item in relevant)
+    has_wiki = any(not item["path"].startswith("raw/") for item in relevant)
+    sufficient = len(documents) >= 2 and mentions >= 2 and len(joined) >= 350 and has_wiki
+    return {
+        "sufficient": sufficient,
+        "reason": "multi_document_coverage" if sufficient else "insufficient_local_evidence",
+        "evidence_count": len(relevant),
+        "document_count": len(documents),
+        "char_count": len(joined),
+        "mentions": mentions,
+        "has_wiki": has_wiki,
+    }
