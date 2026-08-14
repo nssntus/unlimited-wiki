@@ -141,13 +141,14 @@ class WikiApp:
             if self.service is None:
                 raise RuntimeError("workspace service is unavailable")
             return self.service
+        workspace = self.platform.authorize_workspace(context.user_id, context.workspace_id, "wiki.read")
         with self._service_lock:
             service = self._services.get(context.workspace_id)
             if service is None:
                 values = self.platform.load_model(context.workspace_id)
                 config = build_config(**values, allow_private=False) if values else LLMConfig()
                 service = WikiService(
-                    self.platform.workspace_root(context.workspace_root_name),
+                    self.platform.workspace_root(workspace["root_name"]),
                     llm_config=config,
                     remote_search=self.remote_search,
                     start_worker=self.start_worker,
@@ -175,7 +176,8 @@ class WikiApp:
             self.review_worker.close()
 
     def export_workspace(self, context: SessionContext) -> bytes:
-        root = self.platform.workspace_root(context.workspace_root_name)
+        workspace = self.platform.authorize_workspace(context.user_id, context.workspace_id, "workspace.manage")
+        root = self.platform.workspace_root(workspace["root_name"])
         output = io.BytesIO()
         with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for directory in ("wiki", "raw"):
@@ -185,11 +187,12 @@ class WikiApp:
         return output.getvalue()
 
     def delete_account(self, context: SessionContext, password: str) -> None:
+        workspace = self.platform.authorize_workspace(context.user_id, context.workspace_id, "workspace.manage")
         service = self._services.pop(context.workspace_id, None)
         self._diagnostics.pop(context.workspace_id, None)
         if service is not None:
             service.close()
-        root = self.platform.workspace_root(context.workspace_root_name)
+        root = self.platform.workspace_root(workspace["root_name"])
         self.platform.delete_account(context, password)
         if root.exists():
             shutil.rmtree(root)
@@ -216,6 +219,7 @@ class WikiApp:
         effective_key = api_key or (current.api_key if current.provider == provider and current.base_url == base_url.rstrip("/") else "")
         config = build_config(provider, base_url, effective_key, model, allow_private=not self.multi_user)
         if self.platform is not None and context is not None:
+            self.platform.authorize_workspace(context.user_id, context.workspace_id, "model.manage")
             self.platform.save_model(context.workspace_id, provider, config.base_url, effective_key, model)
         else:
             save_model_settings(self.project_root, config)
@@ -433,6 +437,18 @@ def make_handler(app: WikiApp):
             if self.context.role != role:
                 raise ApiError(403, "insufficient role")
 
+        def _require_workspace_permission(self, permission: str) -> None:
+            if app.platform is None:
+                return
+            if self.context is None:
+                raise ApiError(401, "authentication required")
+            try:
+                app.platform.authorize_workspace(self.context.user_id, self.context.workspace_id, permission)
+            except FileNotFoundError as exc:
+                raise ApiError(404, "not found") from exc
+            except PermissionError as exc:
+                raise ApiError(403, "insufficient workspace role") from exc
+
         def _private_service(self) -> WikiService:
             if self.service is None:
                 raise ApiError(401, "authentication required")
@@ -533,6 +549,7 @@ def make_handler(app: WikiApp):
             if path == "/api/account/export":
                 if self.context is None:
                     raise ApiError(401, "authentication required")
+                self._require_workspace_permission("workspace.manage")
                 payload = app.export_workspace(self.context)
                 self._extra_headers.append(("Content-Disposition", "attachment; filename=wiki-export.zip"))
                 return self._send(200, payload, "application/zip")
@@ -552,6 +569,7 @@ def make_handler(app: WikiApp):
             if path == "/api/status":
                 return self._json(200, app.status(service))
             if path == "/api/settings/model":
+                self._require_workspace_permission("model.manage")
                 return self._json(200, app.model_settings(service))
             if path == "/api/articles":
                 return self._json(200, service.articles())
@@ -593,10 +611,12 @@ def make_handler(app: WikiApp):
             if path == "/api/ingest":
                 return self._json(200, service.raw_inbox())
             if path == "/api/ingest/preview":
+                self._require_workspace_permission("wiki.write")
                 return self._json(200, service.ingest_preview(_single_query(parsed, "path", required=True)))
             if path == "/api/merge/preview":
                 return self._json(200, service.merge_preview(_single_query(parsed, "source", required=True), _single_query(parsed, "target", required=True)))
             if path == "/api/operations":
+                self._require_workspace_permission("wiki.write")
                 return self._json(200, service.files.operation(_single_query(parsed, "id", required=True)))
             if path == "/api/search":
                 return self._json(200, _search(service, _single_query(parsed, "q")))
@@ -690,6 +710,23 @@ def make_handler(app: WikiApp):
                 return self._json(201, response)
 
             service = self._private_service()
+            content_write_paths = {
+                "/api/generate", "/api/meta", "/api/classifications/preview", "/api/classifications/draft",
+                "/api/classifications/commit", "/api/classifications/retry", "/api/categories/preview",
+                "/api/categories/commit", "/api/reconciliation/scan", "/api/reconciliation/preview",
+                "/api/reconciliation/commit", "/api/governance", "/api/article/save", "/api/ingest/commit",
+                "/api/ingest/upload", "/api/merge/commit", "/api/share-previews", "/api/submissions",
+            }
+            if path in {"/api/settings/models", "/api/settings/model"}:
+                self._require_workspace_permission("model.manage")
+            elif path == "/api/account/delete":
+                self._require_workspace_permission("workspace.manage")
+            elif (
+                path in content_write_paths
+                or re.fullmatch(r"/api/tasks/[a-f0-9]+/(cancel|retry)", path)
+                or re.fullmatch(r"/api/operations/[A-Za-z0-9-]+/rollback", path)
+            ):
+                self._require_workspace_permission("wiki.write")
             if path == "/api/settings/models":
                 _fields(data, {"provider", "base_url", "api_key"}, {"provider", "base_url"})
                 values = (
