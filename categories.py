@@ -94,11 +94,13 @@ def blurb_of(cat_id: str) -> str:
 
 
 def parse_category_line(md: str) -> str | None:
-    m = re.search(r"^>\s*Category:\s*([a-z0-9-]+)\s*$", md, re.M | re.I)
+    m = re.search(r"^>\s*Category:\s*([^\r\n]+?)\s*$", md, re.M | re.I)
     if not m:
         return None
-    cid = m.group(1).lower()
-    return cid if cid in BY_ID else None
+    value = m.group(1).strip()
+    if not value or value in {".", ".."} or any(ch in value for ch in "/\\\0"):
+        return None
+    return value
 
 
 def classify(term: str, from_path: str = "", heading: str = "", passage: str = "") -> str:

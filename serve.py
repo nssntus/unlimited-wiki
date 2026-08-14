@@ -556,7 +556,15 @@ def make_handler(app: WikiApp):
             if path == "/api/articles":
                 return self._json(200, service.articles())
             if path == "/api/categories":
-                return self._json(200, service.categories())
+                status = _single_query(parsed, "status") or "active"
+                if status not in {"active", "archived", "all"}:
+                    raise ApiError(400, "invalid category status")
+                rows = service.categories()
+                return self._json(200, rows if status == "all" else [item for item in rows if item["status"] == status])
+            if path == "/api/classifications/workbench":
+                return self._json(200, service.classification_workbench())
+            if path == "/api/reconciliation":
+                return self._json(200, {"items": service.state.list_reconciliation()})
             if path == "/api/keywords":
                 return self._json(200, wiki_ops.highlightable_keywords(service.root))
             if path == "/api/todo":
@@ -728,6 +736,59 @@ def make_handler(app: WikiApp):
                 ))
                 self.diagnostics.refresh()
                 return self._json(200, response)
+            if path == "/api/classifications/preview":
+                _fields(data, {"selections"}, {"selections"})
+                selections = data.get("selections")
+                if not isinstance(selections, list):
+                    raise ApiError(422, "selections must be an array")
+                return self._json(200, service.classification_preview(selections))
+            if path == "/api/classifications/draft":
+                _fields(data, {"selections", "expected_revision"}, {"selections", "expected_revision"})
+                selections = data.get("selections")
+                expected_revision = data.get("expected_revision")
+                if not isinstance(selections, list) or isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
+                    raise ApiError(422, "invalid classification draft")
+                return self._json(200, service.save_classification_draft(selections, expected_revision))
+            if path == "/api/classifications/commit":
+                _fields(data, {"preview_id"}, {"preview_id"})
+                response, replay = self._idempotency(data, lambda: service.classification_commit(_string(data, "preview_id", maximum=64, required=True)))
+                return self._json(200 if replay else 201, response)
+            if path == "/api/classifications/retry":
+                _fields(data, {"article_id"}, {"article_id"})
+                response, replay = self._idempotency(data, lambda: service.retry_classification(_string(data, "article_id", maximum=64, required=True)))
+                return self._json(200 if replay else 202, response)
+            if path == "/api/categories/preview":
+                _fields(data, {"action", "category_id", "target_category_id", "name", "description", "sort_order"}, {"action"})
+                action = _string(data, "action", maximum=20, required=True)
+                sort_order = data.get("sort_order")
+                if sort_order is not None and (isinstance(sort_order, bool) or not isinstance(sort_order, int)):
+                    raise ApiError(422, "sort_order must be an integer")
+                return self._json(200, service.category_preview(
+                    action,
+                    category_id=_string(data, "category_id", maximum=64),
+                    target_category_id=_string(data, "target_category_id", maximum=64),
+                    name=_string(data, "name", maximum=80),
+                    description=_string(data, "description", maximum=500),
+                    sort_order=sort_order,
+                ))
+            if path == "/api/categories/commit":
+                _fields(data, {"preview_id"}, {"preview_id"})
+                response, replay = self._idempotency(data, lambda: service.category_commit(_string(data, "preview_id", maximum=64, required=True)))
+                return self._json(200 if replay else 201, response)
+            if path == "/api/reconciliation/scan":
+                _fields(data, set())
+                response, replay = self._idempotency(data, service.scan_reconciliation)
+                return self._json(200 if replay else 201, response)
+            if path == "/api/reconciliation/preview":
+                _fields(data, {"reconciliation_id", "decision"}, {"reconciliation_id", "decision"})
+                return self._json(200, service.reconciliation_preview(
+                    _string(data, "reconciliation_id", maximum=64, required=True),
+                    _string(data, "decision", maximum=20, required=True),
+                ))
+            if path == "/api/reconciliation/commit":
+                _fields(data, {"preview_id"}, {"preview_id"})
+                response, replay = self._idempotency(data, lambda: service.reconciliation_commit(_string(data, "preview_id", maximum=64, required=True)))
+                return self._json(200 if replay else 201, response)
             if path == "/api/governance":
                 _fields(data, set())
                 response, replay = self._idempotency(data, service.enqueue_governance)
@@ -746,12 +807,12 @@ def make_handler(app: WikiApp):
                 self.diagnostics.refresh()
                 return self._json(409 if response.get("conflict") else 200, response)
             if path == "/api/ingest/commit":
-                _fields(data, {"path", "disposition", "title", "category", "target_path"}, {"path", "disposition", "title", "category"})
+                _fields(data, {"path", "disposition", "title", "category", "target_path"}, {"path", "disposition", "title"})
                 response, _ = self._idempotency(data, lambda: service.ingest_commit(
                     _string(data, "path", maximum=512, required=True),
                     _string(data, "disposition", maximum=20, required=True),
                     title=_string(data, "title", maximum=120, required=True),
-                    category=_string(data, "category", maximum=80, required=True),
+                    category=_string(data, "category", maximum=80),
                     target_path=_string(data, "target_path", maximum=512) or None,
                 ))
                 self.diagnostics.refresh()
@@ -789,7 +850,7 @@ def make_handler(app: WikiApp):
             if match:
                 _fields(data, set())
                 task_id, action = match.group(1), match.group("action")
-                response, _ = self._idempotency(data, lambda: service.state.cancel_task(task_id) if action == "cancel" else service.retry_task(task_id))
+                response, _ = self._idempotency(data, lambda: service.cancel_task(task_id) if action == "cancel" else service.retry_task(task_id))
                 service._wake.set()
                 return self._json(200, response)
             match = re.fullmatch(r"/api/operations/([A-Za-z0-9-]+)/rollback", path)

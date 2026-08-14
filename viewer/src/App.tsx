@@ -24,6 +24,9 @@ const SharePage = lazy(() => import("@/pages/share-page").then((module) => ({ de
 const SubmissionsPage = lazy(() => import("@/pages/submissions-page").then((module) => ({ default: module.SubmissionsPage })))
 const SubmissionDetailPage = lazy(() => import("@/pages/submissions-page").then((module) => ({ default: module.SubmissionDetailPage })))
 const NotificationsPage = lazy(() => import("@/pages/notifications-page").then((module) => ({ default: module.NotificationsPage })))
+const ClassificationPage = lazy(() => import("@/pages/classification-page").then((module) => ({ default: module.ClassificationPage })))
+const CategoriesPage = lazy(() => import("@/pages/categories-page").then((module) => ({ default: module.CategoriesPage })))
+const ReconciliationPage = lazy(() => import("@/pages/reconciliation-page").then((module) => ({ default: module.ReconciliationPage })))
 const AdminReviewsPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminReviewsPage })))
 const AdminReviewDetailPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminReviewDetailPage })))
 const AdminReportsPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminReportsPage })))
@@ -57,6 +60,9 @@ export function App() {
             <Route path="/submissions" element={<SubmissionsPage />} />
             <Route path="/submissions/:id" element={<SubmissionDetailPage />} />
             <Route path="/notifications" element={<NotificationsPage />} />
+            <Route path="/classification" element={<ClassificationPage />} />
+            <Route path="/categories" element={<CategoriesPage />} />
+            <Route path="/reconciliation" element={<ReconciliationPage />} />
             <Route path="/*" element={<ArticlePage />} />
             </Route>
             <Route element={<RequireSession role="admin"><AdminShell /></RequireSession>}>
