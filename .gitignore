@@ -20,6 +20,11 @@ secrets*
 /test_wiki_ops.py
 
 # Runtime and development artifacts
+.wiki-state/
+.platform/
+spaces/
+viewer/node_modules/
+viewer/dist/
 __pycache__/
 *.py[cod]
 *.log

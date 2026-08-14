@@ -14,8 +14,11 @@ import keywords as kw
 
 REQUIRED_HEADINGS = ("它做什么", "机制", "怎么用", "例子")
 STATUS_RE = re.compile(r"^>\s*Status:\s*(.+)$", re.M | re.I)
+GENERATION_RE = re.compile(r"^>\s*Generation:\s*(.+)$", re.M | re.I)
+EVIDENCE_RE = re.compile(r"^>\s*Evidence:\s*(.+)$", re.M | re.I)
 MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 WIKI_SKIP = {"index.md", "log.md"}
+VALID_STATUSES = {"词条", "草稿", "过时", "有争议"}
 
 
 def rel_href(from_rel: str, to_rel: str) -> str:
@@ -87,6 +90,41 @@ def completeness(md: str) -> str:
     return "草稿"
 
 
+def structure_completeness(md: str) -> str:
+    if (parse_generation(md) or "").startswith("seed-adopted"):
+        return "完整"
+    mech = has_heading(md, "它做什么") or has_heading(md, "机制")
+    missing = []
+    if not mech:
+        missing.append("它做什么/机制")
+    for heading in ("怎么用", "例子"):
+        if not has_heading(md, heading):
+            missing.append(heading)
+    return "完整" if not missing else "缺章节"
+
+
+def missing_sections(md: str) -> list[str]:
+    if (parse_generation(md) or "").startswith("seed-adopted"):
+        return []
+    out = []
+    if not (has_heading(md, "它做什么") or has_heading(md, "机制")):
+        out.append("它做什么/机制")
+    for heading in ("怎么用", "例子"):
+        if not has_heading(md, heading):
+            out.append(heading)
+    return out
+
+
+def parse_generation(md: str) -> str | None:
+    match = GENERATION_RE.search(md or "")
+    return match.group(1).strip() if match else None
+
+
+def parse_evidence_status(md: str) -> str:
+    match = EVIDENCE_RE.search(md or "")
+    return match.group(1).strip() if match else "未标记"
+
+
 def would_use_web(project_root: Path, term: str, extra_needles: list[str] | None = None) -> bool:
     if aliases.resolve(project_root, term):
         return False
@@ -118,6 +156,52 @@ def _already_links_to(md: str, from_rel: str, to_rel: str) -> bool:
         if resolve_href(from_rel, href) == to_rel:
             return True
     return False
+
+
+def article_body(md: str) -> str:
+    """Return prose used for semantic lint, excluding metadata and link destinations."""
+    body = re.sub(r"^>.*$", "", md, flags=re.M)
+    body = MD_LINK_RE.sub("", body)
+    return body
+
+
+def mentions_title(md: str, title: str) -> bool:
+    body = article_body(md)
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._+-]*", title):
+        pattern = rf"(?<![A-Za-z0-9_]){re.escape(title)}(?![A-Za-z0-9_])"
+        return bool(re.search(pattern, body, re.I))
+    return title.casefold() in body.casefold()
+
+
+def article_quality_issues(
+    project_root: Path,
+    rel: str,
+    md: str,
+    *,
+    extra_paths: set[str] | None = None,
+) -> list[str]:
+    problems: list[str] = []
+    missing = missing_sections(md)
+    if missing:
+        problems.append("缺少章节：" + "、".join(missing))
+    status = parse_status(md)
+    if not status:
+        problems.append("缺少内容状态")
+    elif status not in VALID_STATUSES:
+        problems.append(f"非法内容状态：{status}")
+    if not re.search(r"^>\s*(?:Sources|Raw):\s*\S", md, re.M | re.I):
+        problems.append("缺少 Sources 或 Raw")
+    available = extra_paths or set()
+    for label, href in MD_LINK_RE.findall(md):
+        if href.startswith(("http://", "https://", "mailto:", "#")):
+            continue
+        target = resolve_href(rel, href)
+        if not target:
+            continue
+        path = project_root / target if target.startswith("raw/") else project_root / "wiki" / target
+        if target not in available and not path.is_file():
+            problems.append(f"死链：{label} -> {href}")
+    return problems
 
 
 def add_see_also(md: str, from_rel: str, to_rel: str, title: str) -> str:
@@ -166,6 +250,7 @@ def mention_counts(project_root: Path) -> dict[str, int]:
 
 def mentioned_but_missing(project_root: Path, min_mentions: int = 2) -> list[dict]:
     rows = []
+    title_index = aliases.build_title_index(project_root)
     for term, count in mention_counts(project_root).items():
         if count < min_mentions:
             continue
@@ -184,9 +269,19 @@ def mentioned_but_missing(project_root: Path, min_mentions: int = 2) -> list[dic
             "怎么用",
         }:
             continue
-        if aliases.resolve(project_root, term):
+        if aliases.norm(term) in title_index:
             continue
-        rows.append({"term": term, "mentions": count})
+        excerpts = kw.excerpts_for(project_root, term, limit=8)
+        rows.append(
+            {
+                "term": term,
+                "mentions": count,
+                "sources": [
+                    {"path": item["path"], "title": item["title"], "heading": "", "passage": item["text"]}
+                    for item in excerpts
+                ],
+            }
+        )
     rows.sort(key=lambda r: (-r["mentions"], r["term"]))
     return rows
 
@@ -218,6 +313,10 @@ def fix_missing_backlinks(project_root: Path) -> list[str]:
 
 def highlightable_keywords(project_root: Path) -> list[dict]:
     missing_ok = {row["term"] for row in mentioned_but_missing(project_root, min_mentions=2)}
+    for path in kw.iter_articles(project_root):
+        md = path.read_text(encoding="utf-8")
+        if (parse_generation(md) or "").startswith("seed-adopted"):
+            missing_ok.update(kw.extract_from_markdown(md))
     out = []
     for row in kw.collect_keywords(project_root):
         if row["path"]:
@@ -236,7 +335,19 @@ def lint_wiki(project_root: Path) -> list[dict]:
         title = kw.parse_title(md) or path.stem
         articles.append((rel, title, md))
         if not cats.parse_category_line(md):
-            issues.append({"kind": "missing_category", "path": rel, "detail": title})
+            issues.append({"id": f"missing_category:{rel}", "kind": "missing_category", "path": rel, "title": title, "detail": title})
+        quality = article_quality_issues(project_root, rel, md)
+        quality = [item for item in quality if not item.startswith("死链：")]
+        if quality:
+            issues.append(
+                {
+                    "id": f"content_quality:{rel}",
+                    "kind": "content_quality",
+                    "path": rel,
+                    "title": title,
+                    "detail": "；".join(quality),
+                }
+            )
         for label, href in MD_LINK_RE.findall(md):
             if href.startswith(("http://", "https://", "mailto:", "#")):
                 continue
@@ -246,12 +357,12 @@ def lint_wiki(project_root: Path) -> list[dict]:
             if target.startswith("raw/"):
                 if not (project_root / target).is_file():
                     issues.append(
-                        {"kind": "dead_link", "path": rel, "detail": f"{label} -> {href}"}
+                        {"id": f"dead_link:{rel}:{href}", "kind": "dead_link", "path": rel, "title": title, "target": href, "detail": f"{label} -> {href}"}
                     )
                 continue
             dest = project_root / "wiki" / target
             if not dest.is_file():
-                issues.append({"kind": "dead_link", "path": rel, "detail": f"{label} -> {href}"})
+                issues.append({"id": f"dead_link:{rel}:{href}", "kind": "dead_link", "path": rel, "title": title, "target": href, "detail": f"{label} -> {href}"})
 
     titles = [(rel, title) for rel, title, _md in articles]
     for rel_b, title_b, md_b in articles:
@@ -259,14 +370,17 @@ def lint_wiki(project_root: Path) -> list[dict]:
         for rel_a, title_a in titles:
             if rel_a == rel_b or len(title_a) < 2:
                 continue
-            if title_a.lower() not in body:
+            if not mentions_title(md_b, title_a):
                 continue
             if _already_links_to(md_b, rel_b, rel_a):
                 continue
             issues.append(
                 {
+                    "id": f"missing_backlink:{rel_b}:{rel_a}",
                     "kind": "missing_backlink",
                     "path": rel_b,
+                    "title": title_b,
+                    "target": rel_a,
                     "detail": f"mentions {title_a} but does not link to {rel_a}",
                 }
             )
@@ -276,8 +390,11 @@ def lint_wiki(project_root: Path) -> list[dict]:
             if aliases.norm(title_a) == aliases.norm(title_b):
                 issues.append(
                     {
+                        "id": f"near_duplicate:{rel_a}:{rel_b}",
                         "kind": "near_duplicate",
                         "path": rel_a,
+                        "title": title_a,
+                        "target": rel_b,
                         "detail": f"{title_a} ~ {title_b} ({rel_b})",
                     }
                 )
@@ -286,8 +403,11 @@ def lint_wiki(project_root: Path) -> list[dict]:
             if ratio >= 0.86:
                 issues.append(
                     {
+                        "id": f"near_duplicate:{rel_a}:{rel_b}",
                         "kind": "near_duplicate",
                         "path": rel_a,
+                        "title": title_a,
+                        "target": rel_b,
                         "detail": f"{title_a} ~ {title_b} ({rel_b})",
                     }
                 )
@@ -301,6 +421,25 @@ def rewrite_wiki_hrefs(md: str, from_rel: str, old_rel: str, new_rel: str) -> st
         if target == old_rel:
             return f"[{label}]({rel_href(from_rel, new_rel)})"
         return match.group(0)
+
+    return MD_LINK_RE.sub(repl, md)
+
+
+def rebase_wiki_hrefs(md: str, old_rel: str, new_rel: str) -> str:
+    """Keep a moved page's relative links pointing at the same canonical files."""
+
+    def repl(match: re.Match) -> str:
+        label, href = match.group(1), match.group(2)
+        if href.startswith(("http://", "https://", "mailto:", "#")):
+            return match.group(0)
+        fragment = ""
+        if "#" in href:
+            href, fragment = href.split("#", 1)
+            fragment = "#" + fragment
+        target = resolve_href(old_rel, href)
+        if not target:
+            return match.group(0)
+        return f"[{label}]({rel_href(new_rel, target)}{fragment})"
 
     return MD_LINK_RE.sub(repl, md)
 
