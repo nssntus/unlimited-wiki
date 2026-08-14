@@ -492,7 +492,17 @@ class StateStore:
 
     def replace_reconciliation(self, items: list[dict]) -> list[dict]:
         stamp = now_iso()
-        with self.connect() as db:
+        fingerprints = [item["fingerprint"] for item in items]
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if fingerprints:
+                placeholders = ",".join("?" for _ in fingerprints)
+                db.execute(
+                    f"DELETE FROM reconciliation_items WHERE status='pending' AND fingerprint NOT IN ({placeholders})",
+                    fingerprints,
+                )
+            else:
+                db.execute("DELETE FROM reconciliation_items WHERE status='pending'")
             for item in items:
                 db.execute(
                     """INSERT INTO reconciliation_items(id,fingerprint,kind,payload_json,status,created_at,updated_at)
@@ -500,6 +510,7 @@ class StateStore:
                     kind=excluded.kind,payload_json=excluded.payload_json,updated_at=excluded.updated_at""",
                     (uuid.uuid4().hex, item["fingerprint"], item["kind"], json.dumps(item, ensure_ascii=False), "pending", stamp, stamp),
                 )
+            db.commit()
         return self.list_reconciliation()
 
     def list_reconciliation(self, status: str = "pending") -> list[dict]:

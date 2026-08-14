@@ -201,7 +201,8 @@ def iter_articles(project_root: Path) -> list[Path]:
         if path.name in WIKI_SKIP:
             continue
         try:
-            head = path.read_text(encoding="utf-8")[:4096]
+            with path.open(encoding="utf-8") as handle:
+                head = handle.read(4096)
         except (OSError, UnicodeError):
             continue
         if REDIRECT_RE.search(head):

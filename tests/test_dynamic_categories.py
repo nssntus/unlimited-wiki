@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import uuid
 
 import pytest
 
@@ -57,7 +59,7 @@ def test_preview_commit_inline_category_and_rollback(service: WikiService):
             "tags": ["AI", "Workflow"],
         }
     ])
-    assert preview["can_commit"] is True
+    assert preview["can_commit"] is True, preview
     assert not (service.root / "wiki" / "Research").exists()
 
     committed = service.classification_commit(preview["preview_id"])
@@ -100,6 +102,30 @@ def test_category_rename_archive_restore_and_empty_delete(service: WikiService):
     assert restored["category"]["status"] == "active"
     service.category_commit(service.category_preview("delete", category_id=category["category_id"])["preview_id"])
     assert not (service.root / "wiki" / "Reference").exists()
+
+
+def test_category_management_can_batch_migrate_articles(service: WikiService):
+    source = next(item for item in service.categories() if item["directory_name"] == "concepts")
+    target = next(item for item in service.categories() if item["directory_name"] == "tools")
+    generated = service.generate("Managed Migration")["article"]
+    classified = service.classification_preview([
+        {"article_id": generated["article_id"], "article_revision": generated["revision"], "decision": "existing", "category_id": source["category_id"]}
+    ])
+    service.classification_commit(classified["preview_id"])
+    before_revision = dc.load_registry(service.root)["revision"]
+    preview = service.category_preview(
+        "migrate",
+        category_id=source["category_id"],
+        target_category_id=target["category_id"],
+    )
+    assert preview["can_commit"] is True, preview
+    assert preview["moves"]
+    result = service.category_commit(preview["preview_id"])
+    assert result["operation_id"]
+    assert dc.load_registry(service.root)["revision"] == before_revision
+    assert all(item["primary_category_id"] == target["category_id"] for item in result["moved_articles"])
+    service.rollback(result["operation_id"])
+    assert any(item["primary_category_id"] == source["category_id"] for item in service.articles())
 
 
 def test_external_directory_only_creates_reconciliation_item(service: WikiService):
@@ -185,3 +211,123 @@ def test_classification_draft_survives_service_restart(kb_root: Path):
         assert workbench["draft"]["selections"] == [selection]
     finally:
         reopened.close()
+
+
+def test_classification_preview_blocks_duplicate_articles_and_target_paths(service: WikiService):
+    first = service.generate("Shared Name")["article"]
+    second_path = service.root / "wiki" / "_inbox" / "nested" / "Shared-Name.md"
+    second_path.parent.mkdir(parents=True)
+    second_path.write_text(
+        dc.ensure_article_metadata(
+            "# Other Shared Name\n\nBody from the second article.\n",
+            category_id=None,
+            status="pending",
+            article_uuid=uuid.uuid4().hex,
+            article_tags=[],
+        ),
+        encoding="utf-8",
+    )
+    second = service.read_article("_inbox/nested/Shared-Name.md")
+    category = service.categories()[0]
+    duplicate_article = service.classification_preview([
+        {"article_id": first["article_id"], "article_revision": first["revision"], "decision": "existing", "category_id": category["category_id"]},
+        {"article_id": first["article_id"], "article_revision": first["revision"], "decision": "existing", "category_id": category["category_id"]},
+    ])
+    assert duplicate_article["can_commit"] is False
+    assert {item["kind"] for item in duplicate_article["conflicts"]} == {"duplicate_article_selection"}
+
+    collision = service.classification_preview([
+        {"article_id": first["article_id"], "article_revision": first["revision"], "decision": "existing", "category_id": category["category_id"]},
+        {"article_id": second["article_id"], "article_revision": second["revision"], "decision": "existing", "category_id": category["category_id"]},
+    ])
+    assert collision["can_commit"] is False
+    assert "duplicate_target_path" in {item["kind"] for item in collision["conflicts"]}
+    with pytest.raises(RuntimeError, match="duplicate paths"):
+        service.classification_commit(collision["preview_id"])
+    assert service.read_article(first["path"])["markdown"] == first["markdown"]
+    assert service.read_article(second["path"])["markdown"] == second["markdown"]
+    assert not (service.root / "wiki" / category["directory_name"] / "Shared-Name.md").exists()
+
+
+def test_existing_category_confirmation_preserves_taxonomy_and_other_suggestions(service: WikiService):
+    first = service.generate("Confirm One")["article"]
+    second = service.generate("Keep Suggestion")["article"]
+    registry = dc.load_registry(service.root)
+    category = service.categories()[0]
+    service.state.save_classification_suggestion(
+        second["article_id"], second["revision"], registry["revision"], "succeeded",
+        suggestion={"candidates": [{"category_id": category["category_id"], "confidence": 0.9, "reason": "stable"}], "tags": [], "new_category": None},
+    )
+    preview = service.classification_preview([
+        {"article_id": first["article_id"], "article_revision": first["revision"], "decision": "existing", "category_id": category["category_id"]}
+    ])
+    service.classification_commit(preview["preview_id"])
+    assert dc.load_registry(service.root)["revision"] == registry["revision"]
+    remaining = next(item for item in service.classification_workbench()["items"] if item["article"]["article_id"] == second["article_id"])
+    assert remaining["suggestion"]["status"] == "succeeded"
+
+
+def test_reconciliation_scan_removes_disappeared_pending_items(service: WikiService):
+    external = service.root / "wiki" / "Transient"
+    external.mkdir()
+    assert service.scan_reconciliation()["count"] == 1
+    external.rmdir()
+    result = service.scan_reconciliation()
+    assert result["count"] == 0
+    assert service.state.list_reconciliation() == []
+
+
+def test_concurrent_directory_adoption_preserves_both_categories(service: WikiService):
+    for name in ("ExternalA", "ExternalB"):
+        folder = service.root / "wiki" / name
+        folder.mkdir()
+        (folder / "note.md").write_text(f"# {name}\n\nBody\n", encoding="utf-8")
+    items = {item["payload"]["path"]: item for item in service.scan_reconciliation()["items"]}
+    previews = [service.reconciliation_preview(items[name]["id"], "adopt")["preview_id"] for name in ("ExternalA", "ExternalB")]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(service.reconciliation_commit, previews))
+    assert all(item["operation_id"] for item in results)
+    registry = dc.load_registry(service.root)
+    adopted = {item["directory_name"]: item for item in registry["categories"] if item["directory_name"].startswith("External")}
+    assert set(adopted) == {"ExternalA", "ExternalB"}
+    for name, category in adopted.items():
+        article = service.read_article(f"{name}/note.md")
+        assert article["primary_category_id"] == category["category_id"]
+
+
+def test_late_classification_and_raw_results_do_not_persist(service: WikiService, monkeypatch: pytest.MonkeyPatch):
+    article = service.generate("Late Classification")["article"]
+    registry = dc.load_registry(service.root)
+    article_task, _ = service.state.enqueue_task(
+        "article-classification",
+        article["article_id"],
+        {"path": article["path"], "article_id": article["article_id"], "article_revision": article["revision"], "taxonomy_revision": registry["revision"]},
+    )
+    article_task = service.state.claim_task({"article-classification"}) or article_task
+    monkeypatch.setattr(service, "_call_classification_llm", lambda *_args: (
+        service.state.cancel_task(article_task["id"]),
+        {"candidates": [], "tags": [], "new_category": None},
+    )[1])
+    article_result = service._run_classification_task(article_task)
+    assert article_result["cancelled"] is True
+    assert service._finalize_remote_result(article_task, article_result)["status"] == "cancelled"
+    assert service.state.classification_suggestion(article["article_id"], article["revision"], registry["revision"]) is None
+
+    raw_path = service.root / "raw" / "local" / "late.txt"
+    raw_path.write_text("Raw body for a delayed category plan.", encoding="utf-8")
+    raw = service.read_raw("raw/local/late.txt")
+    raw_task, _ = service.state.enqueue_task(
+        "raw-classification-plan",
+        raw["path"],
+        {"raw_path": raw["path"], "raw_revision": raw["revision"], "taxonomy_revision": registry["revision"]},
+    )
+    raw_task = service.state.claim_task({"raw-classification-plan"}) or raw_task
+    monkeypatch.setattr(service, "_call_raw_plan_llm", lambda *_args: (
+        service.category_commit(service.category_preview("create", name="Changed During Model")["preview_id"]),
+        {"candidates": []},
+    )[1])
+    raw_result = service._run_raw_classification_plan(raw_task)
+    assert raw_result["stale"] is True
+    assert service._finalize_remote_result(raw_task, raw_result)["status"] == "failed"
+    plan = service.state.raw_classification_plan(raw["path"], raw["revision"], registry["revision"])
+    assert plan is None or plan["status"] != "succeeded"

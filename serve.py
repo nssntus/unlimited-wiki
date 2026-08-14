@@ -758,7 +758,7 @@ def make_handler(app: WikiApp):
                 response, replay = self._idempotency(data, lambda: service.retry_classification(_string(data, "article_id", maximum=64, required=True)))
                 return self._json(200 if replay else 202, response)
             if path == "/api/categories/preview":
-                _fields(data, {"action", "category_id", "name", "description", "sort_order"}, {"action"})
+                _fields(data, {"action", "category_id", "target_category_id", "name", "description", "sort_order"}, {"action"})
                 action = _string(data, "action", maximum=20, required=True)
                 sort_order = data.get("sort_order")
                 if sort_order is not None and (isinstance(sort_order, bool) or not isinstance(sort_order, int)):
@@ -766,6 +766,7 @@ def make_handler(app: WikiApp):
                 return self._json(200, service.category_preview(
                     action,
                     category_id=_string(data, "category_id", maximum=64),
+                    target_category_id=_string(data, "target_category_id", maximum=64),
                     name=_string(data, "name", maximum=80),
                     description=_string(data, "description", maximum=500),
                     sort_order=sort_order,

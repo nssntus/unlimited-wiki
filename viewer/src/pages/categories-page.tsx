@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   ArchiveIcon,
   ArrowDownIcon,
+  ArrowRightLeftIcon,
   ArrowUpIcon,
   FolderPlusIcon,
   PencilIcon,
@@ -23,7 +24,17 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { OperationRollbackAlert } from "@/features/operation-rollback-alert"
 import { apiGet, apiPost, type Category, queryKeys } from "@/lib/api"
 
 export function CategoriesPage() {
@@ -35,6 +46,8 @@ export function CategoriesPage() {
   const [name, setName] = useState("")
   const [description, setDescription] = useState("")
   const [sortOrder, setSortOrder] = useState<number | null>(null)
+  const [targetCategoryId, setTargetCategoryId] = useState("")
+  const [operationId, setOperationId] = useState<string | null>(null)
   const [preview, setPreview] = useState<{
     preview_id: string
     conflicts: { kind: string }[]
@@ -52,6 +65,7 @@ export function CategoriesPage() {
         {
           action: dialog?.action,
           category_id: dialog?.category?.category_id ?? "",
+          target_category_id: targetCategoryId,
           name,
           description,
           sort_order: sortOrder,
@@ -67,6 +81,7 @@ export function CategoriesPage() {
         preview_id: preview?.preview_id,
       }),
     onSuccess: async (result) => {
+      setOperationId(result.operation_id)
       toast.success(`分类操作完成 · ${result.operation_id}`)
       setDialog(null)
       setPreview(null)
@@ -79,6 +94,7 @@ export function CategoriesPage() {
     setName(category?.name ?? "")
     setDescription(category?.description ?? "")
     setSortOrder(category?.sort_order ?? null)
+    setTargetCategoryId("")
     setPreview(null)
   }
   const list = (status: string) => (
@@ -140,6 +156,16 @@ export function CategoriesPage() {
                     <ArchiveIcon data-icon="inline-start" />
                     归档
                   </Button>
+                  {category.article_count > 0 && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => open("migrate", category)}
+                    >
+                      <ArrowRightLeftIcon data-icon="inline-start" />
+                      迁移词条
+                    </Button>
+                  )}
                   <Button
                     size="sm"
                     variant="ghost"
@@ -165,6 +191,22 @@ export function CategoriesPage() {
         ))}
     </div>
   )
+  if (categories.isLoading) {
+    return <PageFrame><Skeleton className="h-80" /></PageFrame>
+  }
+  if (categories.isError) {
+    return (
+      <PageFrame>
+        <Alert variant="destructive">
+          <AlertTitle>分类加载失败</AlertTitle>
+          <AlertDescription className="flex flex-wrap items-center justify-between gap-3">
+            <span>{categories.error.message}</span>
+            <Button variant="outline" onClick={() => void categories.refetch()}>重试</Button>
+          </AlertDescription>
+        </Alert>
+      </PageFrame>
+    )
+  }
   return (
     <PageFrame>
       <div className="mx-auto max-w-5xl">
@@ -177,6 +219,11 @@ export function CategoriesPage() {
               新建分类
             </Button>
           }
+        />
+        <OperationRollbackAlert
+          operationId={operationId}
+          label="分类操作"
+          onRolledBack={() => setOperationId(null)}
         />
         <Tabs defaultValue="active">
           <TabsList>
@@ -207,7 +254,9 @@ export function CategoriesPage() {
                         ? "恢复分类"
                         : dialog?.action === "reorder"
                           ? "调整分类顺序"
-                          : "删除空分类"}
+                          : dialog?.action === "migrate"
+                            ? "批量迁移分类词条"
+                            : "删除空分类"}
               </DialogTitle>
               <DialogDescription>
                 实际磁盘变更会记录 operation ID，并支持回滚。
@@ -228,6 +277,27 @@ export function CategoriesPage() {
                   onChange={(event) => setDescription(event.target.value)}
                 />
               </div>
+            )}
+            {dialog?.action === "migrate" && (
+              <Select
+                value={targetCategoryId}
+                onValueChange={(value) => value && setTargetCategoryId(value)}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder="选择目标分类" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    {categories.data
+                      ?.filter((item) => item.status === "active" && item.category_id !== dialog.category?.category_id)
+                      .map((item) => (
+                        <SelectItem key={item.category_id} value={item.category_id}>
+                          {item.name} · {item.article_count} 篇
+                        </SelectItem>
+                      ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
             )}
             {preview &&
               (preview.conflicts.length ? (
@@ -258,7 +328,10 @@ export function CategoriesPage() {
                 </Button>
               ) : (
                 <Button
-                  disabled={makePreview.isPending}
+                  disabled={
+                    makePreview.isPending ||
+                    (dialog?.action === "migrate" && !targetCategoryId)
+                  }
                   onClick={() => makePreview.mutate()}
                 >
                   生成预览
