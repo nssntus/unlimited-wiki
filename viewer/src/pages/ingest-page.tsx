@@ -4,7 +4,7 @@ import { useLocation, useNavigate } from "react-router-dom"
 import { FileCheck2Icon } from "lucide-react"
 import { toast } from "sonner"
 
-import { apiGet, apiPost, type ArticleSummary, type Category, queryKeys, type RawInboxItem } from "@/lib/api"
+import { apiGet, apiPost, type ArticleSummary, queryKeys, type RawInboxItem } from "@/lib/api"
 import { MarkdownContent, StatusBadge } from "@/components/markdown-content"
 import { PageFrame, PageTitle } from "@/components/page-frame"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -17,19 +17,18 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 
-type Preview = { raw: RawInboxItem; markdown: string; suggested_title: string; suggested_category: string; suggested_disposition: string; suggested_target: string | null; preview_changes: string[] }
+type Preview = { raw: RawInboxItem; markdown: string; suggested_title: string; suggested_category: string | null; classification_plan: { status: string; candidates: { name: string; confidence: number; reason: string }[]; notice: string }; suggested_disposition: string; suggested_target: string | null; preview_changes: string[] }
 type CommitResult = { target_path: string | null; article: { path: string } | null; task?: { id: string } | null }
 
 export function IngestPage() {
   const path = decodeURIComponent(useLocation().pathname.replace(/^\/ingest\//, ""))
   const navigate = useNavigate(); const client = useQueryClient()
-  const preview = useQuery({ queryKey: ["ingest-preview", path], queryFn: () => apiGet<Preview>(`/api/ingest/preview?path=${encodeURIComponent(path)}`) })
-  const categories = useQuery({ queryKey: queryKeys.categories, queryFn: () => apiGet<Category[]>("/api/categories") })
+  const preview = useQuery({ queryKey: ["ingest-preview", path], queryFn: () => apiGet<Preview>(`/api/ingest/preview?path=${encodeURIComponent(path)}`), refetchInterval: (query) => ["queued", "running"].includes(query.state.data?.classification_plan.status ?? "") ? 1500 : false })
   const articles = useQuery({ queryKey: queryKeys.articles, queryFn: () => apiGet<ArticleSummary[]>("/api/articles") })
-  const [form, setForm] = useState<{ title?: string; category?: string; disposition?: string; target?: string }>({})
-  const title = form.title ?? preview.data?.suggested_title ?? ""; const category = form.category ?? preview.data?.suggested_category ?? "concepts"; const disposition = form.disposition ?? preview.data?.suggested_disposition ?? "new"; const target = form.target ?? preview.data?.suggested_target ?? ""
+  const [form, setForm] = useState<{ title?: string; disposition?: string; target?: string }>({})
+  const title = form.title ?? preview.data?.suggested_title ?? ""; const disposition = form.disposition ?? preview.data?.suggested_disposition ?? "new"; const target = form.target ?? preview.data?.suggested_target ?? ""
   const commit = useMutation({
-    mutationFn: () => apiPost<CommitResult>("/api/ingest/commit", { path, title, category, disposition, target_path: target }),
+    mutationFn: () => apiPost<CommitResult>("/api/ingest/commit", { path, title, disposition, target_path: target }),
     onSuccess: async (result) => {
       await client.invalidateQueries()
       toast.success(
@@ -53,7 +52,7 @@ export function IngestPage() {
   const data = preview.data
   return <PageFrame><div className="mx-auto max-w-5xl"><PageTitle eyebrow={<StatusBadge value="Raw 摄入预览" kind="warn" />} title={data.suggested_title} description={<code className="break-all">{data.raw.path}</code>} />
     {data.raw.status === "integrity_changed" && <Alert variant="destructive" className="mb-6"><AlertTitle>Raw 完整性已变化</AlertTitle><AlertDescription>请将新版本另存为新文件，不能覆盖已摄入证据。</AlertDescription></Alert>}
-    <div className="grid gap-8 lg:grid-cols-[22rem_minmax(0,1fr)]"><section><FieldGroup><Field><FieldLabel htmlFor="ingest-title">正本标题</FieldLabel><Input id="ingest-title" value={title} onChange={(event) => setForm((current) => ({ ...current, title: event.target.value }))} /></Field><Field><FieldLabel>分类</FieldLabel><Select value={category} onValueChange={(value) => value && setForm((current) => ({ ...current, category: value }))}><SelectTrigger className="w-full"><SelectValue /></SelectTrigger><SelectContent><SelectGroup>{categories.data?.map((item) => <SelectItem key={item.id} value={item.id}>{item.label}</SelectItem>)}</SelectGroup></SelectContent></Select></Field><FieldSet><FieldLegend>处置</FieldLegend><RadioGroup value={disposition} onValueChange={(value) => value && setForm((current) => ({ ...current, disposition: value }))}>{[["seed","采用为 Wiki 种子"],["new","新建正本"],["supplement","补充正本"],["duplicate","记录重复"],["defer","暂缓"]].map(([value,label]) => <Field key={value} orientation="horizontal"><RadioGroupItem id={`disp-${value}`} value={value} /><FieldLabel htmlFor={`disp-${value}`}>{label}</FieldLabel></Field>)}</RadioGroup><FieldDescription>{disposition === "seed" ? "完整保留原文结构和内容，不经过 AI 摘要或改写。" : "重复与暂缓不会写 Wiki、index 或 log。"}</FieldDescription></FieldSet>{["supplement","duplicate"].includes(disposition) && <Field><FieldLabel>目标正本</FieldLabel><Select value={target} onValueChange={(value) => value && setForm((current) => ({ ...current, target: value }))}><SelectTrigger className="w-full"><SelectValue placeholder="选择正本" /></SelectTrigger><SelectContent><SelectGroup>{articles.data?.map((item) => <SelectItem key={item.path} value={item.path}>{item.title}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>}</FieldGroup></section>
+    <div className="grid gap-8 lg:grid-cols-[22rem_minmax(0,1fr)]"><section><FieldGroup><Field><FieldLabel htmlFor="ingest-title">正本标题</FieldLabel><Input id="ingest-title" value={title} onChange={(event) => setForm((current) => ({ ...current, title: event.target.value }))} /></Field><Alert><AlertTitle>预计分类方案</AlertTitle><AlertDescription>{data.classification_plan.candidates.length ? data.classification_plan.candidates.map((item) => `${item.name} ${Math.round(item.confidence * 100)}%`).join(" · ") : "暂时没有匹配的现有分类"}<span className="mt-2 block">{data.classification_plan.notice}</span></AlertDescription></Alert><FieldSet><FieldLegend>处置</FieldLegend><RadioGroup value={disposition} onValueChange={(value) => value && setForm((current) => ({ ...current, disposition: value }))}>{[["seed","采用为 Wiki 种子"],["new","新建正本"],["supplement","补充正本"],["duplicate","记录重复"],["defer","暂缓"]].map(([value,label]) => <Field key={value} orientation="horizontal"><RadioGroupItem id={`disp-${value}`} value={value} /><FieldLabel htmlFor={`disp-${value}`}>{label}</FieldLabel></Field>)}</RadioGroup><FieldDescription>{disposition === "seed" ? "完整保留原文结构和内容，不经过 AI 摘要或改写；完成后进入待归类。" : "重复与暂缓不会写 Wiki、index 或 log。"}</FieldDescription></FieldSet>{["supplement","duplicate"].includes(disposition) && <Field><FieldLabel>目标正本</FieldLabel><Select value={target} onValueChange={(value) => value && setForm((current) => ({ ...current, target: value }))}><SelectTrigger className="w-full"><SelectValue placeholder="选择正本" /></SelectTrigger><SelectContent><SelectGroup>{articles.data?.map((item) => <SelectItem key={item.path} value={item.path}>{item.title}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>}</FieldGroup></section>
       <Tabs defaultValue="content"><TabsList><TabsTrigger value="content">正文预览</TabsTrigger><TabsTrigger value="changes">变更预览</TabsTrigger></TabsList><TabsContent value="content" className="mt-4 max-h-[60svh] overflow-y-auto border-l pl-6"><MarkdownContent markdown={data.markdown} fromPath={data.raw.path} /></TabsContent><TabsContent value="changes" className="mt-4"><ul className="flex flex-col gap-3 text-sm">{data.preview_changes.map((item) => <li key={item} className="border-b pb-3">更新 {item}</li>)}</ul></TabsContent></Tabs>
     </div><div className="sticky bottom-0 mt-8 flex justify-end gap-2 border-t bg-background/95 py-4 backdrop-blur"><Button variant="outline" onClick={() => navigate("/inbox")}>取消</Button><Button disabled={commit.isPending || data.raw.status === "integrity_changed"} onClick={() => commit.mutate()}>{commit.isPending ? <Spinner data-icon="inline-start" /> : <FileCheck2Icon data-icon="inline-start" />}确认处置</Button></div>
   </div></PageFrame>

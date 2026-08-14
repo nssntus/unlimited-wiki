@@ -84,7 +84,8 @@ def test_raw_ingest_keeps_source_immutable_and_is_duplicate_safe(service: WikiSe
     raw_path.write_text("Raw Definition 是一个至少八十个字符的明确释义。" * 8, encoding="utf-8")
     before = hashlib.sha256(raw_path.read_bytes()).hexdigest()
     result = service.ingest_commit("raw/local/sample.txt", "new", title="Raw Definition", category="concepts")
-    assert result["target_path"] == "concepts/Raw-Definition.md"
+    assert result["target_path"] == "_inbox/Raw-Definition.md"
+    assert result["article"]["classification_status"] == "pending"
     assert hashlib.sha256(raw_path.read_bytes()).hexdigest() == before
     copy = kb_root / "raw" / "local" / "sample-copy.txt"
     copy.write_bytes(raw_path.read_bytes())
@@ -200,7 +201,7 @@ def test_seed_ingest_preserves_complete_source_without_ai_rewrite(kb_root: Path)
         assert article["generation"].startswith("seed-adopted")
         assert article["completeness"] == "完整"
         assert result["task"] is None
-        assert service.state.list_tasks() == []
+        assert result["classification_task"]["kind"] == "article-classification"
         assert raw_path.read_text(encoding="utf-8") == raw
         assert __import__("wiki_ops").article_quality_issues(kb_root, article["path"], article["markdown"]) == []
     finally:

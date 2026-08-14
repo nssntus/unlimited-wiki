@@ -132,6 +132,37 @@ def test_two_users_isolate_files_tasks_idempotency_and_model_secrets(multi_serve
     assert injected == 400
 
 
+def test_dynamic_category_article_and_reconciliation_ids_are_tenant_scoped(multi_server):
+    app, base = multi_server
+    alice, bob = Client(base), Client(base)
+    assert alice.register("category-alice@example.com", "Category Alice")[0] == 201
+    assert bob.register("category-bob@example.com", "Category Bob")[0] == 201
+    seed_article(app, alice, "Alice taxonomy")
+    alice_service = app.workspace_service(context_for(app, alice))
+    article = alice_service.read_article("concepts/shared.md")
+    category = next(item for item in alice_service.categories() if item["directory_name"] == "concepts")
+    external = alice_service.root / "wiki" / "AliceExternal"
+    external.mkdir()
+    reconciliation = next(item for item in alice_service.scan_reconciliation()["items"] if item["kind"] == "new_directory")
+
+    status, _ = bob.request("POST", "/api/classifications/preview", {
+        "selections": [{
+            "article_id": article["article_id"],
+            "article_revision": article["revision"],
+            "decision": "existing",
+            "category_id": category["category_id"],
+            "tags": [],
+        }],
+    }, key="cross-article")
+    assert status == 404
+    assert bob.request("POST", "/api/categories/preview", {
+        "action": "archive", "category_id": category["category_id"],
+    }, key="cross-category")[0] == 404
+    assert bob.request("POST", "/api/reconciliation/preview", {
+        "reconciliation_id": reconciliation["id"], "decision": "adopt",
+    }, key="cross-reconciliation")[0] == 404
+
+
 def test_logout_revoke_all_and_role_change_take_effect_immediately(multi_server):
     app, base = multi_server
     alice = Client(base)

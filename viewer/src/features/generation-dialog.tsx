@@ -66,7 +66,7 @@ export function GenerationDialog({ request, onOpenChange }: { request: Generatio
         ) : data ? (
           <div className="flex flex-col gap-5">
             <div className="grid gap-4 border-y py-4 sm:grid-cols-3">
-              <div><div className="text-xs text-muted-foreground">分类建议</div><div className="mt-1 text-sm font-medium">{data.category_label}</div></div>
+              <div><div className="text-xs text-muted-foreground">预计分类</div><div className="mt-1 text-sm font-medium">{data.category_label}</div><div className="mt-1 text-xs text-muted-foreground">仅预览，不创建目录</div></div>
               <div><div className="text-xs text-muted-foreground">本地证据</div><div className="mt-1"><StatusBadge value={data.local_coverage.sufficient ? "充分" : "不足"} kind={data.local_coverage.sufficient ? "good" : "warn"} /></div></div>
               <div><div className="text-xs text-muted-foreground">证据范围</div><div className="mt-1 text-sm font-medium">{data.local_coverage.document_count} 篇 / {data.local_coverage.char_count} 字</div></div>
             </div>
@@ -75,6 +75,7 @@ export function GenerationDialog({ request, onOpenChange }: { request: Generatio
               <AlertTitle>{data.local_coverage.sufficient ? "直接使用本地资料" : "先建本地草稿，再后台补证"}</AlertTitle>
               <AlertDescription>{data.local_coverage.sufficient ? "该路径不会发起网页请求。" : "阅读不会等待网络；超时、证书、无结果和模型错误会分别记录。"}</AlertDescription>
             </Alert>
+            <Alert><AlertTitle>生成后进入待归类</AlertTitle><AlertDescription>新正本会先保存到待归类目录，AI 基于完整正文给出最多三个候选；实际移动需要你在归类工作台确认。</AlertDescription></Alert>
             <section>
               <h3 className="mb-2 text-sm font-medium">采用上下文</h3>
               <div className="border-l-2 pl-4 text-sm leading-6 text-muted-foreground">

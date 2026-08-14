@@ -109,6 +109,7 @@ class FileStore:
         metadata: dict | None = None,
         operation_id: str | None = None,
         must_not_exist: bool = False,
+        directories: dict[str, bool] | None = None,
     ) -> dict:
         normalized: dict[str, bytes | None] = {}
         for rel, value in changes.items():
@@ -116,7 +117,13 @@ class FileStore:
             if clean.startswith(".wiki-state/"):
                 raise ValueError("business writes cannot target runtime state")
             normalized[clean] = value.encode("utf-8") if isinstance(value, str) else value
-        if not normalized:
+        normalized_dirs: dict[str, bool] = {}
+        for rel, desired in (directories or {}).items():
+            clean = safe_project_rel(rel)
+            if clean.startswith(".wiki-state/") or not isinstance(desired, bool):
+                raise ValueError("invalid directory transaction")
+            normalized_dirs[clean] = desired
+        if not normalized and not normalized_dirs:
             raise ValueError("empty transaction")
 
         op_id = operation_id or uuid.uuid4().hex
@@ -129,6 +136,12 @@ class FileStore:
             backups = op_dir / "before"
             backups.mkdir(parents=True)
             entries: list[dict] = []
+            directory_entries: list[dict] = []
+            for rel, desired in sorted(normalized_dirs.items()):
+                path = self.resolve(rel)
+                if path.exists() and not path.is_dir():
+                    raise ValueError(f"directory path is occupied: {rel}")
+                directory_entries.append({"path": rel, "before_exists": path.is_dir(), "after_exists": desired})
             for index, (rel, after) in enumerate(sorted(normalized.items())):
                 path = self.resolve(rel)
                 existed = path.is_file()
@@ -151,11 +164,15 @@ class FileStore:
                 "status": "prepared",
                 "metadata": metadata or {},
                 "entries": entries,
+                "directories": directory_entries,
             }
             self._write_manifest(op_dir, manifest)
             manifest["status"] = "applying"
             self._write_manifest(op_dir, manifest)
             try:
+                for entry in directory_entries:
+                    if entry["after_exists"]:
+                        self.resolve(entry["path"]).mkdir(parents=True, exist_ok=True)
                 for rel, after in sorted(normalized.items()):
                     path = self.resolve(rel)
                     if after is None:
@@ -164,6 +181,9 @@ class FileStore:
                             _fsync_dir(path.parent)
                     else:
                         atomic_write(path, after)
+                for entry in reversed(directory_entries):
+                    if not entry["after_exists"]:
+                        self.resolve(entry["path"]).rmdir()
                 manifest["status"] = "committed"
                 manifest["committed_at"] = utc_now()
                 self._write_manifest(op_dir, manifest)
@@ -185,6 +205,13 @@ class FileStore:
                 with contextlib.suppress(FileNotFoundError):
                     path.unlink()
                     _fsync_dir(path.parent)
+        for entry in reversed(manifest.get("directories", [])):
+            path = self.resolve(entry["path"])
+            if entry.get("before_exists"):
+                path.mkdir(parents=True, exist_ok=True)
+            else:
+                with contextlib.suppress(FileNotFoundError, OSError):
+                    path.rmdir()
 
     def recover(self) -> list[str]:
         recovered: list[str] = []

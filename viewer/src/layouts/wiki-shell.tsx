@@ -5,6 +5,7 @@ import {
   ArchiveIcon,
   BellIcon,
   CheckCircle2Icon,
+  FolderCogIcon,
   FilePenLineIcon,
   InboxIcon,
   ListTodoIcon,
@@ -15,6 +16,8 @@ import {
   ShieldCheckIcon,
   StoreIcon,
   WorkflowIcon,
+  ListChecksIcon,
+  RefreshCcwDotIcon,
 } from "lucide-react"
 
 import { apiGet, type ArticleSummary, type Category, type Notification, queryKeys } from "@/lib/api"
@@ -44,6 +47,9 @@ import { useSession } from "@/features/session-context"
 
 const routes = [
   ["/inbox", "原料箱", InboxIcon],
+  ["/classification", "待归类", ListChecksIcon],
+  ["/categories", "分类管理", FolderCogIcon],
+  ["/reconciliation", "文件对账", RefreshCcwDotIcon],
   ["/todo", "待写概念", ListTodoIcon],
   ["/health", "健康检查", CheckCircle2Icon],
   ["/tasks", "任务", WorkflowIcon],
@@ -100,7 +106,7 @@ export function WikiShell() {
             {articles.isLoading ? (
               <div className="flex flex-col gap-3 p-4"><Skeleton className="h-7 w-full" /><Skeleton className="h-7 w-5/6" /><Skeleton className="h-7 w-full" /></div>
             ) : categories.data?.map((category) => {
-              const rows = (articles.data ?? []).filter((article) => article.category === category.id)
+              const rows = (articles.data ?? []).filter((article) => article.primary_category_id === category.category_id)
               if (!rows.length) return null
               return (
                 <SidebarGroup key={category.id}>
@@ -124,6 +130,12 @@ export function WikiShell() {
                 </SidebarGroup>
               )
             })}
+            {(articles.data ?? []).some((article) => article.classification_status !== "confirmed") && (
+              <SidebarGroup>
+                <SidebarGroupLabel>待归类</SidebarGroupLabel>
+                <SidebarGroupContent><SidebarMenu>{(articles.data ?? []).filter((article) => article.classification_status !== "confirmed").map((article) => <SidebarMenuItem key={article.path}><SidebarMenuButton render={<Link to={articleHref(article.path)} />} isActive={location.pathname === articleHref(article.path)} tooltip={article.title}><FilePenLineIcon /><span>{article.title}</span></SidebarMenuButton><SidebarMenuBadge>待确认</SidebarMenuBadge></SidebarMenuItem>)}</SidebarMenu></SidebarGroupContent>
+              </SidebarGroup>
+            )}
           </ScrollArea>
         </SidebarContent>
         <SidebarFooter className="border-t px-4 py-3 text-xs text-muted-foreground">

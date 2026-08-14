@@ -1,4 +1,17 @@
-export type Category = { id: string; label: string; blurb: string }
+export type Category = {
+  id: string
+  category_id: string
+  label: string
+  name: string
+  blurb: string
+  description: string
+  directory_name: string
+  aliases: string[]
+  status: "active" | "archived"
+  sort_order: number
+  article_count: number
+  revision: number
+}
 
 export type ArticleSummary = {
   path: string
@@ -9,6 +22,10 @@ export type ArticleSummary = {
   content_status: string
   completeness: string
   evidence_status: string
+  article_id: string
+  primary_category_id: string | null
+  tags: string[]
+  classification_status: "pending" | "confirmed" | "sync_conflict"
 }
 
 export type Article = ArticleSummary & {
@@ -154,6 +171,8 @@ export async function apiPost<T>(path: string, body: Record<string, unknown>, id
 export const queryKeys = {
   articles: ["articles"] as const,
   categories: ["categories"] as const,
+  classifications: ["classifications"] as const,
+  reconciliation: ["reconciliation"] as const,
   article: (path: string) => ["article", path] as const,
   raw: (path: string) => ["raw", path] as const,
   tasks: ["tasks"] as const,

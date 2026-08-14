@@ -70,6 +70,54 @@ class StateStore:
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS raw_records_hash ON raw_records(byte_hash);
+                CREATE TABLE IF NOT EXISTS classification_suggestions (
+                    article_id TEXT NOT NULL,
+                    article_revision TEXT NOT NULL,
+                    taxonomy_revision INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    suggestion_json TEXT,
+                    task_id TEXT,
+                    error_type TEXT,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(article_id, article_revision, taxonomy_revision)
+                );
+                CREATE TABLE IF NOT EXISTS raw_classification_plans (
+                    raw_path TEXT NOT NULL,
+                    raw_revision TEXT NOT NULL,
+                    taxonomy_revision INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    plan_json TEXT,
+                    task_id TEXT,
+                    error_type TEXT,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(raw_path, raw_revision, taxonomy_revision)
+                );
+                CREATE TABLE IF NOT EXISTS classification_previews (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS classification_draft (
+                    id INTEGER PRIMARY KEY CHECK(id=1),
+                    revision INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS reconciliation_items (
+                    id TEXT PRIMARY KEY,
+                    fingerprint TEXT NOT NULL UNIQUE,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             db.execute("DROP INDEX IF EXISTS tasks_one_active")
@@ -320,6 +368,165 @@ class StateStore:
                         row["id"],
                     ),
                 )
+
+    def save_classification_suggestion(
+        self,
+        article_id: str,
+        article_revision: str,
+        taxonomy_revision: int,
+        status: str,
+        *,
+        suggestion: dict | None = None,
+        task_id: str | None = None,
+        error_type: str | None = None,
+        error_message: str | None = None,
+    ) -> dict:
+        stamp = now_iso()
+        with self.connect() as db:
+            db.execute(
+                """INSERT INTO classification_suggestions
+                (article_id,article_revision,taxonomy_revision,status,suggestion_json,task_id,error_type,error_message,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(article_id,article_revision,taxonomy_revision) DO UPDATE SET
+                status=excluded.status,suggestion_json=excluded.suggestion_json,task_id=excluded.task_id,
+                error_type=excluded.error_type,error_message=excluded.error_message,updated_at=excluded.updated_at""",
+                (article_id, article_revision, taxonomy_revision, status,
+                 json.dumps(suggestion, ensure_ascii=False) if suggestion is not None else None,
+                 task_id, error_type, error_message[:500] if error_message else None, stamp, stamp),
+            )
+        return self.classification_suggestion(article_id, article_revision, taxonomy_revision) or {}
+
+    def save_raw_classification_plan(self, raw_path: str, raw_revision: str, taxonomy_revision: int, status: str, *, plan: dict | None = None, task_id: str | None = None, error_type: str | None = None, error_message: str | None = None) -> dict:
+        stamp = now_iso()
+        with self.connect() as db:
+            db.execute(
+                """INSERT INTO raw_classification_plans
+                (raw_path,raw_revision,taxonomy_revision,status,plan_json,task_id,error_type,error_message,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(raw_path,raw_revision,taxonomy_revision) DO UPDATE SET
+                status=excluded.status,plan_json=excluded.plan_json,task_id=excluded.task_id,
+                error_type=excluded.error_type,error_message=excluded.error_message,updated_at=excluded.updated_at""",
+                (raw_path, raw_revision, taxonomy_revision, status, json.dumps(plan, ensure_ascii=False) if plan is not None else None, task_id, error_type, error_message[:500] if error_message else None, stamp, stamp),
+            )
+        return self.raw_classification_plan(raw_path, raw_revision, taxonomy_revision) or {}
+
+    def raw_classification_plan(self, raw_path: str, raw_revision: str, taxonomy_revision: int) -> dict | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM raw_classification_plans WHERE raw_path=? AND raw_revision=? AND taxonomy_revision=?",
+                (raw_path, raw_revision, taxonomy_revision),
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        raw_plan = item.pop("plan_json")
+        item["plan"] = json.loads(raw_plan) if raw_plan else None
+        return item
+
+    def classification_suggestion(self, article_id: str, article_revision: str, taxonomy_revision: int) -> dict | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM classification_suggestions WHERE article_id=? AND article_revision=? AND taxonomy_revision=?",
+                (article_id, article_revision, taxonomy_revision),
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        raw_suggestion = item.pop("suggestion_json")
+        item["suggestion"] = json.loads(raw_suggestion) if raw_suggestion else None
+        return item
+
+    def create_preview(self, kind: str, payload: dict, *, ttl_minutes: int = 30) -> dict:
+        preview_id = uuid.uuid4().hex
+        created = now_iso()
+        expires = (datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)).isoformat(timespec="seconds")
+        with self.connect() as db:
+            db.execute(
+                "INSERT INTO classification_previews(id,kind,payload_json,expires_at,created_at) VALUES(?,?,?,?,?)",
+                (preview_id, kind, json.dumps(payload, ensure_ascii=False), expires, created),
+            )
+        return {"preview_id": preview_id, "kind": kind, "payload": payload, "expires_at": expires}
+
+    def get_preview(self, preview_id: str, kind: str) -> dict:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM classification_previews WHERE id=? AND kind=? AND expires_at>=?",
+                (preview_id, kind, now_iso()),
+            ).fetchone()
+        if not row:
+            raise FileNotFoundError(preview_id)
+        return {**dict(row), "payload": json.loads(row["payload_json"])}
+
+    def consume_preview(self, preview_id: str) -> None:
+        with self.connect() as db:
+            db.execute("DELETE FROM classification_previews WHERE id=?", (preview_id,))
+
+    def classification_draft(self) -> dict:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM classification_draft WHERE id=1").fetchone()
+        if not row:
+            return {"revision": 0, "selections": []}
+        return {"revision": row["revision"], "selections": json.loads(row["payload_json"])}
+
+    def save_classification_draft(self, selections: list[dict], expected_revision: int) -> dict:
+        if not isinstance(selections, list) or len(selections) > 500:
+            raise ValueError("invalid classification draft")
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT revision FROM classification_draft WHERE id=1").fetchone()
+            current = row["revision"] if row else 0
+            if current != expected_revision:
+                db.rollback()
+                raise RuntimeError("classification draft changed")
+            next_revision = current + 1
+            db.execute(
+                """INSERT INTO classification_draft(id,revision,payload_json,updated_at) VALUES(1,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,payload_json=excluded.payload_json,updated_at=excluded.updated_at""",
+                (next_revision, json.dumps(selections, ensure_ascii=False), now_iso()),
+            )
+            db.commit()
+        return {"revision": next_revision, "selections": selections}
+
+    def clear_classification_draft(self) -> None:
+        with self.connect() as db:
+            db.execute("DELETE FROM classification_draft WHERE id=1")
+
+    def replace_reconciliation(self, items: list[dict]) -> list[dict]:
+        stamp = now_iso()
+        with self.connect() as db:
+            for item in items:
+                db.execute(
+                    """INSERT INTO reconciliation_items(id,fingerprint,kind,payload_json,status,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?) ON CONFLICT(fingerprint) DO UPDATE SET
+                    kind=excluded.kind,payload_json=excluded.payload_json,updated_at=excluded.updated_at""",
+                    (uuid.uuid4().hex, item["fingerprint"], item["kind"], json.dumps(item, ensure_ascii=False), "pending", stamp, stamp),
+                )
+        return self.list_reconciliation()
+
+    def list_reconciliation(self, status: str = "pending") -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT * FROM reconciliation_items WHERE status=? ORDER BY created_at", (status,)
+            ).fetchall()
+        return [{**dict(row), "payload": json.loads(row["payload_json"])} for row in rows]
+
+    def get_reconciliation(self, item_id: str) -> dict:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM reconciliation_items WHERE id=?", (item_id,)).fetchone()
+        if not row:
+            raise FileNotFoundError(item_id)
+        return {**dict(row), "payload": json.loads(row["payload_json"])}
+
+    def resolve_reconciliation(self, item_id: str, status: str) -> dict:
+        if status not in {"adopted", "restored", "deferred"}:
+            raise ValueError("invalid reconciliation status")
+        with self.connect() as db:
+            changed = db.execute(
+                "UPDATE reconciliation_items SET status=?,updated_at=? WHERE id=? AND status='pending'",
+                (status, now_iso(), item_id),
+            ).rowcount
+        if not changed:
+            raise ValueError("reconciliation item is no longer pending")
+        return self.get_reconciliation(item_id)
 
     @staticmethod
     def _task(row: sqlite3.Row) -> dict:
