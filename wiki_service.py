@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path, PurePosixPath
@@ -18,6 +19,7 @@ import categories as cats
 import keywords as kw
 import websearch
 import wiki_ops
+from document_ingest import MAX_INPUT_BYTES, SUPPORTED_SUFFIXES, parse_document_cached
 from security import RemoteError, resolve_relative_file
 from state_store import StateStore
 from storage import FileStore
@@ -274,12 +276,15 @@ class WikiService:
 
     def read_raw(self, rel: str) -> dict:
         clean = rel.removeprefix("raw/")
-        path = resolve_relative_file(self.root / "raw", clean, suffixes={".md", ".markdown", ".txt"})
+        path = resolve_relative_file(self.root / "raw", clean, suffixes=SUPPORTED_SUFFIXES)
         data = path.read_bytes()
-        if len(data) > 10 * 1024 * 1024:
-            raise ValueError("Raw file exceeds 10 MiB")
-        md = data.decode("utf-8-sig")
-        return {"path": f"raw/{clean}", "title": kw.parse_title(md) or path.stem, "markdown": md, "kind": "raw", "revision": hashlib.sha256(data).hexdigest()}
+        parsed = parse_document_cached(self.root, path.name, data)
+        return {
+            "path": f"raw/{clean}", "title": kw.parse_title(parsed.markdown) or path.stem,
+            "markdown": parsed.markdown, "kind": "raw", "revision": hashlib.sha256(data).hexdigest(),
+            "source_format": parsed.source_format, "extracted_chars": parsed.extracted_chars,
+            "used_ocr": parsed.used_ocr,
+        }
 
     def preflight_generate(self, keyword: str, *, from_path: str = "", heading: str = "", passage: str = "") -> dict:
         term = kw.normalize(keyword)
@@ -455,27 +460,28 @@ class WikiService:
         return {"conflict": False, "operation_id": operation_id, "article": self.read_article(rel)}
 
     @staticmethod
-    def _canonical_text_hash(data: bytes) -> str:
-        text = data.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+    def _canonical_text_hash(text: str) -> str:
+        text = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-    def upload_raw(self, filename: str, content: str) -> dict:
+    def upload_raw(self, filename: str, content: str | bytes) -> dict:
         if not isinstance(filename, str) or not filename.strip() or len(filename) > 255:
             raise ValueError("invalid filename")
-        if not isinstance(content, str) or not content:
+        if not isinstance(content, (str, bytes)) or not content:
             raise ValueError("Raw content cannot be empty")
-        data = content.encode("utf-8")
-        if len(data) > 10 * 1024 * 1024:
+        data = content.encode("utf-8") if isinstance(content, str) else content
+        if len(data) > MAX_INPUT_BYTES:
             raise ValueError("Raw file exceeds 10 MiB")
         name = Path(filename.strip()).name
-        if name != filename.strip() or any(ord(ch) < 32 for ch in name):
+        if name != filename.strip() or name.startswith(".") or any(ord(ch) < 32 for ch in name):
             raise ValueError("invalid filename")
         suffix = Path(name).suffix.lower()
-        if suffix not in {".md", ".markdown", ".txt"}:
-            raise ValueError("unsupported file type")
+        if suffix not in SUPPORTED_SUFFIXES:
+            raise ValueError("不支持该文件格式，未加入原料箱")
+        parsed = parse_document_cached(self.root, name, data)
 
         digest = hashlib.sha256(data).hexdigest()
-        text_digest = self._canonical_text_hash(data)
+        text_digest = self._canonical_text_hash(parsed.markdown)
         for item in self.raw_inbox():
             if item.get("byte_hash") == digest or item.get("text_hash") == text_digest:
                 return {"created": False, "raw": item}
@@ -483,17 +489,30 @@ class WikiService:
         stem = Path(name).stem[:160].strip(" .") or "material"
         candidate = f"local/{stem}{suffix}"
         counter = 2
-        while (self.root / "raw" / candidate).exists():
-            candidate = f"local/{stem}-{counter}{suffix}"
-            counter += 1
-        operation_id = f"raw-upload-{digest[:20]}"
-        self.files.commit(
-            {f"raw/{candidate}": data},
-            kind="raw-upload",
-            metadata={"filename": name, "path": f"raw/{candidate}"},
-            operation_id=operation_id,
-        )
-        item = next(entry for entry in self.raw_inbox() if entry["path"] == f"raw/{candidate}")
+        operation_id = f"raw-upload-{digest[:12]}-{uuid.uuid4().hex}"
+        while True:
+            try:
+                self.files.commit(
+                    {f"raw/{candidate}": data},
+                    kind="raw-upload",
+                    metadata={"filename": name, "path": f"raw/{candidate}"},
+                    operation_id=operation_id,
+                    must_not_exist=True,
+                )
+                break
+            except FileExistsError:
+                existing = next((item for item in self.raw_inbox() if item.get("byte_hash") == digest), None)
+                if existing is not None:
+                    return {"created": False, "raw": existing}
+                candidate = f"local/{stem}-{counter}{suffix}"
+                counter += 1
+        item = {
+            "path": f"raw/{candidate}", "size": len(data), "ingestable": True, "reason": None,
+            "title": kw.parse_title(parsed.markdown) or Path(name).stem, "byte_hash": digest,
+            "text_hash": text_digest, "source_format": parsed.source_format,
+            "extracted_chars": parsed.extracted_chars, "used_ocr": parsed.used_ocr,
+            "status": "unlinked", "linked_target": None,
+        }
         return {"created": True, "operation_id": operation_id, "raw": item}
 
     def raw_inbox(self) -> list[dict]:
@@ -511,23 +530,23 @@ class WikiService:
         out = []
         raw_root = self.root / "raw"
         for path in sorted(raw_root.rglob("*")):
-            if not path.is_file() or path.is_symlink() or path.suffix.lower() not in {".md", ".markdown", ".txt"}:
+            if not path.is_file() or path.is_symlink() or path.suffix.lower() not in SUPPORTED_SUFFIXES:
                 continue
             rel = path.relative_to(self.root).as_posix()
             if any(part.startswith(".") for part in path.relative_to(raw_root).parts):
                 continue
             size = path.stat().st_size
-            item = {"path": rel, "size": size, "ingestable": True, "reason": None}
-            if size > 10 * 1024 * 1024:
-                item.update(ingestable=False, reason="too_large")
+            item = {"path": rel, "size": size, "ingestable": True, "reason": None, "status": "unlinked"}
+            if size > MAX_INPUT_BYTES:
+                item.update(ingestable=False, reason="Raw 文件超过 10 MiB", status="rejected")
                 out.append(item)
                 continue
             data = path.read_bytes()
             try:
-                text_hash = self._canonical_text_hash(data)
-                text = data.decode("utf-8-sig")
-            except UnicodeDecodeError:
-                item.update(ingestable=False, reason="not_utf8")
+                parsed = parse_document_cached(self.root, path.name, data)
+                text_hash = self._canonical_text_hash(parsed.markdown)
+            except ValueError as exc:
+                item.update(ingestable=False, reason=str(exc), status="rejected")
                 out.append(item)
                 continue
             byte_hash = hashlib.sha256(data).hexdigest()
@@ -541,9 +560,12 @@ class WikiService:
                     pass
             item.update(
                 {
-                    "title": kw.parse_title(text) or path.stem,
+                    "title": kw.parse_title(parsed.markdown) or path.stem,
                     "byte_hash": byte_hash,
                     "text_hash": text_hash,
+                    "source_format": parsed.source_format,
+                    "extracted_chars": parsed.extracted_chars,
+                    "used_ocr": parsed.used_ocr,
                     "status": "integrity_changed" if record and record["byte_hash"] != byte_hash else ("ingested" if linked_target else ("duplicate" if duplicate else "unlinked")),
                     "linked_target": linked_target or (duplicate["target_path"] if duplicate else None),
                 }

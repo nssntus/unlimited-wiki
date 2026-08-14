@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -117,6 +119,70 @@ def test_raw_upload_adds_material_and_versions_same_filename(service: WikiServic
     assert second["raw"]["path"] == "raw/local/notes-2.md"
 
 
+def test_raw_upload_after_rollback_uses_a_new_operation(service: WikiService, monkeypatch: pytest.MonkeyPatch):
+    commit_calls = []
+    original_commit = service.files.commit
+
+    def bounded_commit(*args, **kwargs):
+        commit_calls.append(kwargs.get("operation_id"))
+        if len(commit_calls) > 3:
+            raise AssertionError("Raw upload retried indefinitely")
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(service.files, "commit", bounded_commit)
+    content = "# Rollback Raw\n\n允许回滚后重新上传的原材料。"
+    first = service.upload_raw("rollback.md", content)
+    service.rollback(first["operation_id"])
+
+    second = service.upload_raw("rollback.md", content)
+
+    assert second["created"] is True
+    assert second["raw"]["path"] == "raw/local/rollback.md"
+    assert second["operation_id"] != first["operation_id"]
+    assert service.files.operation(first["operation_id"])["status"] == "rolled_back"
+    assert service.files.operation(second["operation_id"])["status"] == "committed"
+    assert commit_calls == [first["operation_id"], second["operation_id"]]
+
+
+def test_raw_filename_retry_keeps_one_operation_id(service: WikiService, monkeypatch: pytest.MonkeyPatch):
+    (service.root / "raw" / "local" / "collision.md").write_text("# Existing\n\n已有原材料。", encoding="utf-8")
+    operation_ids = []
+    original_commit = service.files.commit
+
+    def recording_commit(*args, **kwargs):
+        operation_ids.append(kwargs.get("operation_id"))
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(service.files, "commit", recording_commit)
+    result = service.upload_raw("collision.md", "# New\n\n同名但内容不同的新原材料。")
+
+    assert result["raw"]["path"] == "raw/local/collision-2.md"
+    assert len(operation_ids) == 2
+    assert set(operation_ids) == {result["operation_id"]}
+
+
+def test_concurrent_same_name_raw_uploads_never_overwrite(service: WikiService, monkeypatch: pytest.MonkeyPatch):
+    barrier = threading.Barrier(2)
+    local = threading.local()
+    original = service.raw_inbox
+
+    def synchronized_inbox():
+        result = original()
+        if not getattr(local, "waited", False):
+            local.waited = True
+            barrier.wait(timeout=3)
+        return result
+
+    monkeypatch.setattr(service, "raw_inbox", synchronized_inbox)
+    contents = ["# Concurrent\n\n第一份不可变原料。", "# Concurrent\n\n第二份不可变原料。"]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda value: service.upload_raw("concurrent.md", value), contents))
+
+    paths = {result["raw"]["path"] for result in results}
+    assert paths == {"raw/local/concurrent.md", "raw/local/concurrent-2.md"}
+    assert {(service.root / path).read_text(encoding="utf-8") for path in paths} == set(contents)
+
+
 def test_seed_ingest_preserves_complete_source_without_ai_rewrite(kb_root: Path):
     raw = "# Seed Wiki\n\n## 第一部分\n\n原始正文。\n\n## 第二部分\n\n更多原始正文。\n"
     raw_path = kb_root / "raw" / "local" / "seed.md"
@@ -154,7 +220,7 @@ def test_seed_keywords_are_highlightable_without_cross_document_mentions(kb_root
     assert "Prompt Engineering" in terms
 
 
-@pytest.mark.parametrize("filename", ["../secret.md", "image.png", "", "/tmp/file.md"])
+@pytest.mark.parametrize("filename", ["../secret.md", "image.png", ".hidden.md", "", "/tmp/file.md"])
 def test_raw_upload_rejects_unsafe_filename(service: WikiService, filename: str):
     with pytest.raises(ValueError):
         service.upload_raw(filename, "材料")

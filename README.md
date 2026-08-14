@@ -8,7 +8,7 @@ Unlimited Wiki 是一个仅绑定本机回环地址的多用户 Markdown 知识�
 
 - 多租户私有空间：账号、会话、角色和工作区相互隔离；首个注册账号自动成为管理员。
 - Markdown 知识工作流：文章浏览、搜索、编辑、别名、分类、链接检查、合并与重定向。
-- Raw 原料箱：导入 Markdown、纯文本原料，预览并摄入私有正本。
+- Raw 原料箱：导入常用文档、表格、演示、网页、电子书和图片；在本机提取文字或 OCR 后预览并摄入私有正本。
 - 可靠后台任务：生成、补证和治理任务持久化，支持重试、取消和崩溃恢复。
 - 文件事务：跨文件写入使用锁、原子替换和 before-image，可按条件回滚。
 - 工作区模型配置：支持 OpenAI、DeepSeek 及 OpenAI-compatible 公网模型服务；密钥加密保存且不会通过状态接口回显。
@@ -17,7 +17,7 @@ Unlimited Wiki 是一个仅绑定本机回环地址的多用户 Markdown 知识�
 
 ## 技术栈
 
-- 后端：Python 标准库 HTTP 服务、SQLite、OpenAI Python SDK、Cryptography
+- 后端：Python 标准库 HTTP 服务、SQLite、OpenAI Python SDK、Cryptography、PyMuPDF、Pillow 与 Office 文档解析器
 - 前端：React 19、TypeScript、Vite 8、Tailwind CSS 4、shadcn/Base UI、TanStack Query
 - 存储：每个工作区的 Markdown 文件与 SQLite 状态库
 
@@ -27,6 +27,8 @@ Unlimited Wiki 是一个仅绑定本机回环地址的多用户 Markdown 知识�
 - Python 3.10+
 - Node.js `^20.19.0` 或 `>=22.12.0`
 - npm
+- 图片 OCR 需要 Tesseract，并至少安装与 `WIKI_OCR_LANG` 对应的语言数据（默认 `chi_sim+eng`）
+- `.doc`、`.docm`、`.xls`、`.ppt`、OpenDocument 与 RTF 需要系统可执行的 LibreOffice `soffice`
 
 ## 快速开始
 
@@ -70,6 +72,22 @@ npm --prefix viewer run dev
 
 模型不是浏览、编辑和本地检索的必要条件；AI 生成、AI 治理和投稿预审需要有效的模型配置。
 
+## Raw 原料格式
+
+原料箱会保留上传文件的原始字节，文字提取结果只缓存在当前用户空间的 `.wiki-state/extracted/` 中。文档解析和图片 OCR 均在本机完成，不会因为上传或预览而把内容发送给模型；只有用户后续主动生成词条时，相关摘录才按模型设置进入生成流程。
+
+| 类型 | 格式 | 处理方式 |
+| --- | --- | --- |
+| 文本与网页 | Markdown、TXT、CSV、TSV、JSON、YAML、XML、HTML | 本机直接读取 |
+| Office Open XML | DOCX、XLSX/XLSM、PPTX/PPTM | 本机直接解析 |
+| PDF 与电子书 | PDF、EPUB | 本机提取文字层 |
+| 旧版 Office/OpenDocument | DOC/DOCM、XLS、PPT、ODT、ODS、ODP、RTF | 先由本机 LibreOffice 转换 |
+| 图片 | PNG、JPEG、WebP、TIFF、BMP、GIF、HEIC | 本机 Tesseract OCR；HEIC 转换目前依赖 macOS `sips` |
+
+单个原文件最大 10 MiB，图片最大 2500 万像素；超出像素限制的图片会在完整解码和 OCR 前直接拒绝。上传接口使用 Base64 JSON，因此请求封装会略大于原文件，不受其他普通写接口 64 KiB 上限约束。图片未识别到有效文字时会警告并退回，Raw 不会落盘；OCR 结果只有单个疑似噪声字符时也按无文字处理。
+
+当前 PDF 只读取已有文字层，不对扫描页自动 OCR；多帧 GIF 和多页 TIFF 当前只读取第一帧。受密码保护、损坏、超出页数/行数/解压或提取文字上限的文件会在写入 Raw 前拒绝。
+
 ## 数据目录
 
 运行数据默认位于仓库内，但均已被 Git 忽略：
@@ -94,6 +112,7 @@ viewer/                             前端源码与构建配置
 | `WIKI_REMOTE_TASK_KINDS` | 限制远端工作器处理的任务类型，逗号分隔 | 全部支持类型 |
 | `WIKI_SECURE_COOKIES` | 设为 `1` 时为会话 Cookie 添加 `Secure` | `0` |
 | `WEB_ALLOW_FAKE_IP` | 兼容透明代理将域名解析到 `198.18.0.0/15` 的场景 | `0` |
+| `WIKI_OCR_LANG` | Tesseract OCR 语言组合 | `chi_sim+eng` |
 
 ## 安全边界
 
@@ -129,6 +148,7 @@ npm --prefix viewer run build
 | --- | --- |
 | `serve.py` | HTTP API、静态前端、会话与启动编排 |
 | `wiki_service.py` | 私有知识库工作流 |
+| `document_ingest.py` | 文档解析、格式转换、图片 OCR 与提取缓存 |
 | `state_store.py` | 工作区任务、幂等和 Raw 状态 |
 | `storage.py` | 原子文件事务、恢复与回滚 |
 | `platform_store.py` | 账号、工作区、投稿、公开版本、举报、通知和审计 |

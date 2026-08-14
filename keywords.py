@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from document_ingest import SUPPORTED_SUFFIXES, parse_document_cached
+
 WIKI_SKIP = {"index.md", "log.md"}
 SKIP_HEADINGS = {
     "overview",
@@ -478,9 +480,12 @@ def excerpts_for(
     raw_root = project_root / "raw"
     if raw_root.exists():
         for path in sorted(raw_root.rglob("*")):
-            if path.suffix.lower() not in {".md", ".markdown", ".txt"} or path.is_symlink():
+            if path.suffix.lower() not in SUPPORTED_SUFFIXES or path.is_symlink() or not path.is_file():
                 continue
-            md = path.read_text(encoding="utf-8")
+            try:
+                md = parse_document_cached(project_root, path.name, path.read_bytes()).markdown
+            except (OSError, ValueError):
+                continue
             title = parse_title(md) or path.stem
             rel = path.relative_to(project_root).as_posix()
             for para in re.split(r"\n\s*\n", md):
