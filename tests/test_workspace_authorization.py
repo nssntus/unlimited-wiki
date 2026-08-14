@@ -89,6 +89,32 @@ def _select_default_workspace(store: PlatformStore, user_id: str, workspace_id: 
         db.commit()
 
 
+def _add_workspace_member(
+    store: PlatformStore,
+    workspace_id: str,
+    user_id: str,
+    *,
+    organization_role: str = "member",
+    workspace_role: str = "editor",
+) -> None:
+    created = now_iso()
+    with store.connect() as db:
+        workspace = db.execute(
+            "SELECT organization_id,owner_id FROM workspaces WHERE id=?", (workspace_id,),
+        ).fetchone()
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            "INSERT INTO organization_members VALUES(?,?,?,'active',?,?,?)",
+            (workspace["organization_id"], user_id, organization_role, workspace["owner_id"], created, created),
+        )
+        db.execute(
+            "INSERT INTO workspace_members VALUES(?,?,?,?,'active',0,?,?,?)",
+            (workspace["organization_id"], workspace_id, user_id, workspace_role,
+             workspace["owner_id"], created, created),
+        )
+        db.commit()
+
+
 def test_registration_creates_personal_organization_and_owner_membership(tmp_path: Path):
     store = PlatformStore(tmp_path)
     user, _recovery = store.register("owner@example.com", "Owner", "correct-horse-123")
@@ -412,6 +438,166 @@ def test_account_deletion_preserves_shared_team_workspace(membership_server):
     )["workspace_role"] == "owner"
     assert app.export_workspace(promoted_context)
     assert owner.request("GET", "/api/articles")[0] == 401
+
+
+def test_shared_personal_workspace_blocks_account_deletion(membership_server):
+    app, base = membership_server
+    owner, member = Client(base), Client(base)
+    owner.register("personal-owner@example.com", "Personal Owner")
+    member.register("personal-member@example.com", "Personal Member")
+    owner_context = context_for(app, owner)
+    member_context = context_for(app, member)
+    _add_workspace_member(app.platform, owner_context.workspace_id, member_context.user_id, workspace_role="editor")
+    article_path, _ = seed_article(app, owner, "Shared personal article")
+    personal_root = app.platform.workspace_root(owner_context.workspace_root_name)
+    app.platform.save_model(
+        owner_context.workspace_id, "openai-compatible", "https://models.example.test/v1",
+        "personal-key", "personal-model",
+    )
+    article_bytes = (personal_root / "wiki" / article_path).read_bytes()
+    before_model = app.platform.load_model(owner_context.workspace_id)
+    with app.platform.connect() as db:
+        personal_workspace = db.execute(
+            "SELECT owner_id,organization_id FROM workspaces WHERE id=?", (owner_context.workspace_id,),
+        ).fetchone()
+        personal_organization_id = personal_workspace["organization_id"]
+        before = {
+            "user": tuple(db.execute(
+                "SELECT email,nickname,password_hash,status FROM users WHERE id=?", (owner_context.user_id,),
+            ).fetchone()),
+            "organization": tuple(db.execute(
+                "SELECT kind,personal_owner_id,status FROM organizations WHERE id=?", (personal_organization_id,),
+            ).fetchone()),
+            "workspace_owner": personal_workspace["owner_id"],
+            "sessions": [tuple(row) for row in db.execute(
+                "SELECT token_hash,user_id,csrf_hash,expires_at,created_at FROM sessions "
+                "WHERE user_id=? ORDER BY token_hash", (owner_context.user_id,),
+            )],
+            "recovery": [tuple(row) for row in db.execute(
+                "SELECT code_hash,user_id,expires_at,used_at FROM recovery_codes "
+                "WHERE user_id=? ORDER BY code_hash", (owner_context.user_id,),
+            )],
+            "organization_members": [tuple(row) for row in db.execute(
+                "SELECT user_id,role,status,added_by,created_at,updated_at FROM organization_members "
+                "WHERE organization_id=? ORDER BY user_id", (personal_organization_id,),
+            )],
+            "workspace_members": [tuple(row) for row in db.execute(
+                "SELECT user_id,role,status,is_default,added_by,created_at,updated_at FROM workspace_members "
+                "WHERE workspace_id=? ORDER BY user_id", (owner_context.workspace_id,),
+            )],
+            "audit_count": db.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE actor_id=?", (owner_context.user_id,),
+            ).fetchone()[0],
+        }
+
+    status, payload = owner.request(
+        "POST", "/api/account/delete", {"password": "correct-horse-123"}, key="reject-shared-personal",
+    )
+    assert status == 422
+    assert "personal workspaces" in payload["error"]
+    assert personal_root.exists()
+    assert (personal_root / "wiki" / article_path).read_bytes() == article_bytes
+    assert app.platform.load_model(owner_context.workspace_id) == before_model
+    assert owner.request("GET", f"/api/article?path={article_path}")[0] == 200
+    with app.platform.connect() as db:
+        after = {
+            "user": tuple(db.execute(
+                "SELECT email,nickname,password_hash,status FROM users WHERE id=?", (owner_context.user_id,),
+            ).fetchone()),
+            "organization": tuple(db.execute(
+                "SELECT kind,personal_owner_id,status FROM organizations WHERE id=?", (personal_organization_id,),
+            ).fetchone()),
+            "workspace_owner": db.execute(
+                "SELECT owner_id FROM workspaces WHERE id=?", (owner_context.workspace_id,),
+            ).fetchone()[0],
+            "sessions": [tuple(row) for row in db.execute(
+                "SELECT token_hash,user_id,csrf_hash,expires_at,created_at FROM sessions "
+                "WHERE user_id=? ORDER BY token_hash", (owner_context.user_id,),
+            )],
+            "recovery": [tuple(row) for row in db.execute(
+                "SELECT code_hash,user_id,expires_at,used_at FROM recovery_codes "
+                "WHERE user_id=? ORDER BY code_hash", (owner_context.user_id,),
+            )],
+            "organization_members": [tuple(row) for row in db.execute(
+                "SELECT user_id,role,status,added_by,created_at,updated_at FROM organization_members "
+                "WHERE organization_id=? ORDER BY user_id", (personal_organization_id,),
+            )],
+            "workspace_members": [tuple(row) for row in db.execute(
+                "SELECT user_id,role,status,is_default,added_by,created_at,updated_at FROM workspace_members "
+                "WHERE workspace_id=? ORDER BY user_id", (owner_context.workspace_id,),
+            )],
+            "audit_count": db.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE actor_id=?", (owner_context.user_id,),
+            ).fetchone()[0],
+        }
+        assert after == before
+    _select_default_workspace(app.platform, member_context.user_id, owner_context.workspace_id)
+    assert member.request("GET", f"/api/article?path={article_path}")[0] == 200
+
+
+def test_unshared_personal_workspace_deletion_still_cleans_root(membership_server):
+    app, base = membership_server
+    owner = Client(base)
+    owner.register("unshared-owner@example.com", "Unshared Owner")
+    owner_context = context_for(app, owner)
+    personal_root = app.platform.workspace_root(owner_context.workspace_root_name)
+    article_path, _ = seed_article(app, owner, "Private article")
+    assert (personal_root / "wiki" / article_path).exists()
+
+    status, payload = owner.request(
+        "POST", "/api/account/delete", {"password": "correct-horse-123"}, key="delete-unshared-personal",
+    )
+    assert status == 200 and payload["deleted"] is True
+    assert not personal_root.exists()
+    with app.platform.connect() as db:
+        assert db.execute("SELECT status FROM users WHERE id=?", (owner_context.user_id,)).fetchone()[0] == "deleted"
+        assert db.execute("SELECT COUNT(*) FROM workspace_members WHERE user_id=?", (owner_context.user_id,)).fetchone()[0] == 0
+        assert db.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE actor_id=? AND action='user.delete'",
+            (owner_context.user_id,),
+        ).fetchone()[0] == 1
+
+
+def test_shared_personal_workspace_rolls_back_team_transfer(membership_server):
+    app, base = membership_server
+    owner, member = Client(base), Client(base)
+    owner.register("mixed-owner@example.com", "Mixed Owner")
+    member.register("mixed-member@example.com", "Mixed Member")
+    owner_context = context_for(app, owner)
+    member_context = context_for(app, member)
+    _add_workspace_member(
+        app.platform, owner_context.workspace_id, member_context.user_id, workspace_role="viewer",
+    )
+    team = _create_team_workspace(app.platform, owner_context.user_id, [
+        (owner_context.user_id, "owner", "owner"),
+        (member_context.user_id, "member", "editor"),
+    ], name="Transferable But Blocked")
+    _select_default_workspace(app.platform, owner_context.user_id, team["id"])
+    team_path, _ = seed_article(app, owner, "Team remains unchanged")
+    team_root = app.platform.workspace_root(team["root_name"])
+    app.platform.save_model(
+        team["id"], "openai-compatible", "https://models.example.test/v1", "team-key", "mixed-model",
+    )
+
+    status, _payload = owner.request(
+        "POST", "/api/account/delete", {"password": "correct-horse-123"}, key="shared-personal-blocks-team",
+    )
+    assert status == 422
+    assert (team_root / "wiki" / team_path).exists()
+    assert app.platform.load_model(team["id"])["model"] == "mixed-model"
+    assert owner.request("GET", f"/api/article?path={team_path}")[0] == 200
+    with app.platform.connect() as db:
+        assert db.execute("SELECT status FROM users WHERE id=?", (owner_context.user_id,)).fetchone()[0] == "active"
+        assert db.execute("SELECT owner_id FROM workspaces WHERE id=?", (team["id"],)).fetchone()[0] == owner_context.user_id
+        assert db.execute(
+            "SELECT role FROM workspace_members WHERE workspace_id=? AND user_id=?",
+            (team["id"], member_context.user_id),
+        ).fetchone()[0] == "editor"
+        assert db.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE actor_id=? AND action IN "
+            "('user.delete','workspace.owner_transfer','organization.owner_transfer')",
+            (owner_context.user_id,),
+        ).fetchone()[0] == 0
 
 
 def test_account_deletion_preserves_existing_second_team_owner(membership_server):

@@ -583,6 +583,22 @@ class PlatformStore:
                 db.rollback()
                 raise ValueError("password is invalid")
             now = now_iso()
+            shared_personal = db.execute("""
+                SELECT workspace.id FROM workspaces workspace
+                JOIN organizations organization
+                  ON organization.id=workspace.organization_id
+                 AND organization.kind='personal'
+                 AND organization.personal_owner_id=?
+                WHERE EXISTS (
+                    SELECT 1 FROM workspace_members member
+                    WHERE member.workspace_id=workspace.id
+                      AND member.user_id<>? AND member.status='active'
+                )
+                LIMIT 1
+            """, (context.user_id, context.user_id)).fetchone()
+            if shared_personal is not None:
+                db.rollback()
+                raise ValueError("remove other members from personal workspaces before deleting the account")
             team_workspaces = db.execute("""
                 SELECT DISTINCT w.id,w.organization_id,w.owner_id FROM workspaces w
                 JOIN organizations o ON o.id=w.organization_id AND o.kind='team'
