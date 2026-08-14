@@ -6,7 +6,6 @@ import csv
 import hashlib
 import io
 import json
-import math
 import os
 import re
 import shutil
@@ -277,20 +276,37 @@ def _ocr_image(filename: str, data: bytes) -> str:
             sips = shutil.which("sips")
             if not sips:
                 raise ValueError("HEIC 图片解析器不可用，未加入原料箱")
+            try:
+                metadata = subprocess.run(
+                    [sips, "-g", "pixelWidth", "-g", "pixelHeight", str(source)],
+                    capture_output=True, timeout=15,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise ValueError("HEIC 图片尺寸读取超时，未加入原料箱") from exc
+            width_match = re.search(rb"pixelWidth:\s*(\d+)", metadata.stdout)
+            height_match = re.search(rb"pixelHeight:\s*(\d+)", metadata.stdout)
+            if metadata.returncode != 0 or not width_match or not height_match:
+                raise ValueError("HEIC 图片尺寸无法读取，未加入原料箱")
+            if int(width_match.group(1)) * int(height_match.group(1)) > MAX_IMAGE_PIXELS:
+                raise ValueError("图片超过 2500 万像素，未加入原料箱")
             image_path = Path(directory) / "source.png"
-            result = subprocess.run([sips, "-s", "format", "png", str(source), "--out", str(image_path)], capture_output=True, timeout=30)
+            try:
+                result = subprocess.run([sips, "-s", "format", "png", str(source), "--out", str(image_path)], capture_output=True, timeout=30)
+            except subprocess.TimeoutExpired as exc:
+                raise ValueError("HEIC 图片转换超时，未加入原料箱") from exc
             if result.returncode != 0:
                 raise ValueError("HEIC 图片无法解析，未加入原料箱")
         try:
             with Image.open(image_path) as image:
-                image.seek(0)
-                image = ImageOps.exif_transpose(image).convert("RGB")
                 pixels = image.width * image.height
                 if pixels > MAX_IMAGE_PIXELS:
-                    ratio = math.sqrt(MAX_IMAGE_PIXELS / pixels)
-                    image.thumbnail((max(1, int(image.width * ratio)), max(1, int(image.height * ratio))))
+                    raise ValueError("图片超过 2500 万像素，未加入原料箱")
+                image.seek(0)
+                image = ImageOps.exif_transpose(image).convert("RGB")
                 normalized = Path(directory) / "ocr.png"
                 image.save(normalized, format="PNG")
+        except ValueError:
+            raise
         except Exception as exc:
             raise ValueError("图片文件已损坏或格式不正确，未加入原料箱") from exc
         language = os.environ.get("WIKI_OCR_LANG", "chi_sim+eng")

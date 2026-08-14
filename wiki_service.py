@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path, PurePosixPath
@@ -488,7 +489,7 @@ class WikiService:
         stem = Path(name).stem[:160].strip(" .") or "material"
         candidate = f"local/{stem}{suffix}"
         counter = 2
-        operation_id = f"raw-upload-{digest[:20]}"
+        operation_id = f"raw-upload-{digest[:12]}-{uuid.uuid4().hex}"
         while True:
             try:
                 self.files.commit(

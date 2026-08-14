@@ -123,6 +123,60 @@ def test_image_with_only_one_ocr_noise_character_is_rejected(service, monkeypatc
     assert not (service.root / "raw" / "local" / "noise.png").exists()
 
 
+def test_oversized_image_is_rejected_before_decode_or_ocr(service, monkeypatch):
+    calls = {"transpose": 0, "convert": 0, "ocr": 0}
+
+    class OversizedImage:
+        width = 5_001
+        height = 5_000
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def convert(self, _mode):
+            calls["convert"] += 1
+            raise AssertionError("oversized image must not be decoded")
+
+    monkeypatch.setattr("PIL.Image.open", lambda _path: OversizedImage())
+    monkeypatch.setattr("PIL.ImageOps.exif_transpose", lambda image: calls.__setitem__("transpose", calls["transpose"] + 1) or image)
+    monkeypatch.setattr(document_ingest.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(document_ingest.subprocess, "run", lambda *_args, **_kwargs: calls.__setitem__("ocr", calls["ocr"] + 1))
+
+    with pytest.raises(ValueError, match="图片超过 2500 万像素"):
+        service.upload_raw("oversized.png", b"image-header")
+
+    assert calls == {"transpose": 0, "convert": 0, "ocr": 0}
+    assert not (service.root / "raw" / "local" / "oversized.png").exists()
+
+
+def test_oversized_heic_is_rejected_before_conversion_or_ocr(service, monkeypatch):
+    calls = {"metadata": 0, "convert": 0, "ocr": 0}
+
+    def fake_run(args, **_kwargs):
+        if args[0].endswith("sips") and "pixelWidth" in args:
+            calls["metadata"] += 1
+            return document_ingest.subprocess.CompletedProcess(
+                args, 0, stdout=b"pixelWidth: 5001\npixelHeight: 5000\n", stderr=b"",
+            )
+        if args[0].endswith("sips"):
+            calls["convert"] += 1
+        else:
+            calls["ocr"] += 1
+        raise AssertionError("oversized HEIC must not be converted or OCRed")
+
+    monkeypatch.setattr(document_ingest.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(document_ingest.subprocess, "run", fake_run)
+
+    with pytest.raises(ValueError, match="图片超过 2500 万像素"):
+        service.upload_raw("oversized.heic", b"heic-header")
+
+    assert calls == {"metadata": 1, "convert": 0, "ocr": 0}
+    assert not (service.root / "raw" / "local" / "oversized.heic").exists()
+
+
 def test_image_ocr_result_is_cached_per_workspace(service, monkeypatch):
     image = Image.new("RGB", (240, 120), "white")
     output = io.BytesIO()

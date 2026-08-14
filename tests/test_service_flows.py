@@ -119,6 +119,48 @@ def test_raw_upload_adds_material_and_versions_same_filename(service: WikiServic
     assert second["raw"]["path"] == "raw/local/notes-2.md"
 
 
+def test_raw_upload_after_rollback_uses_a_new_operation(service: WikiService, monkeypatch: pytest.MonkeyPatch):
+    commit_calls = []
+    original_commit = service.files.commit
+
+    def bounded_commit(*args, **kwargs):
+        commit_calls.append(kwargs.get("operation_id"))
+        if len(commit_calls) > 3:
+            raise AssertionError("Raw upload retried indefinitely")
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(service.files, "commit", bounded_commit)
+    content = "# Rollback Raw\n\n允许回滚后重新上传的原材料。"
+    first = service.upload_raw("rollback.md", content)
+    service.rollback(first["operation_id"])
+
+    second = service.upload_raw("rollback.md", content)
+
+    assert second["created"] is True
+    assert second["raw"]["path"] == "raw/local/rollback.md"
+    assert second["operation_id"] != first["operation_id"]
+    assert service.files.operation(first["operation_id"])["status"] == "rolled_back"
+    assert service.files.operation(second["operation_id"])["status"] == "committed"
+    assert commit_calls == [first["operation_id"], second["operation_id"]]
+
+
+def test_raw_filename_retry_keeps_one_operation_id(service: WikiService, monkeypatch: pytest.MonkeyPatch):
+    (service.root / "raw" / "local" / "collision.md").write_text("# Existing\n\n已有原材料。", encoding="utf-8")
+    operation_ids = []
+    original_commit = service.files.commit
+
+    def recording_commit(*args, **kwargs):
+        operation_ids.append(kwargs.get("operation_id"))
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(service.files, "commit", recording_commit)
+    result = service.upload_raw("collision.md", "# New\n\n同名但内容不同的新原材料。")
+
+    assert result["raw"]["path"] == "raw/local/collision-2.md"
+    assert len(operation_ids) == 2
+    assert set(operation_ids) == {result["operation_id"]}
+
+
 def test_concurrent_same_name_raw_uploads_never_overwrite(service: WikiService, monkeypatch: pytest.MonkeyPatch):
     barrier = threading.Barrier(2)
     local = threading.local()
