@@ -21,6 +21,13 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 ROLES = {"user", "admin"}
+ORGANIZATION_ROLES = {"owner", "admin", "member"}
+WORKSPACE_ROLES = {"owner", "editor", "viewer"}
+WORKSPACE_PERMISSIONS = {
+    "viewer": frozenset({"wiki.read"}),
+    "editor": frozenset({"wiki.read", "wiki.write", "wiki.govern"}),
+    "owner": frozenset({"wiki.read", "wiki.write", "wiki.govern", "workspace.manage", "model.manage"}),
+}
 SUBMISSION_STATES = {
     "ai_queued", "ai_reviewing", "ai_failed", "needs_revision", "ai_rejected",
     "pending_admin", "admin_changes_requested", "admin_rejected", "approved", "withdrawn",
@@ -73,13 +80,16 @@ class SessionContext:
     workspace_id: str
     workspace_root_name: str
     workspace_name: str
+    organization_id: str
+    organization_role: str
+    workspace_role: str
     csrf_token: str
     expires_at: str
 
     def public(self) -> dict:
         return {
             "user": {"id": self.user_id, "email": self.email, "nickname": self.nickname, "role": self.role},
-            "workspace": {"display_name": self.workspace_name},
+            "workspace": {"display_name": self.workspace_name, "role": self.workspace_role},
             "csrf_token": self.csrf_token,
             "session_expires_at": self.expires_at,
         }
@@ -152,10 +162,37 @@ class PlatformStore:
                     password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('user','admin')),
                     status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL
                 );
-                CREATE TABLE IF NOT EXISTS workspaces (
-                    id TEXT PRIMARY KEY, owner_id TEXT NOT NULL UNIQUE REFERENCES users(id),
-                    root_name TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL, created_at TEXT NOT NULL
+                CREATE TABLE IF NOT EXISTS organizations (
+                    id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('personal','team')),
+                    personal_owner_id TEXT UNIQUE REFERENCES users(id), display_name TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','suspended','deleted')),
+                    created_by TEXT REFERENCES users(id), created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS workspaces (
+                    id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(id),
+                    organization_id TEXT REFERENCES organizations(id), root_name TEXT NOT NULL UNIQUE,
+                    display_name TEXT NOT NULL, created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS organization_members (
+                    organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+                    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL CHECK(role IN ('owner','admin','member')),
+                    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','suspended')),
+                    added_by TEXT REFERENCES users(id), created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    PRIMARY KEY(organization_id, user_id)
+                );
+                CREATE TABLE IF NOT EXISTS workspace_members (
+                    organization_id TEXT NOT NULL, workspace_id TEXT NOT NULL, user_id TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('owner','editor','viewer')),
+                    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','suspended')),
+                    is_default INTEGER NOT NULL DEFAULT 0 CHECK(is_default IN (0,1)),
+                    added_by TEXT REFERENCES users(id), created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    PRIMARY KEY(workspace_id, user_id),
+                    FOREIGN KEY(organization_id, user_id) REFERENCES organization_members(organization_id, user_id),
+                    FOREIGN KEY(workspace_id, organization_id) REFERENCES workspaces(id, organization_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_members_default
+                    ON workspace_members(user_id) WHERE is_default=1 AND status='active';
                 CREATE TABLE IF NOT EXISTS sessions (
                     token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                     csrf_hash TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL
@@ -215,6 +252,14 @@ class PlatformStore:
                     status TEXT NOT NULL, manifest_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
             """)
+            workspace_columns = {row["name"] for row in db.execute("PRAGMA table_info(workspaces)").fetchall()}
+            if "organization_id" not in workspace_columns:
+                db.execute("ALTER TABLE workspaces ADD COLUMN organization_id TEXT REFERENCES organizations(id)")
+            db.commit()
+            self._remove_workspace_owner_unique(db)
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_org_identity ON workspaces(id, organization_id)")
+            db.execute("BEGIN IMMEDIATE")
+            self._backfill_memberships(db)
             public_columns = {row["name"] for row in db.execute("PRAGMA table_info(public_entries)").fetchall()}
             for name, declaration in {
                 "moderation_reason": "TEXT",
@@ -225,6 +270,92 @@ class PlatformStore:
                     db.execute(f"ALTER TABLE public_entries ADD COLUMN {name} {declaration}")
             db.execute("UPDATE submissions SET status='ai_queued',updated_at=? WHERE status='ai_reviewing'", (now_iso(),))
         os.chmod(self.db_path, 0o600)
+
+    @staticmethod
+    def _remove_workspace_owner_unique(db: sqlite3.Connection) -> None:
+        owner_unique = False
+        for index in db.execute("PRAGMA index_list(workspaces)").fetchall():
+            if not index["unique"]:
+                continue
+            columns = [row["name"] for row in db.execute(f"PRAGMA index_info('{index['name']}')").fetchall()]
+            if columns == ["owner_id"]:
+                owner_unique = True
+                break
+        if not owner_unique:
+            return
+
+        db.execute("PRAGMA foreign_keys=OFF")
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""
+                CREATE TABLE workspaces_rebuild (
+                    id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(id),
+                    organization_id TEXT REFERENCES organizations(id), root_name TEXT NOT NULL UNIQUE,
+                    display_name TEXT NOT NULL, created_at TEXT NOT NULL
+                )
+            """)
+            db.execute("""
+                INSERT INTO workspaces_rebuild(id,owner_id,organization_id,root_name,display_name,created_at)
+                SELECT id,owner_id,organization_id,root_name,display_name,created_at FROM workspaces
+            """)
+            db.execute("DROP TABLE workspaces")
+            db.execute("ALTER TABLE workspaces_rebuild RENAME TO workspaces")
+            db.execute("CREATE UNIQUE INDEX idx_workspaces_org_identity ON workspaces(id, organization_id)")
+            violations = db.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError("workspace schema migration failed foreign key validation")
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+        finally:
+            db.execute("PRAGMA foreign_keys=ON")
+        if db.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            raise RuntimeError("workspace schema migration did not restore foreign key enforcement")
+
+    @staticmethod
+    def _personal_organization_id(user_id: str) -> str:
+        return uuid.uuid5(uuid.NAMESPACE_URL, f"unlimited-wiki:personal-organization:{user_id}").hex
+
+    def _backfill_memberships(self, db: sqlite3.Connection) -> None:
+        rows = db.execute("""
+            SELECT u.id user_id,u.nickname,w.id workspace_id,w.organization_id,w.created_at
+            FROM users u JOIN workspaces w ON w.owner_id=u.id
+            WHERE w.organization_id IS NULL
+        """).fetchall()
+        for row in rows:
+            organization_id = row["organization_id"] or self._personal_organization_id(row["user_id"])
+            created = row["created_at"] or now_iso()
+            db.execute("""
+                INSERT INTO organizations
+                    (id,kind,personal_owner_id,display_name,status,created_by,created_at,updated_at)
+                VALUES(?, 'personal', ?, ?, 'active', ?, ?, ?)
+                ON CONFLICT(id) DO NOTHING
+            """, (organization_id, row["user_id"], f"{row['nickname']} 的个人组织", row["user_id"], created, created))
+            db.execute("UPDATE workspaces SET organization_id=? WHERE id=?", (organization_id, row["workspace_id"]))
+            db.execute("""
+                INSERT INTO organization_members
+                    (organization_id,user_id,role,status,added_by,created_at,updated_at)
+                VALUES(?,?,'owner','active',?,?,?)
+                ON CONFLICT(organization_id,user_id) DO NOTHING
+            """, (organization_id, row["user_id"], row["user_id"], created, created))
+            db.execute("""
+                INSERT INTO workspace_members
+                    (organization_id,workspace_id,user_id,role,status,is_default,added_by,created_at,updated_at)
+                VALUES(?,?,?,'owner','active',?,?,?,?)
+                ON CONFLICT(workspace_id,user_id) DO NOTHING
+            """, (
+                organization_id,
+                row["workspace_id"],
+                row["user_id"],
+                0 if db.execute(
+                    "SELECT 1 FROM workspace_members WHERE user_id=? AND status='active' AND is_default=1",
+                    (row["user_id"],),
+                ).fetchone() else 1,
+                row["user_id"],
+                created,
+                created,
+            ))
 
     def audit(self, actor_id: str | None, action: str, object_type: str, object_id: str, detail: dict | None = None) -> None:
         with self.connect() as db:
@@ -271,6 +402,7 @@ class PlatformStore:
             raise ValueError("nickname must be between 1 and 80 characters")
         password_hash = hash_password(password)
         user_id, workspace_id = uuid.uuid4().hex, uuid.uuid4().hex
+        organization_id = self._personal_organization_id(user_id)
         root_name = workspace_id
         recovery = secrets.token_urlsafe(24)
         created = now_iso()
@@ -279,7 +411,25 @@ class PlatformStore:
             role = "admin" if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0 else "user"
             try:
                 db.execute("INSERT INTO users VALUES(?,?,?,?,?,?,?)", (user_id, email, nickname, password_hash, role, "active", created))
-                db.execute("INSERT INTO workspaces VALUES(?,?,?,?,?)", (workspace_id, user_id, root_name, f"{nickname} 的 Wiki", created))
+                db.execute("""
+                    INSERT INTO organizations
+                        (id,kind,personal_owner_id,display_name,status,created_by,created_at,updated_at)
+                    VALUES(?,'personal',?,?,'active',?,?,?)
+                """, (organization_id, user_id, f"{nickname} 的个人组织", user_id, created, created))
+                db.execute("""
+                    INSERT INTO organization_members
+                        (organization_id,user_id,role,status,added_by,created_at,updated_at)
+                    VALUES(?,?,'owner','active',?,?,?)
+                """, (organization_id, user_id, user_id, created, created))
+                db.execute("""
+                    INSERT INTO workspaces(id,owner_id,organization_id,root_name,display_name,created_at)
+                    VALUES(?,?,?,?,?,?)
+                """, (workspace_id, user_id, organization_id, root_name, f"{nickname} 的 Wiki", created))
+                db.execute("""
+                    INSERT INTO workspace_members
+                        (organization_id,workspace_id,user_id,role,status,is_default,added_by,created_at,updated_at)
+                    VALUES(?,?,?,'owner','active',1,?,?,?)
+                """, (organization_id, workspace_id, user_id, user_id, created, created))
                 db.execute("INSERT INTO recovery_codes VALUES(?,?,?,NULL)", (hash_token(recovery), user_id, future_iso(hours=24)))
                 db.commit()
             except sqlite3.IntegrityError as exc:
@@ -340,20 +490,54 @@ class PlatformStore:
         with self.connect() as db:
             row = db.execute("""
                 SELECT u.id user_id,u.email,u.nickname,u.role,u.status,
-                       w.id workspace_id,w.root_name,w.display_name,
+                       w.id workspace_id,w.root_name,w.display_name,w.organization_id,
+                       om.role organization_role,wm.role workspace_role,o.status organization_status,
                        s.csrf_hash,s.expires_at
-                FROM sessions s JOIN users u ON u.id=s.user_id JOIN workspaces w ON w.owner_id=u.id
+                FROM sessions s
+                JOIN users u ON u.id=s.user_id
+                JOIN workspace_members wm ON wm.user_id=u.id AND wm.status='active' AND wm.is_default=1
+                JOIN workspaces w ON w.id=wm.workspace_id AND w.organization_id=wm.organization_id
+                JOIN organization_members om ON om.organization_id=w.organization_id
+                    AND om.user_id=u.id AND om.status='active'
+                JOIN organizations o ON o.id=w.organization_id
                 WHERE s.token_hash=? AND s.expires_at>?
             """, (hash_token(token), now_iso())).fetchone()
-        if row is None or row["status"] != "active":
+        if row is None or row["status"] != "active" or row["organization_status"] != "active":
             return None
         csrf = self.vault.derive(token, scope="session-csrf")
         if not hmac.compare_digest(hash_token(csrf), row["csrf_hash"]):
             return None
         return SessionContext(
             row["user_id"], row["email"], row["nickname"], row["role"], row["workspace_id"],
-            row["root_name"], row["display_name"], csrf, row["expires_at"],
+            row["root_name"], row["display_name"], row["organization_id"], row["organization_role"],
+            row["workspace_role"], csrf, row["expires_at"],
         )
+
+    def authorize_workspace(self, user_id: str, workspace_id: str, permission: str) -> dict:
+        with self.connect() as db:
+            row = db.execute("""
+                SELECT w.*,wm.role workspace_role,wm.status workspace_member_status,
+                       om.role organization_role,om.status organization_member_status,
+                       o.status organization_status,u.status user_status
+                FROM workspaces w
+                JOIN workspace_members wm ON wm.workspace_id=w.id AND wm.organization_id=w.organization_id
+                JOIN organization_members om ON om.organization_id=w.organization_id AND om.user_id=wm.user_id
+                JOIN organizations o ON o.id=w.organization_id
+                JOIN users u ON u.id=wm.user_id
+                WHERE w.id=? AND wm.user_id=?
+            """, (workspace_id, user_id)).fetchone()
+        if (
+            row is None
+            or row["user_status"] != "active"
+            or row["organization_status"] != "active"
+            or row["workspace_member_status"] != "active"
+            or row["organization_member_status"] != "active"
+        ):
+            raise FileNotFoundError(workspace_id)
+        allowed = WORKSPACE_PERMISSIONS.get(row["workspace_role"], frozenset())
+        if permission not in allowed:
+            raise PermissionError(permission)
+        return dict(row)
 
     def revoke_session(self, token: str) -> None:
         with self.connect() as db:
@@ -391,7 +575,7 @@ class PlatformStore:
                 raise FileNotFoundError(user_id)
         self.audit(actor_id, "user.role", "user", user_id, {"role": role})
 
-    def delete_account(self, context: SessionContext, password: str) -> None:
+    def delete_account(self, context: SessionContext, password: str) -> dict:
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             user = db.execute("SELECT * FROM users WHERE id=? AND status='active'", (context.user_id,)).fetchone()
@@ -399,15 +583,145 @@ class PlatformStore:
                 db.rollback()
                 raise ValueError("password is invalid")
             now = now_iso()
+            shared_personal = db.execute("""
+                SELECT workspace.id FROM workspaces workspace
+                JOIN organizations organization
+                  ON organization.id=workspace.organization_id
+                 AND organization.kind='personal'
+                 AND organization.personal_owner_id=?
+                WHERE EXISTS (
+                    SELECT 1 FROM workspace_members member
+                    WHERE member.workspace_id=workspace.id
+                      AND member.user_id<>? AND member.status='active'
+                )
+                LIMIT 1
+            """, (context.user_id, context.user_id)).fetchone()
+            if shared_personal is not None:
+                db.rollback()
+                raise ValueError("remove other members from personal workspaces before deleting the account")
+            team_workspaces = db.execute("""
+                SELECT DISTINCT w.id,w.organization_id,w.owner_id FROM workspaces w
+                JOIN organizations o ON o.id=w.organization_id AND o.kind='team'
+                LEFT JOIN workspace_members own ON own.workspace_id=w.id AND own.user_id=?
+                WHERE w.owner_id=? OR (own.role='owner' AND own.status='active')
+            """, (context.user_id, context.user_id)).fetchall()
+            workspace_transfers = []
+            for workspace in team_workspaces:
+                candidate = db.execute("""
+                    SELECT member.user_id,member.role FROM workspace_members member
+                    JOIN organization_members organization_member
+                      ON organization_member.organization_id=member.organization_id
+                     AND organization_member.user_id=member.user_id
+                     AND organization_member.status='active'
+                    JOIN users candidate_user ON candidate_user.id=member.user_id AND candidate_user.status='active'
+                    WHERE member.workspace_id=? AND member.user_id<>? AND member.status='active'
+                    ORDER BY CASE member.role WHEN 'owner' THEN 0 WHEN 'editor' THEN 1 ELSE 2 END,
+                             member.created_at,member.user_id
+                    LIMIT 1
+                """, (workspace["id"], context.user_id)).fetchone()
+                if candidate is None:
+                    db.rollback()
+                    raise ValueError("transfer team workspace ownership before deleting the account")
+                workspace_transfers.append((workspace, candidate["user_id"], candidate["role"]))
+
+            team_organizations = db.execute("""
+                SELECT organization.id FROM organizations organization
+                JOIN organization_members own ON own.organization_id=organization.id
+                WHERE organization.kind='team' AND own.user_id=?
+                  AND own.role='owner' AND own.status='active'
+            """, (context.user_id,)).fetchall()
+            organization_transfers = []
+            for organization in team_organizations:
+                candidate = db.execute("""
+                    SELECT member.user_id,member.role FROM organization_members member
+                    JOIN users candidate_user ON candidate_user.id=member.user_id AND candidate_user.status='active'
+                    WHERE member.organization_id=? AND member.user_id<>? AND member.status='active'
+                    ORDER BY CASE member.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
+                             member.created_at,member.user_id
+                    LIMIT 1
+                """, (organization["id"], context.user_id)).fetchone()
+                if candidate is None:
+                    db.rollback()
+                    raise ValueError("transfer team organization ownership before deleting the account")
+                organization_transfers.append((organization["id"], candidate["user_id"], candidate["role"]))
+
+            for organization_id, new_owner_id, previous_role in organization_transfers:
+                db.execute("""
+                    UPDATE organization_members SET role='owner',updated_at=?
+                    WHERE organization_id=? AND user_id=? AND status='active'
+                """, (now, organization_id, new_owner_id))
+                db.execute(
+                    "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
+                    (uuid.uuid4().hex, context.user_id, "organization.owner_transfer", "organization",
+                     organization_id, json.dumps({
+                         "old_owner_id": context.user_id,
+                         "new_owner_id": new_owner_id,
+                         "previous_role": previous_role,
+                         "reason": "account_deletion",
+                     }, ensure_ascii=False), now),
+                )
+            for workspace, new_owner_id, previous_role in workspace_transfers:
+                db.execute("""
+                    UPDATE workspace_members SET role='owner',updated_at=?
+                    WHERE workspace_id=? AND user_id=? AND status='active'
+                """, (now, workspace["id"], new_owner_id))
+                db.execute("UPDATE workspaces SET owner_id=? WHERE id=?", (new_owner_id, workspace["id"]))
+                db.execute(
+                    "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
+                    (uuid.uuid4().hex, context.user_id, "workspace.owner_transfer", "workspace",
+                     workspace["id"], json.dumps({
+                         "old_owner_id": context.user_id,
+                         "new_owner_id": new_owner_id,
+                         "previous_role": previous_role,
+                         "reason": "account_deletion",
+                     }, ensure_ascii=False), now),
+                )
+
+            cleanup = db.execute("""
+                SELECT w.id,w.root_name FROM workspaces w
+                JOIN organizations o ON o.id=w.organization_id
+                WHERE o.kind='personal' AND o.personal_owner_id=?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM workspace_members other
+                    WHERE other.workspace_id=w.id AND other.user_id<>? AND other.status='active'
+                  )
+            """, (context.user_id, context.user_id)).fetchall()
             db.execute("UPDATE public_entries SET status='withdrawn_by_author',updated_at=? WHERE author_id=? AND status='published'", (now, context.user_id))
-            db.execute("DELETE FROM model_settings WHERE workspace_id=?", (context.workspace_id,))
+            for workspace in cleanup:
+                db.execute("DELETE FROM model_settings WHERE workspace_id=?", (workspace["id"],))
             db.execute("DELETE FROM sessions WHERE user_id=?", (context.user_id,))
             db.execute("DELETE FROM recovery_codes WHERE user_id=?", (context.user_id,))
+            db.execute("DELETE FROM workspace_members WHERE user_id=?", (context.user_id,))
+            db.execute("DELETE FROM organization_members WHERE user_id=?", (context.user_id,))
+            db.execute("""
+                UPDATE organizations SET status='deleted',updated_at=?
+                WHERE kind='personal' AND personal_owner_id=?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM organization_members member
+                    WHERE member.organization_id=organizations.id AND member.status='active'
+                  )
+            """, (now, context.user_id))
             db.execute("UPDATE users SET email=?,nickname='已注销用户',password_hash=?,status='deleted' WHERE id=?", (
                 f"deleted-{context.user_id}@invalid.local", hash_password(secrets.token_urlsafe(32)), context.user_id,
             ))
+            db.execute(
+                "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
+                (uuid.uuid4().hex, context.user_id, "user.delete", "user", context.user_id,
+                 json.dumps({
+                     "workspace_transfers": [
+                         {"workspace_id": workspace["id"], "new_owner_id": new_owner_id}
+                         for workspace, new_owner_id, _previous_role in workspace_transfers
+                     ],
+                 }, ensure_ascii=False), now),
+            )
             db.commit()
-        self.audit(context.user_id, "user.delete", "user", context.user_id)
+        return {
+            "cleanup_workspaces": [dict(row) for row in cleanup],
+            "workspace_transfers": [
+                {"workspace_id": workspace["id"], "new_owner_id": new_owner_id}
+                for workspace, new_owner_id, _previous_role in workspace_transfers
+            ],
+        }
 
     def workspace_root(self, root_name: str) -> Path:
         if not re.fullmatch(r"[a-f0-9]{32}", root_name):
@@ -432,7 +746,10 @@ class PlatformStore:
 
     def user_workspace(self, user_id: str) -> dict:
         with self.connect() as db:
-            row = db.execute("SELECT * FROM workspaces WHERE owner_id=?", (user_id,)).fetchone()
+            row = db.execute("""
+                SELECT w.* FROM workspace_members wm JOIN workspaces w ON w.id=wm.workspace_id
+                WHERE wm.user_id=? AND wm.status='active' AND wm.is_default=1
+            """, (user_id,)).fetchone()
         if row is None:
             raise FileNotFoundError(user_id)
         return dict(row)
@@ -460,6 +777,7 @@ class PlatformStore:
         }
 
     def create_preview(self, context: SessionContext, article_path: str, source_revision: str, snapshot: dict) -> dict:
+        self.authorize_workspace(context.user_id, context.workspace_id, "wiki.write")
         preview_id = uuid.uuid4().hex
         canonical = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         content_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -472,6 +790,7 @@ class PlatformStore:
         return {"preview_id": preview_id, "expires_at": expires, "source_revision": source_revision, "content_hash": content_hash, "snapshot": snapshot}
 
     def submit_preview(self, context: SessionContext, preview_id: str) -> dict:
+        self.authorize_workspace(context.user_id, context.workspace_id, "wiki.write")
         submission_id = uuid.uuid4().hex
         now = now_iso()
         with self._lock, self.connect() as db:
@@ -504,13 +823,21 @@ class PlatformStore:
         return result
 
     def list_submissions(self, context: SessionContext) -> list[dict]:
+        self.authorize_workspace(context.user_id, context.workspace_id, "wiki.read")
         with self.connect() as db:
-            rows = db.execute("SELECT * FROM submissions WHERE owner_id=? ORDER BY created_at DESC", (context.user_id,)).fetchall()
+            rows = db.execute(
+                "SELECT * FROM submissions WHERE owner_id=? AND workspace_id=? ORDER BY created_at DESC",
+                (context.user_id, context.workspace_id),
+            ).fetchall()
         return [self._submission_public(row) for row in rows]
 
     def get_submission(self, context: SessionContext, submission_id: str) -> dict:
+        self.authorize_workspace(context.user_id, context.workspace_id, "wiki.read")
         with self.connect() as db:
-            row = db.execute("SELECT * FROM submissions WHERE id=? AND owner_id=?", (submission_id, context.user_id)).fetchone()
+            row = db.execute(
+                "SELECT * FROM submissions WHERE id=? AND owner_id=? AND workspace_id=?",
+                (submission_id, context.user_id, context.workspace_id),
+            ).fetchone()
         if row is None:
             raise FileNotFoundError(submission_id)
         return self._submission_public(row)
@@ -526,6 +853,7 @@ class PlatformStore:
 
     def article_publication(self, context: SessionContext, article: dict) -> dict:
         """Return the current user's publication state without exposing another tenant."""
+        self.authorize_workspace(context.user_id, context.workspace_id, "wiki.read")
         title = str(article.get("title", "")).strip().casefold()
         public_row = None
         active_row = None
@@ -533,14 +861,16 @@ class PlatformStore:
             public_candidates = db.execute("""
                 SELECT e.id,e.status,e.moderation_reason,e.moderated_at,
                        r.id revision_id,r.version,r.snapshot_json,r.published_at
-                FROM public_entries e JOIN public_revisions r ON r.id=e.current_revision_id
-                WHERE e.author_id=? AND e.status IN ('published','removed_by_admin')
+                FROM public_entries e
+                JOIN public_revisions r ON r.id=e.current_revision_id
+                JOIN submissions s ON s.id=r.submission_id
+                WHERE e.author_id=? AND s.workspace_id=? AND e.status IN ('published','removed_by_admin')
                 ORDER BY r.published_at DESC
-            """, (context.user_id,)).fetchall()
+            """, (context.user_id, context.workspace_id)).fetchall()
             submission_candidates = db.execute("""
                 SELECT id,status,snapshot_json,updated_at FROM submissions
-                WHERE owner_id=? ORDER BY updated_at DESC
-            """, (context.user_id,)).fetchall()
+                WHERE owner_id=? AND workspace_id=? ORDER BY updated_at DESC
+            """, (context.user_id, context.workspace_id)).fetchall()
 
         for row in public_candidates:
             snapshot = json.loads(row["snapshot_json"])
@@ -625,18 +955,34 @@ class PlatformStore:
         }
 
     def retry_ai(self, context: SessionContext, submission_id: str) -> dict:
-        with self.connect() as db:
-            changed = db.execute("UPDATE submissions SET status='ai_queued',ai_report_json=NULL,updated_at=? WHERE id=? AND owner_id=? AND status='ai_failed'", (
-                now_iso(), submission_id, context.user_id,
-            )).rowcount
-        if not changed:
-            raise RuntimeError("submission cannot be retried")
+        self.authorize_workspace(context.user_id, context.workspace_id, "wiki.write")
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT status FROM submissions WHERE id=? AND owner_id=? AND workspace_id=?",
+                (submission_id, context.user_id, context.workspace_id),
+            ).fetchone()
+            if row is None:
+                db.rollback()
+                raise FileNotFoundError(submission_id)
+            if row["status"] != "ai_failed":
+                db.rollback()
+                raise RuntimeError("submission cannot be retried")
+            db.execute(
+                "UPDATE submissions SET status='ai_queued',ai_report_json=NULL,updated_at=? WHERE id=?",
+                (now_iso(), submission_id),
+            )
+            db.commit()
         return self.get_submission(context, submission_id)
 
     def withdraw(self, context: SessionContext, submission_id: str) -> dict:
+        self.authorize_workspace(context.user_id, context.workspace_id, "wiki.write")
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM submissions WHERE id=? AND owner_id=?", (submission_id, context.user_id)).fetchone()
+            row = db.execute(
+                "SELECT * FROM submissions WHERE id=? AND owner_id=? AND workspace_id=?",
+                (submission_id, context.user_id, context.workspace_id),
+            ).fetchone()
             if row is None:
                 db.rollback(); raise FileNotFoundError(submission_id)
             if row["status"] == "withdrawn":
@@ -686,8 +1032,10 @@ class PlatformStore:
                 title = str(json.loads(row["snapshot_json"]).get("title", "")).strip().casefold()
                 candidates = db.execute("""
                     SELECT e.id,e.status,e.current_revision_id,r.version,r.snapshot_json FROM public_entries e
-                    JOIN public_revisions r ON r.id=e.current_revision_id WHERE e.author_id=?
-                """, (row["owner_id"],)).fetchall()
+                    JOIN public_revisions r ON r.id=e.current_revision_id
+                    JOIN submissions prior ON prior.id=r.submission_id
+                    WHERE e.author_id=? AND prior.workspace_id=?
+                """, (row["owner_id"], row["workspace_id"])).fetchall()
                 previous_public_status = None
                 for candidate in candidates:
                     if str(json.loads(candidate["snapshot_json"]).get("title", "")).strip().casefold() == title:
