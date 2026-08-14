@@ -583,6 +583,84 @@ class PlatformStore:
                 db.rollback()
                 raise ValueError("password is invalid")
             now = now_iso()
+            team_workspaces = db.execute("""
+                SELECT DISTINCT w.id,w.organization_id,w.owner_id FROM workspaces w
+                JOIN organizations o ON o.id=w.organization_id AND o.kind='team'
+                LEFT JOIN workspace_members own ON own.workspace_id=w.id AND own.user_id=?
+                WHERE w.owner_id=? OR (own.role='owner' AND own.status='active')
+            """, (context.user_id, context.user_id)).fetchall()
+            workspace_transfers = []
+            for workspace in team_workspaces:
+                candidate = db.execute("""
+                    SELECT member.user_id,member.role FROM workspace_members member
+                    JOIN organization_members organization_member
+                      ON organization_member.organization_id=member.organization_id
+                     AND organization_member.user_id=member.user_id
+                     AND organization_member.status='active'
+                    JOIN users candidate_user ON candidate_user.id=member.user_id AND candidate_user.status='active'
+                    WHERE member.workspace_id=? AND member.user_id<>? AND member.status='active'
+                    ORDER BY CASE member.role WHEN 'owner' THEN 0 WHEN 'editor' THEN 1 ELSE 2 END,
+                             member.created_at,member.user_id
+                    LIMIT 1
+                """, (workspace["id"], context.user_id)).fetchone()
+                if candidate is None:
+                    db.rollback()
+                    raise ValueError("transfer team workspace ownership before deleting the account")
+                workspace_transfers.append((workspace, candidate["user_id"], candidate["role"]))
+
+            team_organizations = db.execute("""
+                SELECT organization.id FROM organizations organization
+                JOIN organization_members own ON own.organization_id=organization.id
+                WHERE organization.kind='team' AND own.user_id=?
+                  AND own.role='owner' AND own.status='active'
+            """, (context.user_id,)).fetchall()
+            organization_transfers = []
+            for organization in team_organizations:
+                candidate = db.execute("""
+                    SELECT member.user_id,member.role FROM organization_members member
+                    JOIN users candidate_user ON candidate_user.id=member.user_id AND candidate_user.status='active'
+                    WHERE member.organization_id=? AND member.user_id<>? AND member.status='active'
+                    ORDER BY CASE member.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
+                             member.created_at,member.user_id
+                    LIMIT 1
+                """, (organization["id"], context.user_id)).fetchone()
+                if candidate is None:
+                    db.rollback()
+                    raise ValueError("transfer team organization ownership before deleting the account")
+                organization_transfers.append((organization["id"], candidate["user_id"], candidate["role"]))
+
+            for organization_id, new_owner_id, previous_role in organization_transfers:
+                db.execute("""
+                    UPDATE organization_members SET role='owner',updated_at=?
+                    WHERE organization_id=? AND user_id=? AND status='active'
+                """, (now, organization_id, new_owner_id))
+                db.execute(
+                    "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
+                    (uuid.uuid4().hex, context.user_id, "organization.owner_transfer", "organization",
+                     organization_id, json.dumps({
+                         "old_owner_id": context.user_id,
+                         "new_owner_id": new_owner_id,
+                         "previous_role": previous_role,
+                         "reason": "account_deletion",
+                     }, ensure_ascii=False), now),
+                )
+            for workspace, new_owner_id, previous_role in workspace_transfers:
+                db.execute("""
+                    UPDATE workspace_members SET role='owner',updated_at=?
+                    WHERE workspace_id=? AND user_id=? AND status='active'
+                """, (now, workspace["id"], new_owner_id))
+                db.execute("UPDATE workspaces SET owner_id=? WHERE id=?", (new_owner_id, workspace["id"]))
+                db.execute(
+                    "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
+                    (uuid.uuid4().hex, context.user_id, "workspace.owner_transfer", "workspace",
+                     workspace["id"], json.dumps({
+                         "old_owner_id": context.user_id,
+                         "new_owner_id": new_owner_id,
+                         "previous_role": previous_role,
+                         "reason": "account_deletion",
+                     }, ensure_ascii=False), now),
+                )
+
             cleanup = db.execute("""
                 SELECT w.id,w.root_name FROM workspaces w
                 JOIN organizations o ON o.id=w.organization_id
@@ -610,9 +688,24 @@ class PlatformStore:
             db.execute("UPDATE users SET email=?,nickname='已注销用户',password_hash=?,status='deleted' WHERE id=?", (
                 f"deleted-{context.user_id}@invalid.local", hash_password(secrets.token_urlsafe(32)), context.user_id,
             ))
+            db.execute(
+                "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
+                (uuid.uuid4().hex, context.user_id, "user.delete", "user", context.user_id,
+                 json.dumps({
+                     "workspace_transfers": [
+                         {"workspace_id": workspace["id"], "new_owner_id": new_owner_id}
+                         for workspace, new_owner_id, _previous_role in workspace_transfers
+                     ],
+                 }, ensure_ascii=False), now),
+            )
             db.commit()
-        self.audit(context.user_id, "user.delete", "user", context.user_id)
-        return {"cleanup_workspaces": [dict(row) for row in cleanup]}
+        return {
+            "cleanup_workspaces": [dict(row) for row in cleanup],
+            "workspace_transfers": [
+                {"workspace_id": workspace["id"], "new_owner_id": new_owner_id}
+                for workspace, new_owner_id, _previous_role in workspace_transfers
+            ],
+        }
 
     def workspace_root(self, root_name: str) -> Path:
         if not re.fullmatch(r"[a-f0-9]{32}", root_name):
