@@ -187,15 +187,15 @@ class WikiApp:
         return output.getvalue()
 
     def delete_account(self, context: SessionContext, password: str) -> None:
-        workspace = self.platform.authorize_workspace(context.user_id, context.workspace_id, "workspace.manage")
-        service = self._services.pop(context.workspace_id, None)
-        self._diagnostics.pop(context.workspace_id, None)
-        if service is not None:
-            service.close()
-        root = self.platform.workspace_root(workspace["root_name"])
-        self.platform.delete_account(context, password)
-        if root.exists():
-            shutil.rmtree(root)
+        result = self.platform.delete_account(context, password)
+        for workspace in result["cleanup_workspaces"]:
+            service = self._services.pop(workspace["id"], None)
+            self._diagnostics.pop(workspace["id"], None)
+            if service is not None:
+                service.close()
+            root = self.platform.workspace_root(workspace["root_name"])
+            if root.exists():
+                shutil.rmtree(root)
 
     def status(self, service: WikiService) -> dict:
         config = service.llm
@@ -719,12 +719,11 @@ def make_handler(app: WikiApp):
             }
             if path in {"/api/settings/models", "/api/settings/model"}:
                 self._require_workspace_permission("model.manage")
-            elif path == "/api/account/delete":
-                self._require_workspace_permission("workspace.manage")
             elif (
                 path in content_write_paths
                 or re.fullmatch(r"/api/tasks/[a-f0-9]+/(cancel|retry)", path)
                 or re.fullmatch(r"/api/operations/[A-Za-z0-9-]+/rollback", path)
+                or re.fullmatch(r"/api/submissions/[a-f0-9]{32}/(ai-retry|withdraw)", path)
             ):
                 self._require_workspace_permission("wiki.write")
             if path == "/api/settings/models":
