@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 import uuid
 
 import pytest
@@ -331,3 +332,102 @@ def test_late_classification_and_raw_results_do_not_persist(service: WikiService
     assert service._finalize_remote_result(raw_task, raw_result)["status"] == "failed"
     plan = service.state.raw_classification_plan(raw["path"], raw["revision"], registry["revision"])
     assert plan is None or plan["status"] != "succeeded"
+
+
+def test_cancel_cannot_split_successful_classification_finalization(service: WikiService, monkeypatch: pytest.MonkeyPatch):
+    article = service.generate("Atomic Classification")["article"]
+    registry = dc.load_registry(service.root)
+    task, _ = service.state.enqueue_task(
+        "article-classification",
+        article["article_id"],
+        {"path": article["path"], "article_id": article["article_id"], "article_revision": article["revision"], "taxonomy_revision": registry["revision"]},
+    )
+    task = service.state.claim_task({"article-classification"}) or task
+    entered = Event()
+    release = Event()
+    cancel_reached_state = Event()
+    original_finalize = service.state.finalize_classification_success
+    original_cancel = service.state.cancel_task
+
+    def blocked_finalize(*args, **kwargs):
+        entered.set()
+        assert release.wait(2)
+        return original_finalize(*args, **kwargs)
+
+    def observed_cancel(task_id: str):
+        cancel_reached_state.set()
+        return original_cancel(task_id)
+
+    monkeypatch.setattr(service.state, "finalize_classification_success", blocked_finalize)
+    monkeypatch.setattr(service.state, "cancel_task", observed_cancel)
+    result = {"stale": False, "article_id": article["article_id"], "suggestion": {"candidates": [], "tags": [], "new_category": None}}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        finalize_future = pool.submit(service._finalize_remote_result, task, result)
+        assert entered.wait(2)
+        cancel_future = pool.submit(service.cancel_task, task["id"])
+        assert not cancel_reached_state.wait(0.1)
+        release.set()
+        assert finalize_future.result(timeout=2)["status"] == "succeeded"
+        assert cancel_future.result(timeout=2)["status"] == "succeeded"
+    suggestion = service.state.classification_suggestion(article["article_id"], article["revision"], registry["revision"])
+    assert suggestion and suggestion["status"] == "succeeded"
+
+
+def test_cancel_cannot_split_successful_raw_plan_finalization(service: WikiService, monkeypatch: pytest.MonkeyPatch):
+    raw_file = service.root / "raw" / "local" / "atomic-plan.txt"
+    raw_file.write_text("Raw body for an atomic classification plan.", encoding="utf-8")
+    raw = service.read_raw("raw/local/atomic-plan.txt")
+    registry = dc.load_registry(service.root)
+    task, _ = service.state.enqueue_task(
+        "raw-classification-plan",
+        raw["path"],
+        {"raw_path": raw["path"], "raw_revision": raw["revision"], "taxonomy_revision": registry["revision"]},
+    )
+    task = service.state.claim_task({"raw-classification-plan"}) or task
+    entered = Event()
+    release = Event()
+    cancel_reached_state = Event()
+    original_finalize = service.state.finalize_raw_classification_success
+    original_cancel = service.state.cancel_task
+
+    def blocked_finalize(*args, **kwargs):
+        entered.set()
+        assert release.wait(2)
+        return original_finalize(*args, **kwargs)
+
+    def observed_cancel(task_id: str):
+        cancel_reached_state.set()
+        return original_cancel(task_id)
+
+    monkeypatch.setattr(service.state, "finalize_raw_classification_success", blocked_finalize)
+    monkeypatch.setattr(service.state, "cancel_task", observed_cancel)
+    result = {"stale": False, "raw_path": raw["path"], "plan": {"candidates": []}}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        finalize_future = pool.submit(service._finalize_remote_result, task, result)
+        assert entered.wait(2)
+        cancel_future = pool.submit(service.cancel_task, task["id"])
+        assert not cancel_reached_state.wait(0.1)
+        release.set()
+        assert finalize_future.result(timeout=2)["status"] == "succeeded"
+        assert cancel_future.result(timeout=2)["status"] == "succeeded"
+    plan = service.state.raw_classification_plan(raw["path"], raw["revision"], registry["revision"])
+    assert plan and plan["status"] == "succeeded"
+
+
+def test_old_classification_attempt_cannot_finalize_retried_task(service: WikiService):
+    article = service.generate("Attempt Fence")["article"]
+    registry = dc.load_registry(service.root)
+    task, _ = service.state.enqueue_task(
+        "article-classification",
+        article["article_id"],
+        {"path": article["path"], "article_id": article["article_id"], "article_revision": article["revision"], "taxonomy_revision": registry["revision"]},
+    )
+    first_attempt = service.state.claim_task({"article-classification"}) or task
+    service.cancel_task(first_attempt["id"])
+    service.retry_task(first_attempt["id"])
+    second_attempt = service.state.claim_task({"article-classification"})
+    assert second_attempt and second_attempt["attempts"] == first_attempt["attempts"] + 1
+    old_result = {"stale": False, "article_id": article["article_id"], "suggestion": {"candidates": [], "tags": ["old"], "new_category": None}}
+    assert service._finalize_remote_result(first_attempt, old_result)["status"] == "running"
+    suggestion = service.state.classification_suggestion(article["article_id"], article["revision"], registry["revision"])
+    assert suggestion is None or suggestion["status"] != "succeeded"

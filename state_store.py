@@ -264,16 +264,21 @@ class StateStore:
                 return None
         return self.get_task(row["id"])
 
-    def complete_task(self, task_id: str, result: dict) -> dict:
+    def complete_task(self, task_id: str, result: dict, *, expected_attempt: int | None = None) -> dict:
+        attempt_clause = " AND attempts=?" if expected_attempt is not None else ""
+        params: list[object] = [json.dumps(result, ensure_ascii=False), now_iso(), task_id]
+        if expected_attempt is not None:
+            params.append(expected_attempt)
         with self.connect() as db:
             db.execute(
                 """UPDATE tasks SET status='succeeded', result_json=?, error_type=NULL,
-                error_message=NULL, next_run_at=NULL, updated_at=? WHERE id=? AND status='running'""",
-                (json.dumps(result, ensure_ascii=False), now_iso(), task_id),
+                error_message=NULL, next_run_at=NULL, updated_at=? WHERE id=? AND status='running'"""
+                + attempt_clause,
+                params,
             )
         return self.get_task(task_id)
 
-    def fail_task(self, task_id: str, error_type: str, message: str, *, retry: bool) -> dict:
+    def fail_task(self, task_id: str, error_type: str, message: str, *, retry: bool, expected_attempt: int | None = None) -> dict:
         task = self.get_task(task_id)
         backoff = (5, 30, 120, 600, 3600)
         attempts = task["attempts"]
@@ -283,12 +288,84 @@ class StateStore:
         if should_retry:
             status = "queued"
             next_at = (datetime.now(timezone.utc) + timedelta(seconds=backoff[attempts - 1])).isoformat(timespec="seconds")
+        attempt_clause = " AND attempts=?" if expected_attempt is not None else ""
+        params: list[object] = [status, error_type, message[:500], next_at, now_iso(), task_id]
+        if expected_attempt is not None:
+            params.append(expected_attempt)
         with self.connect() as db:
             db.execute(
                 """UPDATE tasks SET status=?, error_type=?, error_message=?, next_run_at=?,
-                updated_at=? WHERE id=? AND status='running'""",
-                (status, error_type, message[:500], next_at, now_iso(), task_id),
+                updated_at=? WHERE id=? AND status='running'""" + attempt_clause,
+                params,
             )
+        return self.get_task(task_id)
+
+    def finalize_classification_success(
+        self,
+        task_id: str,
+        expected_attempt: int,
+        result: dict,
+        *,
+        article_id: str,
+        article_revision: str,
+        taxonomy_revision: int,
+        suggestion: dict,
+    ) -> dict:
+        stamp = now_iso()
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            changed = db.execute(
+                """UPDATE tasks SET status='succeeded', result_json=?, error_type=NULL,
+                error_message=NULL, next_run_at=NULL, updated_at=?
+                WHERE id=? AND status='running' AND attempts=?""",
+                (json.dumps(result, ensure_ascii=False), stamp, task_id, expected_attempt),
+            ).rowcount
+            if changed:
+                db.execute(
+                    """INSERT INTO classification_suggestions
+                    (article_id,article_revision,taxonomy_revision,status,suggestion_json,task_id,error_type,error_message,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(article_id,article_revision,taxonomy_revision) DO UPDATE SET
+                    status=excluded.status,suggestion_json=excluded.suggestion_json,task_id=excluded.task_id,
+                    error_type=NULL,error_message=NULL,updated_at=excluded.updated_at""",
+                    (article_id, article_revision, taxonomy_revision, "succeeded",
+                     json.dumps(suggestion, ensure_ascii=False), task_id, None, None, stamp, stamp),
+                )
+            db.commit()
+        return self.get_task(task_id)
+
+    def finalize_raw_classification_success(
+        self,
+        task_id: str,
+        expected_attempt: int,
+        result: dict,
+        *,
+        raw_path: str,
+        raw_revision: str,
+        taxonomy_revision: int,
+        plan: dict,
+    ) -> dict:
+        stamp = now_iso()
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            changed = db.execute(
+                """UPDATE tasks SET status='succeeded', result_json=?, error_type=NULL,
+                error_message=NULL, next_run_at=NULL, updated_at=?
+                WHERE id=? AND status='running' AND attempts=?""",
+                (json.dumps(result, ensure_ascii=False), stamp, task_id, expected_attempt),
+            ).rowcount
+            if changed:
+                db.execute(
+                    """INSERT INTO raw_classification_plans
+                    (raw_path,raw_revision,taxonomy_revision,status,plan_json,task_id,error_type,error_message,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(raw_path,raw_revision,taxonomy_revision) DO UPDATE SET
+                    status=excluded.status,plan_json=excluded.plan_json,task_id=excluded.task_id,
+                    error_type=NULL,error_message=NULL,updated_at=excluded.updated_at""",
+                    (raw_path, raw_revision, taxonomy_revision, "succeeded",
+                     json.dumps(plan, ensure_ascii=False), task_id, None, None, stamp, stamp),
+                )
+            db.commit()
         return self.get_task(task_id)
 
     def cancel_task(self, task_id: str) -> dict:

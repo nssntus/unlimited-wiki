@@ -850,7 +850,7 @@ def make_handler(app: WikiApp):
             if match:
                 _fields(data, set())
                 task_id, action = match.group(1), match.group("action")
-                response, _ = self._idempotency(data, lambda: service.state.cancel_task(task_id) if action == "cancel" else service.retry_task(task_id))
+                response, _ = self._idempotency(data, lambda: service.cancel_task(task_id) if action == "cancel" else service.retry_task(task_id))
                 service._wake.set()
                 return self._json(200, response)
             match = re.fullmatch(r"/api/operations/([A-Za-z0-9-]+)/rollback", path)
