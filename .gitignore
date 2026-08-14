@@ -15,6 +15,7 @@ secrets*
 
 # Project documentation, source material, and content-coupled local tests
 /*.md
+!/README.md
 /interactive-tutorial*.html
 /test_keywords.py
 /test_wiki_ops.py
