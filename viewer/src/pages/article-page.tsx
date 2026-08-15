@@ -40,20 +40,51 @@ function taskPresentation(task: Task | null) {
   return { label: "生成完成", kind: "good" as const }
 }
 
+const PUBLICATION_DISMISSAL_PREFIX = "wiki:publication-update-dismissed:v1"
+
+function publicationDismissalKey(article: Article, userId?: string, workspaceId?: string) {
+  const articleId = article.article_id
+  const publicRevisionId = article.publication.public_revision_id
+  const fingerprint = article.publication.publication_fingerprint
+  if (!userId || !workspaceId || !/^[a-f0-9]{32}$/.test(articleId) || !/^[a-f0-9]{32}$/.test(publicRevisionId || "") || !/^v2:[a-f0-9]{64}$/.test(fingerprint || "")) return null
+  return `${PUBLICATION_DISMISSAL_PREFIX}:${userId}:${workspaceId}:${articleId}:${publicRevisionId}:${fingerprint}`
+}
+
+function wasPublicationDismissed(key: string | null) {
+  if (!key) return false
+  try {
+    return window.localStorage.getItem(key) === "1"
+  } catch {
+    return false
+  }
+}
+
 function PublicationUpdatePrompt({ article }: { article: Article }) {
-  const [open, setOpen] = useState(true)
+  const { session } = useSession()
+  const dismissalKey = publicationDismissalKey(article, session?.user?.id, session?.workspace?.id)
+  const [open, setOpen] = useState(() => !wasPublicationDismissed(dismissalKey))
   const navigate = useNavigate()
+  const dismiss = () => {
+    if (dismissalKey) {
+      try {
+        window.localStorage.setItem(dismissalKey, "1")
+      } catch {
+        // Storage can be unavailable in private browsing; closing this instance still works.
+      }
+    }
+    setOpen(false)
+  }
   return (
     <AlertDialog open={open} onOpenChange={setOpen}>
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>将这次更新发布到广场？</AlertDialogTitle>
           <AlertDialogDescription>
-            私有正文已不同于广场版本 {article.publication.public_version}。提交后会生成新的不可变快照，并重新经过 AI 预审和 Admin 审核；审核通过前，广场仍展示旧版本。
+            私有正文或公开可见信息已不同于广场版本 {article.publication.public_version}。提交后会生成新的不可变快照，并重新经过 AI 预审和 Admin 审核；审核通过前，广场仍展示旧版本。
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
-          <AlertDialogCancel>暂不更新</AlertDialogCancel>
+          <AlertDialogCancel onClick={dismiss}>暂不更新</AlertDialogCancel>
           <AlertDialogAction onClick={() => navigate(`/share?article=${encodeURIComponent(article.path)}`)}>提交更新</AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
@@ -108,7 +139,7 @@ function MetadataPanel({ article }: { article: Article }) {
 }
 
 export function ArticlePage() {
-  const { hasPermission } = useSession()
+  const { hasPermission, session } = useSession()
   const canWrite = hasPermission("wiki.write")
   const location = useLocation()
   const navigate = useNavigate()
@@ -131,6 +162,7 @@ export function ArticlePage() {
   if (!articlePath) return <PageFrame><Empty className="min-h-[60svh]"><EmptyHeader><EmptyMedia variant="icon"><FilePenLineIcon /></EmptyMedia><EmptyTitle>知识库还是空的</EmptyTitle><EmptyDescription>{canWrite ? "将 Markdown 放入 Raw 后，从原料箱创建第一篇正本。" : "当前空间还没有可阅读的词条。"}</EmptyDescription></EmptyHeader>{canWrite && <EmptyContent><Button render={<Link to="/inbox" />}>打开原料箱</Button></EmptyContent>}</Empty></PageFrame>
   if (article.isError || !article.data) return <PageFrame><Empty className="min-h-[60svh]"><EmptyHeader><EmptyMedia variant="icon"><FilePenLineIcon /></EmptyMedia><EmptyTitle>找不到这篇词条</EmptyTitle><EmptyDescription>{article.error?.message || articlePath}</EmptyDescription></EmptyHeader><EmptyContent><Button variant="outline" onClick={() => navigate("/")}>返回词库</Button></EmptyContent></Empty></PageFrame>
   const data = article.data
+  const updatePromptKey = publicationDismissalKey(data, session?.user?.id, session?.workspace?.id) || data.revision
   const taskState = taskPresentation(data.remote_task)
   const badges = [
     <StatusBadge key="category" value={data.category_label} />,
@@ -155,7 +187,7 @@ export function ArticlePage() {
           {data.remote_task && ["queued", "running"].includes(data.remote_task.status) && <Alert className="mb-6"><InfoIcon /><AlertTitle>词条正在生成</AlertTitle><AlertDescription>当前先展示本地草稿；后台任务完成后，本页会自动刷新为生成结果。</AlertDescription></Alert>}
           {data.remote_task?.status === "failed" && <Alert variant="destructive" className="mb-6"><InfoIcon /><AlertTitle>词条生成失败</AlertTitle><AlertDescription>{data.remote_task.error_type || "model_error"} · {data.remote_task.error_message || "请在任务中心重试。"}</AlertDescription></Alert>}
           {data.remote_task?.result?.conflict === true && <Alert className="mb-6"><InfoIcon /><AlertTitle>生成结果未覆盖当前正文</AlertTitle><AlertDescription>生成期间正文发生变化，结果已被冲突保护拦截；请在任务中心基于当前正文重试。</AlertDescription></Alert>}
-          {data.publication.state === "update_available" && <Alert className="mb-6"><RefreshCwIcon /><AlertTitle>广场版本需要更新</AlertTitle><AlertDescription className="flex flex-wrap items-center justify-between gap-3"><span>当前私有正文已修改，广场仍展示版本 {data.publication.public_version}。{canWrite ? "是否提交本次更新重新审核？" : "请联系 Editor 或 Owner 提交更新。"}</span>{canWrite && <Button size="sm" render={<Link to={`/share?article=${encodeURIComponent(data.path)}`} />}>提交广场更新</Button>}</AlertDescription></Alert>}
+          {data.publication.state === "update_available" && <Alert className="mb-6"><RefreshCwIcon /><AlertTitle>广场版本需要更新</AlertTitle><AlertDescription className="flex flex-wrap items-center justify-between gap-3"><span>当前私有正文或公开可见信息已更新，广场仍展示版本 {data.publication.public_version}。{canWrite ? "是否提交本次更新重新审核？" : "请联系 Editor 或 Owner 提交更新。"}</span>{canWrite && <Button size="sm" render={<Link to={`/share?article=${encodeURIComponent(data.path)}`} />}>提交广场更新</Button>}</AlertDescription></Alert>}
           {data.publication.state === "removed" && <Alert variant="destructive" className="mb-6"><InfoIcon /><AlertTitle>该词条已从广场下架</AlertTitle><AlertDescription className="flex flex-wrap items-center justify-between gap-3"><span>{data.publication.moderation_reason || (canWrite ? "请根据通知中的处理理由修改私有正本。原公开快照不会被改写。" : "原公开快照已下架，私有正文仍可阅读。")}</span>{canWrite && <Button variant="outline" size="sm" render={<Link to={`/edit/${data.path}`} />}>修改正文</Button>}</AlertDescription></Alert>}
           {data.publication.state === "relist_available" && <Alert className="mb-6"><RefreshCwIcon /><AlertTitle>修改完成后可申请重新上架</AlertTitle><AlertDescription className="flex flex-wrap items-center justify-between gap-3"><span>当前正文已不同于被下架版本。{canWrite ? "提交后会创建新快照，并重新经过 AI 预审和 Admin 审核。" : "请联系 Editor 或 Owner 申请重新上架。"}</span>{canWrite && <Button size="sm" render={<Link to={`/share?article=${encodeURIComponent(data.path)}`} />}>申请重新上架</Button>}</AlertDescription></Alert>}
           {(data.publication.state === "submitted" || data.publication.state === "update_pending" || data.publication.state === "relist_pending") && <Alert className="mb-6"><Clock3Icon /><AlertTitle>{data.publication.state === "update_pending" ? "广场更新正在审核" : data.publication.state === "relist_pending" ? "重新上架申请正在审核" : "广场投稿正在审核"}</AlertTitle><AlertDescription className="flex flex-wrap items-center justify-between gap-3"><span>{data.publication.submission_matches_current ? "当前正文已固化为审核快照，审核通过前不会改变广场内容。" : "提交审核后正文又发生了变化；当前审核快照不会自动变化，审核结束后可再次提交。"}</span>{canWrite && data.publication.submission_id && <Button variant="outline" size="sm" render={<Link to={`/submissions/${data.publication.submission_id}`} />}>查看进度</Button>}</AlertDescription></Alert>}
@@ -181,7 +213,7 @@ export function ArticlePage() {
       </PageFrame>
       {canWrite && <GenerationDialog request={generation} onOpenChange={(open) => !open && setGeneration(null)} />}
       {canWrite && <GovernanceDialog key={data.revision} article={data} open={govern} onOpenChange={setGovern} />}
-      {canWrite && data.publication.state === "update_available" && <PublicationUpdatePrompt key={data.revision} article={data} />}
+      {canWrite && data.publication.state === "update_available" && <PublicationUpdatePrompt key={updatePromptKey} article={data} />}
     </>
   )
 }

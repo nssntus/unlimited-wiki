@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+import dynamic_categories as dc
+from publication import public_markdown, snapshot_fingerprint
 from serve import create_app, create_server
 from tests.test_multitenant import Client, context_for
 
@@ -89,6 +91,66 @@ def test_workspace_switch_is_isolated_per_session(team_server):
     reopened = type(app.platform)(app.project_root)
     assert reopened.resolve_session(first.cookie.split("=", 1)[1]).workspace_id == team["id"]
     assert reopened.resolve_session(second.cookie.split("=", 1)[1]).workspace_id == personal.workspace_id
+
+
+def test_legacy_publication_backfill_runs_for_each_author_in_cached_team_service(team_server):
+    app, base = team_server
+    owner, member = Client(base), Client(base)
+    owner.register("legacy-owner@example.com", "Legacy Owner")
+    member.register("legacy-member@example.com", "Legacy Member")
+    team = _create_team(owner, "Legacy Team")
+    owner.request("POST", "/api/workspaces/switch", {"workspace_id": team["id"]}, key="owner-switch-legacy")
+    _invite_and_accept(owner, member, "legacy-member@example.com", "editor")
+    member.request("POST", "/api/workspaces/switch", {"workspace_id": team["id"]}, key="member-switch-legacy")
+    _write_article(app, team["id"], "Legacy shared article")
+
+    owner_context = context_for(app, owner)
+    owner_service = app.workspace_service(owner_context)
+    value = owner_service.read_article("concepts/shared.md")
+    if not value["article_id"]:
+        article_path = owner_service.root / "wiki" / value["path"]
+        article_path.write_text(
+            dc.ensure_article_metadata(value["markdown"], category_id=None, status="pending"),
+            encoding="utf-8",
+        )
+        value = owner_service.read_article("concepts/shared.md")
+
+    member_context = context_for(app, member)
+    public_snapshot = {
+        "title": value["title"],
+        "category": value["category"],
+        "content_status": value["content_status"],
+        "markdown": public_markdown(value["markdown"]),
+        "summary": "summary",
+        "attribution": "Legacy Member",
+        "source_summaries": [],
+    }
+    preview = app.platform.create_preview(
+        member_context,
+        value["path"],
+        value["revision"],
+        value["article_id"],
+        snapshot_fingerprint(public_snapshot),
+        public_snapshot,
+    )
+    submission = app.platform.submit_preview(member_context, preview["preview_id"])
+    app.platform.ai_decide(submission["id"], "pass", {"summary": "accepted"})
+    approved = app.platform.admin_decide(owner_context, submission["id"], "approve", "approved")
+    with app.platform.connect() as db:
+        db.execute(
+            "UPDATE public_entries SET source_workspace_id=NULL,source_article_id=NULL WHERE id=?",
+            (approved["public_entry_id"],),
+        )
+        db.execute(
+            "UPDATE submissions SET article_id=NULL WHERE id=?",
+            (submission["id"],),
+        )
+
+    assert app.platform.article_publication(member_context, value)["state"] == "not_published"
+    assert app.workspace_service(member_context) is owner_service
+    publication = app.platform.article_publication(member_context, value)
+    assert publication["state"] == "published"
+    assert publication["public_entry_id"] == approved["public_entry_id"]
 
 
 def test_invitation_role_changes_and_removal_take_effect_immediately(team_server):

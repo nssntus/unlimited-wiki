@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from platform_store import PlatformStore, now_iso
+from publication import public_markdown, snapshot_fingerprint
 from tests.test_multitenant import Client, context_for, seed_article
 from serve import create_app, create_server
 
@@ -119,6 +120,188 @@ def _add_workspace_member(
              workspace["owner_id"], created, created),
         )
         db.commit()
+
+
+def _publication_snapshot(article_id: str) -> dict:
+    markdown = (
+        f"# Shared publication\n\n> Article-ID: {article_id}\n"
+        "> Category: concepts\n> Status: 词条\n\nBody\n"
+    )
+    return {
+        "title": "Shared publication",
+        "category": "concepts",
+        "content_status": "词条",
+        "markdown": public_markdown(markdown),
+        "summary": "Body",
+        "attribution": "Member",
+        "source_summaries": [],
+    }
+
+
+def _team_publication_world(tmp_path: Path, operation: str):
+    store = PlatformStore(tmp_path)
+    owner, _ = store.register("publication-owner@example.com", "Owner", "correct-horse-123")
+    member, _ = store.register("publication-member@example.com", "Member", "correct-horse-123")
+    team = _create_team_workspace(store, owner["id"], [
+        (owner["id"], "owner", "owner"),
+        (member["id"], "member", "editor"),
+    ])
+    _select_default_workspace(store, owner["id"], team["id"])
+    _select_default_workspace(store, member["id"], team["id"])
+    _owner_token, owner_context = store.create_session(owner["id"])
+    _member_token, member_context = store.create_session(member["id"])
+    article_id = "a" * 32
+    snapshot = _publication_snapshot(article_id)
+    fingerprint = snapshot_fingerprint(snapshot)
+
+    preview = None
+    submission = None
+    public_entry_id = None
+    if operation != "create_preview":
+        preview = store.create_preview(
+            member_context, "concepts/shared.md", "revision-1", article_id, fingerprint, snapshot,
+        )
+    if operation in {"retry_ai", "withdraw"}:
+        submission = store.submit_preview(member_context, preview["preview_id"])
+    if operation == "retry_ai":
+        store.ai_decide(submission["id"], "failed", {"summary": "temporary failure"})
+    if operation == "withdraw":
+        store.ai_decide(submission["id"], "pass", {"summary": "accepted"})
+        approved = store.admin_decide(owner_context, submission["id"], "approve", "approved")
+        public_entry_id = approved["public_entry_id"]
+    return store, owner_context, member_context, snapshot, fingerprint, preview, submission, public_entry_id
+
+
+def _publication_rows(store: PlatformStore) -> dict:
+    with store.connect() as db:
+        return {
+            "previews": [tuple(row) for row in db.execute("SELECT * FROM share_previews ORDER BY id")],
+            "submissions": [tuple(row) for row in db.execute("SELECT * FROM submissions ORDER BY id")],
+            "entries": [tuple(row) for row in db.execute("SELECT * FROM public_entries ORDER BY id")],
+            "revisions": [tuple(row) for row in db.execute("SELECT * FROM public_revisions ORDER BY id")],
+            "audit": [tuple(row) for row in db.execute(
+                "SELECT * FROM audit_events WHERE object_type IN ('submission','public_entry') ORDER BY id"
+            )],
+        }
+
+
+@pytest.mark.parametrize("operation", ["create_preview", "submit_preview", "retry_ai", "withdraw"])
+def test_revocation_after_initial_publication_authorization_prevents_all_writes(
+    tmp_path: Path, monkeypatch, operation: str,
+):
+    (
+        store, owner_context, member_context, snapshot, fingerprint, preview, submission, _public_entry_id,
+    ) = _team_publication_world(tmp_path, operation)
+    before = _publication_rows(store)
+    permission_checked = threading.Event()
+    release_writer = threading.Event()
+    original_authorize = store.authorize_workspace
+    writer_error: list[BaseException] = []
+
+    def pause_after_initial_check(user_id: str, workspace_id: str, permission: str):
+        result = original_authorize(user_id, workspace_id, permission)
+        if user_id == member_context.user_id and permission == "wiki.write":
+            permission_checked.set()
+            assert release_writer.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(store, "authorize_workspace", pause_after_initial_check)
+
+    def write_after_check():
+        try:
+            if operation == "create_preview":
+                store.create_preview(
+                    member_context, "concepts/new.md", "revision-2", "b" * 32,
+                    fingerprint, snapshot,
+                )
+            elif operation == "submit_preview":
+                store.submit_preview(member_context, preview["preview_id"])
+            elif operation == "retry_ai":
+                store.retry_ai(member_context, submission["id"])
+            else:
+                store.withdraw(member_context, submission["id"])
+        except BaseException as exc:
+            writer_error.append(exc)
+
+    writer = threading.Thread(target=write_after_check)
+    writer.start()
+    assert permission_checked.wait(timeout=5)
+    assert store.remove_workspace_member(owner_context, member_context.user_id)["status"] == "suspended"
+    release_writer.set()
+    writer.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert writer_error and isinstance(writer_error[0], (FileNotFoundError, PermissionError))
+    assert _publication_rows(store) == before
+
+
+@pytest.mark.parametrize("operation", ["create_preview", "submit_preview", "retry_ai", "withdraw"])
+def test_publication_write_and_final_authorization_are_one_linearized_transaction(
+    tmp_path: Path, monkeypatch, operation: str,
+):
+    (
+        store, owner_context, member_context, snapshot, fingerprint, preview, submission, public_entry_id,
+    ) = _team_publication_world(tmp_path, operation)
+    final_permission_checked = threading.Event()
+    release_writer = threading.Event()
+    revoke_done = threading.Event()
+    original_final_authorize = store._authorize_workspace_in_transaction
+    writer_result: list[dict] = []
+    writer_error: list[BaseException] = []
+
+    def pause_inside_transaction(db, user_id: str, workspace_id: str, permission: str):
+        result = original_final_authorize(db, user_id, workspace_id, permission)
+        if user_id == member_context.user_id and permission == "wiki.write":
+            final_permission_checked.set()
+            assert release_writer.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(store, "_authorize_workspace_in_transaction", pause_inside_transaction)
+
+    def write_inside_transaction():
+        try:
+            if operation == "create_preview":
+                result = store.create_preview(
+                    member_context, "concepts/new.md", "revision-2", "b" * 32,
+                    fingerprint, snapshot,
+                )
+            elif operation == "submit_preview":
+                result = store.submit_preview(member_context, preview["preview_id"])
+            elif operation == "retry_ai":
+                result = store.retry_ai(member_context, submission["id"])
+            else:
+                result = store.withdraw(member_context, submission["id"])
+            writer_result.append(result)
+        except BaseException as exc:
+            writer_error.append(exc)
+
+    def revoke_member():
+        store.remove_workspace_member(owner_context, member_context.user_id)
+        revoke_done.set()
+
+    writer = threading.Thread(target=write_inside_transaction)
+    writer.start()
+    assert final_permission_checked.wait(timeout=5)
+    remover = threading.Thread(target=revoke_member)
+    remover.start()
+    assert not revoke_done.wait(timeout=0.2)
+    release_writer.set()
+    writer.join(timeout=5)
+    remover.join(timeout=5)
+
+    assert not writer_error and writer_result
+    assert revoke_done.is_set()
+    with store.connect() as db:
+        if operation == "create_preview":
+            assert db.execute("SELECT COUNT(*) FROM share_previews").fetchone()[0] == 1
+        elif operation == "submit_preview":
+            assert db.execute("SELECT COUNT(*) FROM share_previews").fetchone()[0] == 0
+            assert db.execute("SELECT status FROM submissions").fetchone()[0] == "ai_queued"
+        elif operation == "retry_ai":
+            assert db.execute("SELECT status FROM submissions WHERE id=?", (submission["id"],)).fetchone()[0] == "ai_queued"
+        else:
+            assert db.execute("SELECT status FROM submissions WHERE id=?", (submission["id"],)).fetchone()[0] == "withdrawn"
+            assert db.execute("SELECT status FROM public_entries WHERE id=?", (public_entry_id,)).fetchone()[0] == "withdrawn_by_author"
 
 
 def test_registration_creates_personal_organization_and_owner_membership(tmp_path: Path):
@@ -356,9 +539,10 @@ def test_submissions_and_publication_state_do_not_cross_workspaces(membership_se
     path_b, revision_b = seed_article(app, author, "Same title")
     article_b = author.request("GET", f"/api/article?path={path_b}")[1]
     assert article_b["publication"]["state"] == "not_published"
-    preview_b = author.request("POST", "/api/share-previews", {
+    preview_status, preview_b = author.request("POST", "/api/share-previews", {
         "article_path": path_b, "source_revision": revision_b, "attribution": "nickname",
-    }, key="two-preview-b")[1]
+    }, key="two-preview-b")
+    assert preview_status == 201, preview_b
     submission_b = author.request("POST", "/api/submissions", {"preview_id": preview_b["preview_id"]}, key="two-submit-b")[1]
     app.platform.ai_decide(submission_b["id"], "pass", {"summary": "accepted B"})
     public_b = author.request("POST", f"/api/admin/submissions/{submission_b['id']}/decision", {

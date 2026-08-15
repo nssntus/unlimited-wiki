@@ -34,6 +34,7 @@ from model_settings import build_config, load_model_settings, public_model_setti
 from legacy_migration import migrate_legacy_workspace
 from platform_store import PlatformIdempotencyError, PlatformStore, SessionContext
 from platform_review import PlatformReviewWorker
+from publication import public_markdown, snapshot_fingerprint
 from wiki_service import LLMConfig, WikiService, article_summary
 
 ROOT = Path(__file__).resolve().parent
@@ -128,6 +129,7 @@ class WikiApp:
         self._service_lock = threading.RLock()
         self._services: dict[str, WikiService] = {}
         self._diagnostics: dict[str, DiagnosticCache] = {}
+        self._publication_backfills: set[tuple[str, str]] = set()
         if self.service is not None:
             self.diagnostics = DiagnosticCache(self.service)
         self.review_worker = PlatformReviewWorker(self.platform, self.platform_reviewer) if self.platform is not None and self.start_worker else None
@@ -162,6 +164,10 @@ class WikiApp:
                     require_task_actor=True,
                 )
                 self._services[context.workspace_id] = service
+            backfill_key = (context.workspace_id, context.user_id)
+            if backfill_key not in self._publication_backfills:
+                self.platform.backfill_workspace_publication_sources(context, service.articles())
+                self._publication_backfills.add(backfill_key)
             return service
 
     def diagnostics_for(self, context: SessionContext | None, service: WikiService) -> DiagnosticCache:
@@ -631,6 +637,7 @@ def make_handler(app: WikiApp):
                     "state": "not_published", "public_entry_id": None, "public_revision_id": None,
                     "public_version": None, "published_at": None, "submission_id": None,
                     "submission_status": None, "submission_matches_current": False,
+                    "publication_fingerprint": None,
                     "moderation_reason": None, "moderated_at": None,
                 }
                 return self._json(200, article)
@@ -1019,13 +1026,17 @@ def make_handler(app: WikiApp):
                     raise ApiError(409, "article already has a submission in review")
                 if attribution not in {"nickname", "anonymous"}:
                     raise ApiError(422, "invalid attribution")
+                projected_markdown = public_markdown(article["markdown"])
                 snapshot = {
                     "title": article["title"], "category": article["category"], "content_status": article["content_status"],
-                    "markdown": article["markdown"], "summary": article_summary(article["markdown"]),
+                    "markdown": projected_markdown, "summary": article_summary(projected_markdown),
                     "attribution": self.context.nickname if attribution == "nickname" else "匿名用户",
                     "source_summaries": [str(value)[:240] for value in article.get("sources", [])],
                 }
-                response, _ = self._idempotency(data, lambda: app.platform.create_preview(self.context, article_path, source_revision, snapshot))
+                fingerprint = snapshot_fingerprint(snapshot)
+                response, _ = self._idempotency(data, lambda: app.platform.create_preview(
+                    self.context, article_path, source_revision, article["article_id"], fingerprint, snapshot,
+                ))
                 return self._json(201, response)
             if path == "/api/submissions":
                 _fields(data, {"preview_id"}, {"preview_id"})

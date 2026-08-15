@@ -20,6 +20,8 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from publication import FINGERPRINT_VERSION, article_id_from_markdown, normalize_text, snapshot_fingerprint
+
 
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 ROLES = {"user", "admin"}
@@ -285,25 +287,28 @@ class PlatformStore:
                 CREATE TABLE IF NOT EXISTS share_previews (
                     id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(id), workspace_id TEXT NOT NULL REFERENCES workspaces(id),
                     article_path TEXT NOT NULL, source_revision TEXT NOT NULL, content_hash TEXT NOT NULL,
-                    snapshot_json TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL
+                    snapshot_json TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL,
+                    article_id TEXT, publication_fingerprint TEXT
                 );
                 CREATE TABLE IF NOT EXISTS submissions (
                     id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(id), workspace_id TEXT NOT NULL REFERENCES workspaces(id),
                     status TEXT NOT NULL, snapshot_json TEXT NOT NULL, content_hash TEXT NOT NULL,
                     ai_report_json TEXT, reason TEXT, reviewer_id TEXT REFERENCES users(id), public_entry_id TEXT,
-                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, article_id TEXT, article_path TEXT,
+                    source_revision TEXT, publication_fingerprint TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_submissions_owner ON submissions(owner_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions(status, created_at);
                 CREATE TABLE IF NOT EXISTS public_entries (
                     id TEXT PRIMARY KEY, author_id TEXT NOT NULL REFERENCES users(id), status TEXT NOT NULL,
                     current_revision_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                    moderation_reason TEXT, moderated_by TEXT REFERENCES users(id), moderated_at TEXT
+                    moderation_reason TEXT, moderated_by TEXT REFERENCES users(id), moderated_at TEXT,
+                    source_workspace_id TEXT, source_article_id TEXT
                 );
                 CREATE TABLE IF NOT EXISTS public_revisions (
                     id TEXT PRIMARY KEY, entry_id TEXT NOT NULL REFERENCES public_entries(id), submission_id TEXT NOT NULL UNIQUE REFERENCES submissions(id),
                     version INTEGER NOT NULL, snapshot_json TEXT NOT NULL, content_hash TEXT NOT NULL,
-                    published_at TEXT NOT NULL, UNIQUE(entry_id, version)
+                    published_at TEXT NOT NULL, publication_fingerprint TEXT, UNIQUE(entry_id, version)
                 );
                 CREATE TABLE IF NOT EXISTS reports (
                     id TEXT PRIMARY KEY, entry_id TEXT NOT NULL REFERENCES public_entries(id), reporter_id TEXT REFERENCES users(id),
@@ -370,11 +375,102 @@ class PlatformStore:
                 "moderation_reason": "TEXT",
                 "moderated_by": "TEXT REFERENCES users(id)",
                 "moderated_at": "TEXT",
+                "source_workspace_id": "TEXT",
+                "source_article_id": "TEXT",
             }.items():
                 if name not in public_columns:
                     db.execute(f"ALTER TABLE public_entries ADD COLUMN {name} {declaration}")
+            for table, columns in {
+                "share_previews": {
+                    "article_id": "TEXT",
+                    "publication_fingerprint": "TEXT",
+                },
+                "submissions": {
+                    "article_id": "TEXT",
+                    "article_path": "TEXT",
+                    "source_revision": "TEXT",
+                    "publication_fingerprint": "TEXT",
+                },
+                "public_revisions": {
+                    "publication_fingerprint": "TEXT",
+                },
+            }.items():
+                existing = {row["name"] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+                for name, declaration in columns.items():
+                    if name not in existing:
+                        db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+            self._backfill_publication_metadata(db)
+            db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_submissions_article
+                ON submissions(owner_id,workspace_id,article_id,updated_at DESC)
+            """)
+            db.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_public_entries_source_article
+                ON public_entries(author_id,source_workspace_id,source_article_id)
+                WHERE source_workspace_id IS NOT NULL AND source_article_id IS NOT NULL
+            """)
             db.execute("UPDATE submissions SET status='ai_queued',updated_at=? WHERE status='ai_reviewing'", (now_iso(),))
         os.chmod(self.db_path, 0o600)
+
+    @staticmethod
+    def _backfill_publication_metadata(db: sqlite3.Connection) -> None:
+        for table in ("share_previews", "submissions"):
+            rows = db.execute(
+                f"SELECT id,snapshot_json,article_id,publication_fingerprint FROM {table}"
+            ).fetchall()
+            for row in rows:
+                if row["article_id"] and re.fullmatch(
+                    rf"{re.escape(FINGERPRINT_VERSION)}:[a-f0-9]{{64}}",
+                    str(row["publication_fingerprint"] or ""),
+                ):
+                    continue
+                try:
+                    snapshot = json.loads(row["snapshot_json"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                article_id = row["article_id"] or article_id_from_markdown(str(snapshot.get("markdown", "")))
+                fingerprint = snapshot_fingerprint(snapshot)
+                db.execute(
+                    f"UPDATE {table} SET article_id=?,publication_fingerprint=? WHERE id=?",
+                    (article_id, fingerprint, row["id"]),
+                )
+
+        revisions = db.execute(
+            "SELECT id,snapshot_json,publication_fingerprint FROM public_revisions"
+        ).fetchall()
+        for row in revisions:
+            if re.fullmatch(
+                rf"{re.escape(FINGERPRINT_VERSION)}:[a-f0-9]{{64}}",
+                str(row["publication_fingerprint"] or ""),
+            ):
+                continue
+            try:
+                fingerprint = snapshot_fingerprint(json.loads(row["snapshot_json"]))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            db.execute(
+                "UPDATE public_revisions SET publication_fingerprint=? WHERE id=?",
+                (fingerprint, row["id"]),
+            )
+
+        candidates = db.execute("""
+            SELECT entry.id,entry.author_id,submission.workspace_id,submission.article_id
+            FROM public_entries entry
+            JOIN public_revisions revision ON revision.id=entry.current_revision_id
+            JOIN submissions submission ON submission.id=revision.submission_id
+            WHERE submission.article_id IS NOT NULL
+        """).fetchall()
+        grouped: dict[tuple[str, str, str], list[str]] = {}
+        for row in candidates:
+            key = (row["author_id"], row["workspace_id"], row["article_id"])
+            grouped.setdefault(key, []).append(row["id"])
+        for (author_id, workspace_id, article_id), entry_ids in grouped.items():
+            if len(entry_ids) != 1:
+                continue
+            db.execute("""
+                UPDATE public_entries SET source_workspace_id=?,source_article_id=?
+                WHERE id=? AND author_id=? AND source_workspace_id IS NULL AND source_article_id IS NULL
+            """, (workspace_id, article_id, entry_ids[0], author_id))
 
     @staticmethod
     def _remove_workspace_owner_unique(db: sqlite3.Connection) -> None:
@@ -469,10 +565,18 @@ class PlatformStore:
 
     def audit(self, actor_id: str | None, action: str, object_type: str, object_id: str, detail: dict | None = None) -> None:
         with self.connect() as db:
-            db.execute(
-                "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
-                (uuid.uuid4().hex, actor_id, action, object_type, object_id, json.dumps(detail or {}, ensure_ascii=False), now_iso()),
-            )
+            self._audit(db, actor_id, action, object_type, object_id, detail)
+
+    @staticmethod
+    def _audit(
+        db: sqlite3.Connection, actor_id: str | None, action: str, object_type: str,
+        object_id: str, detail: dict | None = None,
+    ) -> None:
+        db.execute(
+            "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
+            (uuid.uuid4().hex, actor_id, action, object_type, object_id,
+             json.dumps(detail or {}, ensure_ascii=False), now_iso()),
+        )
 
     @staticmethod
     def _notify(db: sqlite3.Connection, user_id: str, kind: str, object_type: str, object_id: str, title: str, message: str) -> None:
@@ -651,6 +755,19 @@ class PlatformStore:
             row = self._workspace_access_row(db, user_id, workspace_id)
         self._check_workspace_permission(row, workspace_id, permission)
         return dict(row)
+
+    def _authorize_workspace_in_transaction(
+        self, db: sqlite3.Connection, user_id: str, workspace_id: str, permission: str,
+    ) -> sqlite3.Row:
+        row = self._workspace_access_row(db, user_id, workspace_id)
+        self._check_workspace_permission(row, workspace_id, permission)
+        return row
+
+    @staticmethod
+    def _authorize_admin_in_transaction(db: sqlite3.Connection, user_id: str) -> None:
+        row = db.execute("SELECT role,status FROM users WHERE id=?", (user_id,)).fetchone()
+        if row is None or row["status"] != "active" or row["role"] != "admin":
+            raise PermissionError("admin role required")
 
     @contextlib.contextmanager
     def authorized_workspace_action(self, user_id: str, workspace_id: str, permission: str):
@@ -1394,18 +1511,47 @@ class PlatformStore:
             "api_key": self.vault.decrypt(row["api_key_enc"], scope=scope), "model": row["model"],
         }
 
-    def create_preview(self, context: SessionContext, article_path: str, source_revision: str, snapshot: dict) -> dict:
+    def create_preview(
+        self,
+        context: SessionContext,
+        article_path: str,
+        source_revision: str,
+        article_id: str,
+        publication_fingerprint: str,
+        snapshot: dict,
+    ) -> dict:
         self.authorize_workspace(context.user_id, context.workspace_id, "wiki.write")
+        if not re.fullmatch(r"[a-f0-9]{32}", article_id or ""):
+            raise ValueError("article has no stable identity")
+        if publication_fingerprint != snapshot_fingerprint(snapshot):
+            raise ValueError("publication fingerprint does not match snapshot")
         preview_id = uuid.uuid4().hex
         canonical = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         content_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         expires = future_iso(minutes=30)
-        with self.connect() as db:
-            db.execute("INSERT INTO share_previews VALUES(?,?,?,?,?,?,?,?,?)", (
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._authorize_workspace_in_transaction(
+                db, context.user_id, context.workspace_id, "wiki.write",
+            )
+            db.execute("""
+                INSERT INTO share_previews(
+                    id,owner_id,workspace_id,article_path,source_revision,content_hash,snapshot_json,
+                    expires_at,created_at,article_id,publication_fingerprint
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            """, (
                 preview_id, context.user_id, context.workspace_id, article_path, source_revision,
-                content_hash, canonical, expires, now_iso(),
+                content_hash, canonical, expires, now_iso(), article_id, publication_fingerprint,
             ))
-        return {"preview_id": preview_id, "expires_at": expires, "source_revision": source_revision, "content_hash": content_hash, "snapshot": snapshot}
+            db.commit()
+        return {
+            "preview_id": preview_id,
+            "expires_at": expires,
+            "source_revision": source_revision,
+            "content_hash": content_hash,
+            "publication_fingerprint": publication_fingerprint,
+            "snapshot": snapshot,
+        }
 
     def submit_preview(self, context: SessionContext, preview_id: str) -> dict:
         self.authorize_workspace(context.user_id, context.workspace_id, "wiki.write")
@@ -1413,20 +1559,34 @@ class PlatformStore:
         now = now_iso()
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._authorize_workspace_in_transaction(
+                db, context.user_id, context.workspace_id, "wiki.write",
+            )
             row = db.execute("SELECT * FROM share_previews WHERE id=? AND owner_id=? AND workspace_id=? AND expires_at>?", (
                 preview_id, context.user_id, context.workspace_id, now,
             )).fetchone()
             if row is None:
                 db.rollback()
                 raise FileNotFoundError(preview_id)
-            db.execute("INSERT INTO submissions VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
+            db.execute("""
+                INSERT INTO submissions(
+                    id,owner_id,workspace_id,status,snapshot_json,content_hash,ai_report_json,reason,
+                    reviewer_id,public_entry_id,created_at,updated_at,article_id,article_path,
+                    source_revision,publication_fingerprint
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
                 submission_id, context.user_id, context.workspace_id, "ai_queued", row["snapshot_json"],
-                row["content_hash"], None, None, None, None, now, now,
+                row["content_hash"], None, None, None, None, now, now, row["article_id"],
+                row["article_path"], row["source_revision"], row["publication_fingerprint"],
             ))
             db.execute("DELETE FROM share_previews WHERE id=?", (preview_id,))
+            saved = db.execute("SELECT * FROM submissions WHERE id=?", (submission_id,)).fetchone()
+            self._audit(
+                db, context.user_id, "submission.create", "submission", submission_id,
+                {"content_hash": row["content_hash"]},
+            )
             db.commit()
-        self.audit(context.user_id, "submission.create", "submission", submission_id, {"content_hash": row["content_hash"]})
-        return self.get_submission(context, submission_id)
+        return self._submission_public(saved)
 
     @staticmethod
     def _submission_public(row: sqlite3.Row, *, admin: bool = False) -> dict:
@@ -1461,24 +1621,105 @@ class PlatformStore:
         return self._submission_public(row)
 
     @staticmethod
-    def _snapshot_matches_article(snapshot: dict, article: dict) -> bool:
+    def _legacy_snapshot_matches_identity(snapshot: dict, article: dict) -> bool:
         return (
-            str(snapshot.get("title", "")).strip() == str(article.get("title", "")).strip()
-            and snapshot.get("category") == article.get("category")
-            and snapshot.get("content_status") == article.get("content_status")
-            and snapshot.get("markdown") == article.get("markdown")
+            normalize_text(snapshot.get("title")).casefold() == normalize_text(article.get("title")).casefold()
+            and normalize_text(snapshot.get("category")) == normalize_text(article.get("category"))
+            and normalize_text(snapshot.get("content_status")) == normalize_text(article.get("content_status"))
         )
+
+    @staticmethod
+    def _publication_identity(value: dict) -> tuple[str, str, str]:
+        return (
+            normalize_text(value.get("title")).casefold(),
+            normalize_text(value.get("category")),
+            normalize_text(value.get("content_status")),
+        )
+
+    def backfill_workspace_publication_sources(self, context: SessionContext, articles: list[dict]) -> dict:
+        """Bind legacy publication rows only when the private identity is unambiguous."""
+        self.authorize_workspace(context.user_id, context.workspace_id, "wiki.read")
+        private_by_identity: dict[tuple[str, str, str], list[dict]] = {}
+        for article in articles:
+            article_id = str(article.get("article_id") or "")
+            if re.fullmatch(r"[a-f0-9]{32}", article_id):
+                private_by_identity.setdefault(self._publication_identity(article), []).append(article)
+
+        bound_entries = 0
+        bound_submissions = 0
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._authorize_workspace_in_transaction(
+                db, context.user_id, context.workspace_id, "wiki.read",
+            )
+            public_rows = db.execute("""
+                SELECT entry.id,revision.snapshot_json
+                FROM public_entries entry
+                JOIN public_revisions revision ON revision.id=entry.current_revision_id
+                JOIN submissions submission ON submission.id=revision.submission_id
+                WHERE entry.author_id=? AND submission.workspace_id=?
+                  AND entry.source_workspace_id IS NULL AND entry.source_article_id IS NULL
+            """, (context.user_id, context.workspace_id)).fetchall()
+            public_by_identity: dict[tuple[str, str, str], list[sqlite3.Row]] = {}
+            for row in public_rows:
+                try:
+                    identity = self._publication_identity(json.loads(row["snapshot_json"]))
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                public_by_identity.setdefault(identity, []).append(row)
+
+            for identity, rows in public_by_identity.items():
+                private = private_by_identity.get(identity, [])
+                if len(private) != 1 or len(rows) != 1:
+                    continue
+                result = db.execute("""
+                    UPDATE public_entries SET source_workspace_id=?,source_article_id=?
+                    WHERE id=? AND source_workspace_id IS NULL AND source_article_id IS NULL
+                """, (context.workspace_id, private[0]["article_id"], rows[0]["id"]))
+                bound_entries += result.rowcount
+
+            submission_rows = db.execute("""
+                SELECT id,snapshot_json FROM submissions
+                WHERE owner_id=? AND workspace_id=? AND article_id IS NULL
+            """, (context.user_id, context.workspace_id)).fetchall()
+            for row in submission_rows:
+                try:
+                    private = private_by_identity.get(
+                        self._publication_identity(json.loads(row["snapshot_json"])), []
+                    )
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if len(private) != 1:
+                    continue
+                result = db.execute(
+                    "UPDATE submissions SET article_id=? WHERE id=? AND article_id IS NULL",
+                    (private[0]["article_id"], row["id"]),
+                )
+                bound_submissions += result.rowcount
+            db.commit()
+        return {"public_entries": bound_entries, "submissions": bound_submissions}
+
+    @staticmethod
+    def _row_fingerprint(row: sqlite3.Row, snapshot: dict) -> str:
+        return row["publication_fingerprint"] or snapshot_fingerprint(snapshot)
 
     def article_publication(self, context: SessionContext, article: dict) -> dict:
         """Return the current user's publication state without exposing another tenant."""
         self.authorize_workspace(context.user_id, context.workspace_id, "wiki.read")
-        title = str(article.get("title", "")).strip().casefold()
+        article_id = str(article.get("article_id") or "")
+        current_fingerprint = snapshot_fingerprint({
+            "title": article.get("title"),
+            "category": article.get("category"),
+            "content_status": article.get("content_status"),
+            "markdown": article.get("markdown", ""),
+        })
         public_row = None
         active_row = None
         with self.connect() as db:
             public_candidates = db.execute("""
                 SELECT e.id,e.status,e.moderation_reason,e.moderated_at,
-                       r.id revision_id,r.version,r.snapshot_json,r.published_at
+                       e.source_article_id,r.id revision_id,r.version,r.snapshot_json,r.published_at,
+                       r.publication_fingerprint
                 FROM public_entries e
                 JOIN public_revisions r ON r.id=e.current_revision_id
                 JOIN submissions s ON s.id=r.submission_id
@@ -1486,25 +1727,21 @@ class PlatformStore:
                 ORDER BY r.published_at DESC
             """, (context.user_id, context.workspace_id)).fetchall()
             submission_candidates = db.execute("""
-                SELECT id,status,snapshot_json,updated_at FROM submissions
+                SELECT id,status,snapshot_json,updated_at,article_id,publication_fingerprint FROM submissions
                 WHERE owner_id=? AND workspace_id=? ORDER BY updated_at DESC
             """, (context.user_id, context.workspace_id)).fetchall()
 
-        for row in public_candidates:
-            snapshot = json.loads(row["snapshot_json"])
-            if str(snapshot.get("title", "")).strip().casefold() == title:
-                public_row = (row, snapshot)
-                break
-        for row in submission_candidates:
-            if row["status"] not in ACTIVE_SUBMISSION_STATES:
-                continue
-            snapshot = json.loads(row["snapshot_json"])
-            if str(snapshot.get("title", "")).strip().casefold() == title:
-                active_row = (row, snapshot)
-                break
+        exact_public = [row for row in public_candidates if row["source_article_id"] == article_id]
+        if len(exact_public) == 1:
+            public_row = (exact_public[0], json.loads(exact_public[0]["snapshot_json"]))
 
-        public_matches = bool(public_row and self._snapshot_matches_article(public_row[1], article))
-        submission_matches = bool(active_row and self._snapshot_matches_article(active_row[1], article))
+        active_candidates = [row for row in submission_candidates if row["status"] in ACTIVE_SUBMISSION_STATES]
+        exact_active = [row for row in active_candidates if row["article_id"] == article_id]
+        if len(exact_active) == 1:
+            active_row = (exact_active[0], json.loads(exact_active[0]["snapshot_json"]))
+
+        public_matches = bool(public_row and self._row_fingerprint(public_row[0], public_row[1]) == current_fingerprint)
+        submission_matches = bool(active_row and self._row_fingerprint(active_row[0], active_row[1]) == current_fingerprint)
         public_status = public_row[0]["status"] if public_row else None
         if public_status == "removed_by_admin" and active_row:
             state = "relist_pending"
@@ -1534,6 +1771,7 @@ class PlatformStore:
             "submission_id": submission["id"] if submission else None,
             "submission_status": submission["status"] if submission else None,
             "submission_matches_current": submission_matches,
+            "publication_fingerprint": current_fingerprint,
             "moderation_reason": public["moderation_reason"] if public else None,
             "moderated_at": public["moderated_at"] if public else None,
         }
@@ -1576,6 +1814,9 @@ class PlatformStore:
         self.authorize_workspace(context.user_id, context.workspace_id, "wiki.write")
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._authorize_workspace_in_transaction(
+                db, context.user_id, context.workspace_id, "wiki.write",
+            )
             row = db.execute(
                 "SELECT status FROM submissions WHERE id=? AND owner_id=? AND workspace_id=?",
                 (submission_id, context.user_id, context.workspace_id),
@@ -1590,13 +1831,17 @@ class PlatformStore:
                 "UPDATE submissions SET status='ai_queued',ai_report_json=NULL,updated_at=? WHERE id=?",
                 (now_iso(), submission_id),
             )
+            saved = db.execute("SELECT * FROM submissions WHERE id=?", (submission_id,)).fetchone()
             db.commit()
-        return self.get_submission(context, submission_id)
+        return self._submission_public(saved)
 
     def withdraw(self, context: SessionContext, submission_id: str) -> dict:
         self.authorize_workspace(context.user_id, context.workspace_id, "wiki.write")
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._authorize_workspace_in_transaction(
+                db, context.user_id, context.workspace_id, "wiki.write",
+            )
             row = db.execute(
                 "SELECT * FROM submissions WHERE id=? AND owner_id=? AND workspace_id=?",
                 (submission_id, context.user_id, context.workspace_id),
@@ -1608,9 +1853,10 @@ class PlatformStore:
             if row["status"] == "approved" and row["public_entry_id"]:
                 db.execute("UPDATE public_entries SET status='withdrawn_by_author',updated_at=? WHERE id=?", (now_iso(), row["public_entry_id"]))
             db.execute("UPDATE submissions SET status='withdrawn',updated_at=? WHERE id=?", (now_iso(), submission_id))
+            saved = db.execute("SELECT * FROM submissions WHERE id=?", (submission_id,)).fetchone()
+            self._audit(db, context.user_id, "submission.withdraw", "submission", submission_id)
             db.commit()
-        self.audit(context.user_id, "submission.withdraw", "submission", submission_id)
-        return self.get_submission(context, submission_id)
+        return self._submission_public(saved)
 
     def admin_list(self, context: SessionContext, status: str = "pending_admin") -> list[dict]:
         if context.role != "admin":
@@ -1638,6 +1884,7 @@ class PlatformStore:
         now = now_iso()
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._authorize_admin_in_transaction(db, context.user_id)
             row = db.execute("SELECT * FROM submissions WHERE id=?", (submission_id,)).fetchone()
             if row is None:
                 db.rollback(); raise FileNotFoundError(submission_id)
@@ -1647,40 +1894,69 @@ class PlatformStore:
             if decision == "approve":
                 entry_id = None
                 version = 1
-                title = str(json.loads(row["snapshot_json"]).get("title", "")).strip().casefold()
+                snapshot = json.loads(row["snapshot_json"])
+                article_id = row["article_id"]
+                if not isinstance(article_id, str) or re.fullmatch(r"[a-f0-9]{32}", article_id) is None:
+                    db.rollback()
+                    raise RuntimeError("legacy submission identity is unresolved")
                 candidates = db.execute("""
-                    SELECT e.id,e.status,e.current_revision_id,r.version,r.snapshot_json FROM public_entries e
+                    SELECT e.id,e.status,e.current_revision_id,e.source_article_id,
+                           r.version,r.snapshot_json
+                    FROM public_entries e
                     JOIN public_revisions r ON r.id=e.current_revision_id
                     JOIN submissions prior ON prior.id=r.submission_id
                     WHERE e.author_id=? AND prior.workspace_id=?
                 """, (row["owner_id"], row["workspace_id"])).fetchall()
                 previous_public_status = None
-                for candidate in candidates:
-                    if str(json.loads(candidate["snapshot_json"]).get("title", "")).strip().casefold() == title:
-                        entry_id, version = candidate["id"], candidate["version"] + 1
-                        previous_public_status = candidate["status"]
-                        break
+                exact = [candidate for candidate in candidates if article_id and candidate["source_article_id"] == article_id]
+                if len(exact) > 1:
+                    db.rollback()
+                    raise RuntimeError("multiple public entries share the same article identity")
+                selected = exact[0] if exact else None
+                if selected is None:
+                    legacy = [
+                        candidate for candidate in candidates
+                        if candidate["source_article_id"] is None
+                        and self._legacy_snapshot_matches_identity(json.loads(candidate["snapshot_json"]), snapshot)
+                    ]
+                    if legacy:
+                        db.rollback()
+                        raise RuntimeError("legacy public entry identity is unresolved")
+                if selected is not None:
+                    entry_id, version = selected["id"], selected["version"] + 1
+                    previous_public_status = selected["status"]
                 revision_id = uuid.uuid4().hex
                 if entry_id is None:
                     entry_id = uuid.uuid4().hex
                     db.execute("""
-                        INSERT INTO public_entries(id,author_id,status,current_revision_id,created_at,updated_at)
-                        VALUES(?,?,?,?,?,?)
-                    """, (entry_id, row["owner_id"], "published", revision_id, now, now))
+                        INSERT INTO public_entries(
+                            id,author_id,status,current_revision_id,created_at,updated_at,
+                            source_workspace_id,source_article_id
+                        ) VALUES(?,?,?,?,?,?,?,?)
+                    """, (
+                        entry_id, row["owner_id"], "published", revision_id, now, now,
+                        row["workspace_id"], article_id,
+                    ))
                 else:
                     db.execute("""
                         UPDATE public_entries SET status='published',current_revision_id=?,updated_at=?,
                           moderation_reason=NULL,moderated_by=NULL,moderated_at=NULL WHERE id=?
                     """, (revision_id, now, entry_id))
-                db.execute("INSERT INTO public_revisions VALUES(?,?,?,?,?,?,?)", (
-                    revision_id, entry_id, submission_id, version, row["snapshot_json"], row["content_hash"], now,
+                db.execute("""
+                    INSERT INTO public_revisions(
+                        id,entry_id,submission_id,version,snapshot_json,content_hash,published_at,
+                        publication_fingerprint
+                    ) VALUES(?,?,?,?,?,?,?,?)
+                """, (
+                    revision_id, entry_id, submission_id, version, row["snapshot_json"],
+                    row["content_hash"], now,
+                    row["publication_fingerprint"] or snapshot_fingerprint(snapshot),
                 ))
                 status = "approved"
                 db.execute("UPDATE submissions SET status=?,reason=?,reviewer_id=?,public_entry_id=?,updated_at=? WHERE id=?", (
                     status, reason.strip(), context.user_id, entry_id, now, submission_id,
                 ))
                 if previous_public_status == "removed_by_admin":
-                    snapshot = json.loads(row["snapshot_json"])
                     self._notify(
                         db, row["owner_id"], "public_relisted", "public_entry", entry_id,
                         f"《{snapshot.get('title', '词条')}》已重新上架",
@@ -1692,10 +1968,10 @@ class PlatformStore:
                 db.execute("UPDATE submissions SET status=?,reason=?,reviewer_id=?,updated_at=? WHERE id=?", (
                     status, reason.strip(), context.user_id, now, submission_id,
                 ))
+            self._audit(db, context.user_id, f"submission.{decision}", "submission", submission_id, {
+                "reason": reason.strip(), "self_review": self_review,
+            })
             db.commit()
-        self.audit(context.user_id, f"submission.{decision}", "submission", submission_id, {
-            "reason": reason.strip(), "self_review": self_review,
-        })
         return {"id": submission_id, "status": status, "public_entry_id": entry_id}
 
     def list_public(self, query: str = "", category: str = "") -> list[dict]:
@@ -1786,6 +2062,7 @@ class PlatformStore:
         now = now_iso()
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._authorize_admin_in_transaction(db, context.user_id)
             row = db.execute("""
                 SELECT e.author_id,r.snapshot_json FROM public_entries e
                 JOIN public_revisions r ON r.id=e.current_revision_id
@@ -1803,8 +2080,11 @@ class PlatformStore:
                 f"《{title}》已从 Wiki 广场下架",
                 f"处理理由：{reason.strip()}。请修改私有正本后申请重新上架。",
             )
+            self._audit(
+                db, context.user_id, "public.remove", "public_entry", entry_id,
+                {"reason": reason.strip()},
+            )
             db.commit()
-        self.audit(context.user_id, "public.remove", "public_entry", entry_id, {"reason": reason.strip()})
         return {"id": entry_id, "status": "removed_by_admin"}
 
     def relist_public(self, context: SessionContext, entry_id: str, reason: str) -> dict:
@@ -1815,6 +2095,7 @@ class PlatformStore:
         now = now_iso()
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._authorize_admin_in_transaction(db, context.user_id)
             row = db.execute("""
                 SELECT e.author_id,r.snapshot_json FROM public_entries e
                 JOIN public_revisions r ON r.id=e.current_revision_id
@@ -1832,8 +2113,11 @@ class PlatformStore:
                 f"《{title}》已重新上架",
                 f"Admin 已恢复该公开版本。处理说明：{reason.strip()}",
             )
+            self._audit(
+                db, context.user_id, "public.relist", "public_entry", entry_id,
+                {"reason": reason.strip()},
+            )
             db.commit()
-        self.audit(context.user_id, "public.relist", "public_entry", entry_id, {"reason": reason.strip()})
         return {"id": entry_id, "status": "published"}
 
     def decide_report(self, context: SessionContext, report_id: str, action: str, reason: str) -> dict:
@@ -1841,6 +2125,7 @@ class PlatformStore:
             raise PermissionError("admin role, valid action, and reason are required")
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._authorize_admin_in_transaction(db, context.user_id)
             row = db.execute("""
                 SELECT reports.*,e.author_id,e.status AS entry_status,r.snapshot_json FROM reports
                 JOIN public_entries e ON e.id=reports.entry_id
@@ -1866,6 +2151,9 @@ class PlatformStore:
             db.execute("UPDATE reports SET status='resolved',resolution=?,resolved_by=?,updated_at=? WHERE id=?", (
                 f"{action}: {reason.strip()}", context.user_id, now_iso(), report_id,
             ))
+            self._audit(
+                db, context.user_id, f"report.{action}", "report", report_id,
+                {"reason": reason.strip()},
+            )
             db.commit()
-        self.audit(context.user_id, f"report.{action}", "report", report_id, {"reason": reason.strip()})
         return {"id": report_id, "status": "resolved", "action": action}
