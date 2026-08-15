@@ -46,7 +46,7 @@ function publicationDismissalKey(article: Article, userId?: string, workspaceId?
   const articleId = article.article_id
   const publicRevisionId = article.publication.public_revision_id
   const fingerprint = article.publication.publication_fingerprint
-  if (!userId || !workspaceId || !/^[a-f0-9]{32}$/.test(articleId) || !/^[a-f0-9]{32}$/.test(publicRevisionId || "") || !/^v1:[a-f0-9]{64}$/.test(fingerprint || "")) return null
+  if (!userId || !workspaceId || !/^[a-f0-9]{32}$/.test(articleId) || !/^[a-f0-9]{32}$/.test(publicRevisionId || "") || !/^v2:[a-f0-9]{64}$/.test(fingerprint || "")) return null
   return `${PUBLICATION_DISMISSAL_PREFIX}:${userId}:${workspaceId}:${articleId}:${publicRevisionId}:${fingerprint}`
 }
 

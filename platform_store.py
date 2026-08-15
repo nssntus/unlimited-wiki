@@ -20,7 +20,7 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from publication import article_id_from_markdown, normalize_text, snapshot_fingerprint
+from publication import FINGERPRINT_VERSION, article_id_from_markdown, normalize_text, snapshot_fingerprint
 
 
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -419,14 +419,17 @@ class PlatformStore:
                 f"SELECT id,snapshot_json,article_id,publication_fingerprint FROM {table}"
             ).fetchall()
             for row in rows:
-                if row["article_id"] and row["publication_fingerprint"]:
+                if row["article_id"] and re.fullmatch(
+                    rf"{re.escape(FINGERPRINT_VERSION)}:[a-f0-9]{{64}}",
+                    str(row["publication_fingerprint"] or ""),
+                ):
                     continue
                 try:
                     snapshot = json.loads(row["snapshot_json"])
                 except (TypeError, json.JSONDecodeError):
                     continue
                 article_id = row["article_id"] or article_id_from_markdown(str(snapshot.get("markdown", "")))
-                fingerprint = row["publication_fingerprint"] or snapshot_fingerprint(snapshot)
+                fingerprint = snapshot_fingerprint(snapshot)
                 db.execute(
                     f"UPDATE {table} SET article_id=?,publication_fingerprint=? WHERE id=?",
                     (article_id, fingerprint, row["id"]),
@@ -436,7 +439,10 @@ class PlatformStore:
             "SELECT id,snapshot_json,publication_fingerprint FROM public_revisions"
         ).fetchall()
         for row in revisions:
-            if row["publication_fingerprint"]:
+            if re.fullmatch(
+                rf"{re.escape(FINGERPRINT_VERSION)}:[a-f0-9]{{64}}",
+                str(row["publication_fingerprint"] or ""),
+            ):
                 continue
             try:
                 fingerprint = snapshot_fingerprint(json.loads(row["snapshot_json"]))
@@ -559,10 +565,18 @@ class PlatformStore:
 
     def audit(self, actor_id: str | None, action: str, object_type: str, object_id: str, detail: dict | None = None) -> None:
         with self.connect() as db:
-            db.execute(
-                "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
-                (uuid.uuid4().hex, actor_id, action, object_type, object_id, json.dumps(detail or {}, ensure_ascii=False), now_iso()),
-            )
+            self._audit(db, actor_id, action, object_type, object_id, detail)
+
+    @staticmethod
+    def _audit(
+        db: sqlite3.Connection, actor_id: str | None, action: str, object_type: str,
+        object_id: str, detail: dict | None = None,
+    ) -> None:
+        db.execute(
+            "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
+            (uuid.uuid4().hex, actor_id, action, object_type, object_id,
+             json.dumps(detail or {}, ensure_ascii=False), now_iso()),
+        )
 
     @staticmethod
     def _notify(db: sqlite3.Connection, user_id: str, kind: str, object_type: str, object_id: str, title: str, message: str) -> None:
@@ -741,6 +755,19 @@ class PlatformStore:
             row = self._workspace_access_row(db, user_id, workspace_id)
         self._check_workspace_permission(row, workspace_id, permission)
         return dict(row)
+
+    def _authorize_workspace_in_transaction(
+        self, db: sqlite3.Connection, user_id: str, workspace_id: str, permission: str,
+    ) -> sqlite3.Row:
+        row = self._workspace_access_row(db, user_id, workspace_id)
+        self._check_workspace_permission(row, workspace_id, permission)
+        return row
+
+    @staticmethod
+    def _authorize_admin_in_transaction(db: sqlite3.Connection, user_id: str) -> None:
+        row = db.execute("SELECT role,status FROM users WHERE id=?", (user_id,)).fetchone()
+        if row is None or row["status"] != "active" or row["role"] != "admin":
+            raise PermissionError("admin role required")
 
     @contextlib.contextmanager
     def authorized_workspace_action(self, user_id: str, workspace_id: str, permission: str):
@@ -1502,7 +1529,11 @@ class PlatformStore:
         canonical = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         content_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         expires = future_iso(minutes=30)
-        with self.connect() as db:
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._authorize_workspace_in_transaction(
+                db, context.user_id, context.workspace_id, "wiki.write",
+            )
             db.execute("""
                 INSERT INTO share_previews(
                     id,owner_id,workspace_id,article_path,source_revision,content_hash,snapshot_json,
@@ -1512,6 +1543,7 @@ class PlatformStore:
                 preview_id, context.user_id, context.workspace_id, article_path, source_revision,
                 content_hash, canonical, expires, now_iso(), article_id, publication_fingerprint,
             ))
+            db.commit()
         return {
             "preview_id": preview_id,
             "expires_at": expires,
@@ -1527,6 +1559,9 @@ class PlatformStore:
         now = now_iso()
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._authorize_workspace_in_transaction(
+                db, context.user_id, context.workspace_id, "wiki.write",
+            )
             row = db.execute("SELECT * FROM share_previews WHERE id=? AND owner_id=? AND workspace_id=? AND expires_at>?", (
                 preview_id, context.user_id, context.workspace_id, now,
             )).fetchone()
@@ -1545,9 +1580,13 @@ class PlatformStore:
                 row["article_path"], row["source_revision"], row["publication_fingerprint"],
             ))
             db.execute("DELETE FROM share_previews WHERE id=?", (preview_id,))
+            saved = db.execute("SELECT * FROM submissions WHERE id=?", (submission_id,)).fetchone()
+            self._audit(
+                db, context.user_id, "submission.create", "submission", submission_id,
+                {"content_hash": row["content_hash"]},
+            )
             db.commit()
-        self.audit(context.user_id, "submission.create", "submission", submission_id, {"content_hash": row["content_hash"]})
-        return self.get_submission(context, submission_id)
+        return self._submission_public(saved)
 
     @staticmethod
     def _submission_public(row: sqlite3.Row, *, admin: bool = False) -> dict:
@@ -1610,6 +1649,9 @@ class PlatformStore:
         bound_submissions = 0
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._authorize_workspace_in_transaction(
+                db, context.user_id, context.workspace_id, "wiki.read",
+            )
             public_rows = db.execute("""
                 SELECT entry.id,revision.snapshot_json
                 FROM public_entries entry
@@ -1772,6 +1814,9 @@ class PlatformStore:
         self.authorize_workspace(context.user_id, context.workspace_id, "wiki.write")
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._authorize_workspace_in_transaction(
+                db, context.user_id, context.workspace_id, "wiki.write",
+            )
             row = db.execute(
                 "SELECT status FROM submissions WHERE id=? AND owner_id=? AND workspace_id=?",
                 (submission_id, context.user_id, context.workspace_id),
@@ -1786,13 +1831,17 @@ class PlatformStore:
                 "UPDATE submissions SET status='ai_queued',ai_report_json=NULL,updated_at=? WHERE id=?",
                 (now_iso(), submission_id),
             )
+            saved = db.execute("SELECT * FROM submissions WHERE id=?", (submission_id,)).fetchone()
             db.commit()
-        return self.get_submission(context, submission_id)
+        return self._submission_public(saved)
 
     def withdraw(self, context: SessionContext, submission_id: str) -> dict:
         self.authorize_workspace(context.user_id, context.workspace_id, "wiki.write")
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._authorize_workspace_in_transaction(
+                db, context.user_id, context.workspace_id, "wiki.write",
+            )
             row = db.execute(
                 "SELECT * FROM submissions WHERE id=? AND owner_id=? AND workspace_id=?",
                 (submission_id, context.user_id, context.workspace_id),
@@ -1804,9 +1853,10 @@ class PlatformStore:
             if row["status"] == "approved" and row["public_entry_id"]:
                 db.execute("UPDATE public_entries SET status='withdrawn_by_author',updated_at=? WHERE id=?", (now_iso(), row["public_entry_id"]))
             db.execute("UPDATE submissions SET status='withdrawn',updated_at=? WHERE id=?", (now_iso(), submission_id))
+            saved = db.execute("SELECT * FROM submissions WHERE id=?", (submission_id,)).fetchone()
+            self._audit(db, context.user_id, "submission.withdraw", "submission", submission_id)
             db.commit()
-        self.audit(context.user_id, "submission.withdraw", "submission", submission_id)
-        return self.get_submission(context, submission_id)
+        return self._submission_public(saved)
 
     def admin_list(self, context: SessionContext, status: str = "pending_admin") -> list[dict]:
         if context.role != "admin":
@@ -1834,6 +1884,7 @@ class PlatformStore:
         now = now_iso()
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._authorize_admin_in_transaction(db, context.user_id)
             row = db.execute("SELECT * FROM submissions WHERE id=?", (submission_id,)).fetchone()
             if row is None:
                 db.rollback(); raise FileNotFoundError(submission_id)
@@ -1845,6 +1896,9 @@ class PlatformStore:
                 version = 1
                 snapshot = json.loads(row["snapshot_json"])
                 article_id = row["article_id"]
+                if not isinstance(article_id, str) or re.fullmatch(r"[a-f0-9]{32}", article_id) is None:
+                    db.rollback()
+                    raise RuntimeError("legacy submission identity is unresolved")
                 candidates = db.execute("""
                     SELECT e.id,e.status,e.current_revision_id,e.source_article_id,
                            r.version,r.snapshot_json
@@ -1914,10 +1968,10 @@ class PlatformStore:
                 db.execute("UPDATE submissions SET status=?,reason=?,reviewer_id=?,updated_at=? WHERE id=?", (
                     status, reason.strip(), context.user_id, now, submission_id,
                 ))
+            self._audit(db, context.user_id, f"submission.{decision}", "submission", submission_id, {
+                "reason": reason.strip(), "self_review": self_review,
+            })
             db.commit()
-        self.audit(context.user_id, f"submission.{decision}", "submission", submission_id, {
-            "reason": reason.strip(), "self_review": self_review,
-        })
         return {"id": submission_id, "status": status, "public_entry_id": entry_id}
 
     def list_public(self, query: str = "", category: str = "") -> list[dict]:
@@ -2008,6 +2062,7 @@ class PlatformStore:
         now = now_iso()
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._authorize_admin_in_transaction(db, context.user_id)
             row = db.execute("""
                 SELECT e.author_id,r.snapshot_json FROM public_entries e
                 JOIN public_revisions r ON r.id=e.current_revision_id
@@ -2025,8 +2080,11 @@ class PlatformStore:
                 f"《{title}》已从 Wiki 广场下架",
                 f"处理理由：{reason.strip()}。请修改私有正本后申请重新上架。",
             )
+            self._audit(
+                db, context.user_id, "public.remove", "public_entry", entry_id,
+                {"reason": reason.strip()},
+            )
             db.commit()
-        self.audit(context.user_id, "public.remove", "public_entry", entry_id, {"reason": reason.strip()})
         return {"id": entry_id, "status": "removed_by_admin"}
 
     def relist_public(self, context: SessionContext, entry_id: str, reason: str) -> dict:
@@ -2037,6 +2095,7 @@ class PlatformStore:
         now = now_iso()
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._authorize_admin_in_transaction(db, context.user_id)
             row = db.execute("""
                 SELECT e.author_id,r.snapshot_json FROM public_entries e
                 JOIN public_revisions r ON r.id=e.current_revision_id
@@ -2054,8 +2113,11 @@ class PlatformStore:
                 f"《{title}》已重新上架",
                 f"Admin 已恢复该公开版本。处理说明：{reason.strip()}",
             )
+            self._audit(
+                db, context.user_id, "public.relist", "public_entry", entry_id,
+                {"reason": reason.strip()},
+            )
             db.commit()
-        self.audit(context.user_id, "public.relist", "public_entry", entry_id, {"reason": reason.strip()})
         return {"id": entry_id, "status": "published"}
 
     def decide_report(self, context: SessionContext, report_id: str, action: str, reason: str) -> dict:
@@ -2063,6 +2125,7 @@ class PlatformStore:
             raise PermissionError("admin role, valid action, and reason are required")
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._authorize_admin_in_transaction(db, context.user_id)
             row = db.execute("""
                 SELECT reports.*,e.author_id,e.status AS entry_status,r.snapshot_json FROM reports
                 JOIN public_entries e ON e.id=reports.entry_id
@@ -2088,6 +2151,9 @@ class PlatformStore:
             db.execute("UPDATE reports SET status='resolved',resolution=?,resolved_by=?,updated_at=? WHERE id=?", (
                 f"{action}: {reason.strip()}", context.user_id, now_iso(), report_id,
             ))
+            self._audit(
+                db, context.user_id, f"report.{action}", "report", report_id,
+                {"reason": reason.strip()},
+            )
             db.commit()
-        self.audit(context.user_id, f"report.{action}", "report", report_id, {"reason": reason.strip()})
         return {"id": report_id, "status": "resolved", "action": action}

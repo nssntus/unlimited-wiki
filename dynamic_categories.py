@@ -9,6 +9,9 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from markdown_metadata import meta_value as canonical_meta_value
+from markdown_metadata import replace_meta as replace_canonical_meta
+
 
 REGISTRY_REL = "wiki/.categories.json"
 RESERVED_NAMES = {"_inbox", "index.md", "log.md", ".", ".."}
@@ -102,8 +105,7 @@ def assert_unique(registry: dict, candidate: dict, *, ignore_id: str | None = No
 
 
 def meta_value(md: str, key: str) -> str | None:
-    match = re.search(rf"^>[ \t]*{re.escape(key)}:[ \t]*(.*?)[ \t]*$", md, re.M | re.I)
-    return match.group(1).strip() if match else None
+    return canonical_meta_value(md, key)
 
 
 def article_id(md: str) -> str | None:
@@ -130,15 +132,7 @@ def classification(md: str) -> str | None:
 
 
 def replace_meta(md: str, key: str, value: str) -> str:
-    pattern = re.compile(rf"^>\s*{re.escape(key)}:.*$", re.M | re.I)
-    line = f"> {key}: {value}"
-    cleaned = pattern.sub("", md)
-    lines = cleaned.splitlines()
-    insert_at = 1 if lines and lines[0].startswith("# ") else 0
-    if insert_at < len(lines) and lines[insert_at] == "":
-        insert_at += 1
-    lines.insert(insert_at, line)
-    return "\n".join(lines) + ("\n" if cleaned.endswith("\n") else "")
+    return replace_canonical_meta(md, key, value)
 
 
 def ensure_article_metadata(md: str, *, category_id: str | None, status: str, article_uuid: str | None = None, article_tags: list[str] | None = None) -> str:

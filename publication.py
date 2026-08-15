@@ -7,8 +7,10 @@ import json
 import re
 import unicodedata
 
+from markdown_metadata import META_RE, canonical_metadata_preamble, meta_value
 
-FINGERPRINT_VERSION = "v1"
+
+FINGERPRINT_VERSION = "v2"
 PRIVATE_METADATA = {
     "article-id",
     "category-id",
@@ -18,8 +20,7 @@ PRIVATE_METADATA = {
     "updated",
     "archived",
 }
-META_RE = re.compile(r"^>\s*([^:]+):\s*(.*)$")
-ARTICLE_ID_RE = re.compile(r"^>\s*Article-ID:\s*([a-f0-9]{32})\s*$", re.M | re.I)
+ARTICLE_ID_RE = re.compile(r"^>\s*Article-ID:\s*([a-f0-9]{32})\s*$", re.I)
 
 
 def normalize_text(value: object) -> str:
@@ -27,23 +28,34 @@ def normalize_text(value: object) -> str:
 
 
 def article_id_from_markdown(markdown: str) -> str | None:
-    match = ARTICLE_ID_RE.search(markdown or "")
-    return match.group(1).lower() if match else None
+    value = meta_value(markdown, "Article-ID")
+    return value.lower() if value and re.fullmatch(r"[a-f0-9]{32}", value, re.I) else None
 
 
 def public_markdown(markdown: str) -> str:
-    """Remove private runtime metadata and normalize equivalent Markdown bytes."""
-    normalized = unicodedata.normalize("NFC", str(markdown or "")).replace("\r\n", "\n").replace("\r", "\n")
-    lines: list[str] = []
-    for line in normalized.split("\n"):
-        match = META_RE.match(line)
-        if match:
-            key = match.group(1).strip().casefold()
-            if key in PRIVATE_METADATA or (key in {"tags", "evidence", "sources", "raw"} and not match.group(2).strip()):
-                continue
-        lines.append(line.rstrip())
-    compact = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
-    return compact + "\n" if compact else ""
+    """Remove private fields from the canonical leading metadata block only."""
+    value = str(markdown or "")
+    header = canonical_metadata_preamble(value)
+    if header is None:
+        return value
+    lines, _title_index, block_start, index = header
+
+    visible: list[str] = []
+    for line in lines[block_start:index]:
+        match = META_RE.match(line.rstrip("\r\n"))
+        if match is None:
+            visible.append(line)
+            continue
+        key = match.group(1).strip().casefold()
+        if key in PRIVATE_METADATA or (key in {"tags", "evidence", "sources", "raw"} and not match.group(2).strip()):
+            continue
+        visible.append(line)
+    return "".join(lines[:block_start] + visible + lines[index:])
+
+
+def fingerprint_markdown(markdown: str) -> str:
+    """Normalize encoding-equivalent bytes without changing Markdown whitespace."""
+    return unicodedata.normalize("NFC", public_markdown(markdown)).replace("\r\n", "\n").replace("\r", "\n")
 
 
 def snapshot_fingerprint(snapshot: dict) -> str:
@@ -51,7 +63,7 @@ def snapshot_fingerprint(snapshot: dict) -> str:
         "title": normalize_text(snapshot.get("title")),
         "category": normalize_text(snapshot.get("category")),
         "content_status": normalize_text(snapshot.get("content_status")),
-        "markdown": public_markdown(str(snapshot.get("markdown", ""))),
+        "markdown": fingerprint_markdown(str(snapshot.get("markdown", ""))),
     }
     canonical = json.dumps(projection, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return f"{FINGERPRINT_VERSION}:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
