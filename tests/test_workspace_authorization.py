@@ -356,9 +356,10 @@ def test_submissions_and_publication_state_do_not_cross_workspaces(membership_se
     path_b, revision_b = seed_article(app, author, "Same title")
     article_b = author.request("GET", f"/api/article?path={path_b}")[1]
     assert article_b["publication"]["state"] == "not_published"
-    preview_b = author.request("POST", "/api/share-previews", {
+    preview_status, preview_b = author.request("POST", "/api/share-previews", {
         "article_path": path_b, "source_revision": revision_b, "attribution": "nickname",
-    }, key="two-preview-b")[1]
+    }, key="two-preview-b")
+    assert preview_status == 201, preview_b
     submission_b = author.request("POST", "/api/submissions", {"preview_id": preview_b["preview_id"]}, key="two-submit-b")[1]
     app.platform.ai_decide(submission_b["id"], "pass", {"summary": "accepted B"})
     public_b = author.request("POST", f"/api/admin/submissions/{submission_b['id']}/decision", {

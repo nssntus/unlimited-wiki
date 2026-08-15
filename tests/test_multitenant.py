@@ -9,10 +9,12 @@ from urllib.parse import urlsplit
 
 import pytest
 import platform_review
+import dynamic_categories as dc
 
 from legacy_migration import migrate_legacy_workspace
 from platform_store import PlatformStore
 from platform_review import PlatformReviewWorker, parse_review_result, review_failure
+from publication import snapshot_fingerprint
 from serve import create_app, create_server
 
 
@@ -85,7 +87,14 @@ def seed_article(app, client: Client, title: str = "Shared title") -> tuple[str,
         f"# {title}\n\n> Category: concepts\n> Status: 词条\n\n## 它做什么\n\n{title} 的私有正文。\n\n## 怎么用\n\n仅用于测试。\n\n## 例子\n\n示例。\n\n## See Also\n",
         encoding="utf-8",
     )
-    article = app.workspace_service(context).read_article("concepts/shared.md")
+    service = app.workspace_service(context)
+    article = service.read_article("concepts/shared.md")
+    if not article["article_id"]:
+        path.write_text(
+            dc.ensure_article_metadata(article["markdown"], category_id=None, status="pending"),
+            encoding="utf-8",
+        )
+        article = service.read_article("concepts/shared.md")
     return article["path"], article["revision"]
 
 
@@ -187,6 +196,9 @@ def test_snapshot_ai_admin_publish_with_self_review_and_idor_guards(multi_server
         "article_path": article_path, "source_revision": revision, "attribution": "nickname",
     }, key="preview")
     assert status == 201
+    assert "Article-ID" not in preview["snapshot"]["markdown"]
+    assert "Category-ID" not in preview["snapshot"]["markdown"]
+    assert "Classification-Updated" not in preview["snapshot"]["markdown"]
     status, submission = alice.request("POST", "/api/submissions", {"preview_id": preview["preview_id"]}, key="submit")
     assert status == 201 and submission["status"] == "ai_queued"
     snapshot_hash = submission["content_hash"]
@@ -396,7 +408,10 @@ def test_platform_ai_worker_reads_snapshot_only_and_recovers_to_admin_queue(tmp_
     token, context = platform.create_session(user["id"])
     assert token
     snapshot = {"title": "Public candidate", "category": "concepts", "markdown": "# Public candidate\n\nBody", "attribution": "Owner"}
-    preview = platform.create_preview(context, "concepts/private.md", "revision-1", snapshot)
+    article_id = "a" * 32
+    preview = platform.create_preview(
+        context, "concepts/private.md", "revision-1", article_id, snapshot_fingerprint(snapshot), snapshot,
+    )
     submission = platform.submit_preview(context, preview["preview_id"])
     seen = []
     worker = PlatformReviewWorker(platform, lambda value: seen.append(value) or {"decision": "pass", "summary": "accepted"})
@@ -420,7 +435,10 @@ def test_platform_ai_uses_submitter_encrypted_model_without_cross_tenant_access(
     platform.save_model(bob["workspace_id"], "openai-compatible", "http://bob.example/v1", "bob-key", "bob-model")
     _token, bob_context = platform.create_session(bob["id"])
     snapshot = {"title": "Bob candidate", "markdown": "# Bob candidate\n\nBody"}
-    preview = platform.create_preview(bob_context, "private/bob.md", "rev-bob", snapshot)
+    article_id = "b" * 32
+    preview = platform.create_preview(
+        bob_context, "private/bob.md", "rev-bob", article_id, snapshot_fingerprint(snapshot), snapshot,
+    )
     submission = platform.submit_preview(bob_context, preview["preview_id"])
     captured = {}
 

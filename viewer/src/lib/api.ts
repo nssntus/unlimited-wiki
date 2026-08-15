@@ -47,6 +47,7 @@ export type Article = ArticleSummary & {
     submission_id: string | null
     submission_status: string | null
     submission_matches_current: boolean
+    publication_fingerprint: string | null
     moderation_reason: string | null
     moderated_at: string | null
   }
