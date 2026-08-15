@@ -32,7 +32,7 @@ import wiki_ops
 from document_ingest import MAX_INPUT_BYTES
 from model_settings import build_config, load_model_settings, public_model_settings, save_model_settings
 from legacy_migration import migrate_legacy_workspace
-from platform_store import PlatformStore, SessionContext
+from platform_store import PlatformIdempotencyError, PlatformStore, SessionContext
 from platform_review import PlatformReviewWorker
 from wiki_service import LLMConfig, WikiService, article_summary
 
@@ -153,6 +153,13 @@ class WikiApp:
                     remote_search=self.remote_search,
                     start_worker=self.start_worker,
                     remote_task_kinds=self.remote_task_kinds,
+                    authorize_actor=lambda user_id, workspace_id=context.workspace_id: bool(
+                        self.platform.authorize_workspace(user_id, workspace_id, "wiki.write")
+                    ),
+                    actor_guard=lambda user_id, workspace_id=context.workspace_id: (
+                        self.platform.authorized_workspace_action(user_id, workspace_id, "wiki.write")
+                    ),
+                    require_task_actor=True,
                 )
                 self._services[context.workspace_id] = service
             return service
@@ -519,6 +526,19 @@ def make_handler(app: WikiApp):
                 self._private_service().state.idempotency_abort(endpoint, key)
                 raise
 
+        def _platform_idempotency(self, data: dict, action, *, scope: str | None = None):
+            if app.platform is None or self.context is None:
+                raise ApiError(401, "authentication required")
+            key = self.headers.get("Idempotency-Key", "")
+            if not key or len(key) > 128 or not key.isascii() or any(ord(ch) < 33 for ch in key):
+                raise ApiError(422, "a printable ASCII Idempotency-Key is required")
+            endpoint = urlparse(self.path).path
+            scope = scope or f"workspace:{self.context.workspace_id}"
+            try:
+                return app.platform.run_platform_idempotent(scope, endpoint, key, data, action)
+            except PlatformIdempotencyError as exc:
+                raise ApiError(409, str(exc)) from exc
+
         def _serve_static(self, path: str) -> None:
             dist = app.dist_dir
             if not dist.is_dir():
@@ -553,6 +573,18 @@ def make_handler(app: WikiApp):
                 payload = app.export_workspace(self.context)
                 self._extra_headers.append(("Content-Disposition", "attachment; filename=wiki-export.zip"))
                 return self._send(200, payload, "application/zip")
+            if path == "/api/workspaces":
+                if self.context is None:
+                    raise ApiError(401, "authentication required")
+                return self._json(200, app.platform.list_workspaces(self.context))
+            if path == "/api/invitations":
+                if self.context is None:
+                    raise ApiError(401, "authentication required")
+                return self._json(200, app.platform.list_invitations(self.context))
+            if path == "/api/workspace/members":
+                if self.context is None:
+                    raise ApiError(401, "authentication required")
+                return self._json(200, app.platform.list_workspace_members(self.context))
             if path == "/api/public/entries":
                 if app.platform is None:
                     return self._json(200, [])
@@ -708,6 +740,65 @@ def make_handler(app: WikiApp):
                     _string(data, "reason_code", maximum=40, required=True), _string(data, "detail", maximum=1000),
                 )
                 return self._json(201, response)
+
+            if path == "/api/workspaces":
+                _fields(data, {"display_name"}, {"display_name"})
+                response, replay = self._platform_idempotency(data, lambda: app.platform.create_team(
+                    self.context, _string(data, "display_name", maximum=80, required=True),
+                ), scope=f"account:{self.context.user_id}")
+                return self._json(200 if replay else 201, response)
+            if path == "/api/workspaces/switch":
+                _fields(data, {"workspace_id"}, {"workspace_id"})
+                token = self._session_token()
+                _, _ = self._platform_idempotency(data, lambda: {
+                    "workspace_id": app.platform.switch_workspace(
+                        token, self.context, _string(data, "workspace_id", maximum=64, required=True),
+                    ).workspace_id,
+                }, scope=f"session:{hashlib.sha256(token.encode('utf-8')).hexdigest()}")
+                selected = app.platform.resolve_session(token)
+                if selected is None:
+                    raise ApiError(409, "workspace switch failed")
+                self.context = selected
+                return self._json(200, {"authenticated": True, **selected.public()})
+            if path == "/api/workspace/invitations":
+                _fields(data, {"email", "role"}, {"email", "role"})
+                response, replay = self._platform_idempotency(data, lambda: app.platform.invite_workspace_member(
+                    self.context,
+                    _string(data, "email", maximum=254, required=True),
+                    _string(data, "role", maximum=20, required=True),
+                ))
+                return self._json(200 if replay else 201, response)
+            match = re.fullmatch(r"/api/invitations/([a-f0-9]{32})/(?P<action>accept|decline)", path)
+            if match:
+                _fields(data, set())
+                response, _ = self._platform_idempotency(data, lambda: app.platform.respond_to_invitation(
+                    self.context, match.group(1), accept=match.group("action") == "accept",
+                ), scope=f"invitation:{self.context.user_id}:{match.group(1)}")
+                if response.get("status") == "expired":
+                    raise ApiError(422, "invitation is no longer available")
+                return self._json(200, response)
+            match = re.fullmatch(r"/api/workspace/members/([a-f0-9]{32})/(?P<action>role|remove)", path)
+            if match:
+                action = match.group("action")
+                _fields(data, {"role"} if action == "role" else set(), {"role"} if action == "role" else set())
+                response, _ = self._platform_idempotency(data, lambda: (
+                    app.platform.change_workspace_member_role(
+                        self.context, match.group(1), _string(data, "role", maximum=20, required=True),
+                    ) if action == "role" else app.platform.remove_workspace_member(self.context, match.group(1))
+                ))
+                return self._json(200, response)
+            if path == "/api/workspace/owner-transfer":
+                _fields(data, {"user_id"}, {"user_id"})
+                response, _ = self._platform_idempotency(data, lambda: app.platform.transfer_workspace_owner(
+                    self.context, _string(data, "user_id", maximum=64, required=True),
+                ))
+                return self._json(200, response)
+            if path == "/api/workspace/rename":
+                _fields(data, {"display_name"}, {"display_name"})
+                response, _ = self._platform_idempotency(data, lambda: app.platform.rename_workspace(
+                    self.context, _string(data, "display_name", maximum=80, required=True),
+                ))
+                return self._json(200, response)
 
             service = self._private_service()
             content_write_paths = {
@@ -1014,6 +1105,8 @@ def make_handler(app: WikiApp):
                 self._prepare_context(required=app.multi_user and not public)
                 if app.multi_user and not public:
                     self._require_csrf()
+                if self.service is not None:
+                    self.service.set_request_actor(self.context.user_id if self.context else None)
                 self._dispatch_post()
             except ApiError as exc:
                 self._error(exc)
@@ -1031,6 +1124,9 @@ def make_handler(app: WikiApp):
                 print(f"Unhandled POST error operation={operation_id}", file=sys.stderr)
                 traceback.print_exc()
                 self._json(500, {"error": "internal error", "operation_id": operation_id})
+            finally:
+                if self.service is not None:
+                    self.service.set_request_actor(None)
 
         def do_OPTIONS(self) -> None:
             self._json(405, {"error": "method not allowed"})

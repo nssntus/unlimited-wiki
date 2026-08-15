@@ -61,8 +61,10 @@ def _create_team_workspace(
                 (organization_id, user_id, organization_role, owner_id, created, created),
             )
         db.execute(
-            "INSERT INTO workspaces(id,owner_id,organization_id,root_name,display_name,created_at) VALUES(?,?,?,?,?,?)",
-            (workspace_id, owner_id, organization_id, workspace_id, name, created),
+            """INSERT INTO workspaces(
+                id,owner_id,organization_id,root_name,display_name,status,created_at,updated_at
+            ) VALUES(?,?,?,?,?,'active',?,?)""",
+            (workspace_id, owner_id, organization_id, workspace_id, name, created, created),
         )
         for user_id, _organization_role, workspace_role in members:
             db.execute(
@@ -86,6 +88,10 @@ def _select_default_workspace(store: PlatformStore, user_id: str, workspace_id: 
         ).rowcount != 1:
             db.rollback()
             raise FileNotFoundError(workspace_id)
+        db.execute(
+            "UPDATE sessions SET current_workspace_id=? WHERE user_id=?",
+            (workspace_id, user_id),
+        )
         db.commit()
 
 

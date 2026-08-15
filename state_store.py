@@ -120,6 +120,9 @@ class StateStore:
                 );
                 """
             )
+            task_columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
+            if "actor_user_id" not in task_columns:
+                db.execute("ALTER TABLE tasks ADD COLUMN actor_user_id TEXT")
             db.execute("DROP INDEX IF EXISTS tasks_one_active")
             db.execute(
                 "CREATE UNIQUE INDEX tasks_one_active ON tasks(active_key) WHERE status IN ('staged','queued','running')"
@@ -183,7 +186,10 @@ class StateStore:
                 (endpoint, key),
             )
 
-    def enqueue_task(self, kind: str, subject: str, payload: dict, *, staged: bool = False) -> tuple[dict, bool]:
+    def enqueue_task(
+        self, kind: str, subject: str, payload: dict, *, staged: bool = False,
+        actor_user_id: str | None = None,
+    ) -> tuple[dict, bool]:
         active_key = f"{kind}:{subject.casefold()}"
         task_id = uuid.uuid4().hex
         created = now_iso()
@@ -197,9 +203,9 @@ class StateStore:
             status = "staged" if staged else "queued"
             db.execute(
                 """INSERT INTO tasks
-                (id,kind,subject,active_key,status,payload_json,attempts,next_run_at,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (task_id, kind, subject, active_key, status, json.dumps(payload, ensure_ascii=False), 0, created, created, created),
+                (id,kind,subject,active_key,status,payload_json,attempts,next_run_at,created_at,updated_at,actor_user_id)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (task_id, kind, subject, active_key, status, json.dumps(payload, ensure_ascii=False), 0, created, created, created, actor_user_id),
             )
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         return self._task(row), True
@@ -378,19 +384,30 @@ class StateStore:
             raise ValueError("task cannot be cancelled")
         return self.get_task(task_id)
 
-    def retry_task(self, task_id: str, *, payload: dict | None = None) -> dict:
-        task = self.get_task(task_id)
-        retryable_conflict = task["status"] == "succeeded" and bool(task.get("result", {}).get("conflict"))
-        allowed_status = task["status"] in {"failed", "cancelled"} or retryable_conflict
-        if not allowed_status:
-            raise ValueError("task cannot be retried")
-        next_payload = payload or task["payload"]
-        with self.connect() as db:
+    def retry_task(
+        self, task_id: str, *, payload: dict | None = None, actor_user_id: str | None = None,
+    ) -> dict:
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise FileNotFoundError(task_id)
+            task = self._task(row)
+            retryable_conflict = task["status"] == "succeeded" and bool(task.get("result", {}).get("conflict"))
+            allowed_status = task["status"] in {"failed", "cancelled"} or retryable_conflict
+            if not allowed_status:
+                raise ValueError("task cannot be retried")
+            next_payload = payload or task["payload"]
             changed = db.execute(
-                """UPDATE tasks SET status='queued', payload_json=?, result_json=NULL,
-                error_type=NULL, error_message=NULL, next_run_at=?, updated_at=? WHERE id=?""",
-                (json.dumps(next_payload, ensure_ascii=False), now_iso(), now_iso(), task_id),
+                """UPDATE tasks SET status='queued', payload_json=?, actor_user_id=?, result_json=NULL,
+                error_type=NULL, error_message=NULL, next_run_at=?, updated_at=?
+                WHERE id=? AND status=? AND attempts=?""",
+                (
+                    json.dumps(next_payload, ensure_ascii=False), actor_user_id, now_iso(), now_iso(),
+                    task_id, task["status"], task["attempts"],
+                ),
             ).rowcount
+            db.commit()
         if not changed:
             raise ValueError("task cannot be retried")
         return self.get_task(task_id)

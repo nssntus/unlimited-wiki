@@ -361,6 +361,105 @@ def test_governance_preserves_source_metadata(service: WikiService, monkeypatch:
     assert "> Sources: [Source](source.md)" in updated
 
 
+def test_cancel_cannot_split_governance_commit_from_success(service: WikiService, monkeypatch: pytest.MonkeyPatch):
+    article = service.read_article("concepts/base.md")
+    task, _ = service.state.enqueue_task(
+        "governance", article["path"], {"path": article["path"], "base_revision": article["revision"]},
+    )
+    claimed = service.state.claim_task({"governance"})
+    assert claimed and claimed["id"] == task["id"]
+    monkeypatch.setattr(service, "_call_governance_llm", lambda _article: article["markdown"].replace("这是一个例子。", "这是一个治理后的例子。"))
+    monkeypatch.setattr("wiki_ops.article_quality_issues", lambda *_args, **_kwargs: [])
+    committed = threading.Event()
+    release_commit = threading.Event()
+    cancel_done = threading.Event()
+    real_commit = service.files.commit
+    result: dict = {}
+
+    def delayed_commit(*args, **kwargs):
+        manifest = real_commit(*args, **kwargs)
+        committed.set()
+        assert release_commit.wait(3)
+        return manifest
+
+    monkeypatch.setattr(service.files, "commit", delayed_commit)
+    worker = threading.Thread(target=lambda: result.update(task=service._run_governance_task(claimed)))
+    worker.start()
+    assert committed.wait(3)
+
+    def cancel() -> None:
+        result["cancel"] = service.cancel_task(task["id"])
+        cancel_done.set()
+
+    canceller = threading.Thread(target=cancel)
+    canceller.start()
+    assert not cancel_done.wait(0.1)
+    release_commit.set()
+    worker.join(timeout=3)
+    canceller.join(timeout=3)
+
+    assert result["task"]["operation_id"] == f"govern-{task['id']}-attempt-{claimed['attempts']}"
+    assert result["cancel"]["status"] == "succeeded"
+    assert service.state.get_task(task["id"])["status"] == "succeeded"
+    assert "治理后的例子" in service.read_article(article["path"])["markdown"]
+
+
+def test_old_retried_governance_attempt_cannot_write_files(service: WikiService, monkeypatch: pytest.MonkeyPatch):
+    article = service.read_article("concepts/base.md")
+    original = (service.root / "wiki" / article["path"]).read_bytes()
+    task, _ = service.state.enqueue_task(
+        "governance", article["path"], {"path": article["path"], "base_revision": article["revision"]},
+    )
+    first = service.state.claim_task({"governance"})
+    assert first and first["id"] == task["id"]
+    model_started = threading.Event()
+    release_model = threading.Event()
+    result: dict = {}
+
+    def delayed_model(_article):
+        model_started.set()
+        assert release_model.wait(3)
+        return article["markdown"].replace("这是一个例子。", "迟到的旧结果。")
+
+    monkeypatch.setattr(service, "_call_governance_llm", delayed_model)
+    monkeypatch.setattr("wiki_ops.article_quality_issues", lambda *_args, **_kwargs: [])
+    worker = threading.Thread(target=lambda: result.update(task=service._run_governance_task(first)))
+    worker.start()
+    assert model_started.wait(3)
+    assert service.cancel_task(task["id"])["status"] == "cancelled"
+    assert service.retry_task(task["id"])["status"] == "queued"
+    second = service.state.claim_task({"governance"})
+    assert second and second["attempts"] == first["attempts"] + 1
+    release_model.set()
+    worker.join(timeout=3)
+
+    assert result["task"]["superseded"] is True
+    assert service.state.get_task(task["id"])["status"] == "running"
+    assert service.state.get_task(task["id"])["attempts"] == second["attempts"]
+    assert (service.root / "wiki" / article["path"]).read_bytes() == original
+    assert list(service.files.history_root.glob(f"govern-{task['id']}-attempt-*")) == []
+
+
+def test_governance_rolls_back_when_task_finalization_fails(service: WikiService, monkeypatch: pytest.MonkeyPatch):
+    article = service.read_article("concepts/base.md")
+    original = (service.root / "wiki" / article["path"]).read_bytes()
+    task, _ = service.state.enqueue_task(
+        "governance", article["path"], {"path": article["path"], "base_revision": article["revision"]},
+    )
+    claimed = service.state.claim_task({"governance"})
+    assert claimed and claimed["id"] == task["id"]
+    monkeypatch.setattr(service, "_call_governance_llm", lambda _article: article["markdown"].replace("这是一个例子。", "不应保留的结果。"))
+    monkeypatch.setattr("wiki_ops.article_quality_issues", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(service.state, "complete_task", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")))
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        service._run_governance_task(claimed)
+
+    assert (service.root / "wiki" / article["path"]).read_bytes() == original
+    operation_id = f"govern-{task['id']}-attempt-{claimed['attempts']}"
+    assert service.files.operation(operation_id)["status"] == "rolled_back"
+
+
 def test_merge_rewrites_inbound_links_and_rolls_back(service: WikiService, kb_root: Path):
     source = kb_root / "wiki" / "concepts" / "duplicate.md"
     source.write_text(

@@ -78,10 +78,44 @@ export type ModelSettings = {
 export type Session = {
   authenticated: boolean
   user?: { id: string; email: string; nickname: string; role: "user" | "admin" }
-  workspace?: { display_name: string }
+  workspace?: WorkspaceSummary
   csrf_token?: string
   session_expires_at?: string
   registration_enabled: boolean
+}
+
+export type WorkspaceSummary = {
+  id: string
+  organization_id: string
+  kind: "personal" | "team"
+  display_name: string
+  status: "active" | "suspended" | "deleted"
+  role: "owner" | "editor" | "viewer"
+  organization_role: "owner" | "admin" | "member"
+  permissions: string[]
+  current?: boolean
+}
+
+export type WorkspaceMember = {
+  user_id: string
+  email: string
+  nickname: string
+  role: "owner" | "editor" | "viewer"
+  status: "active"
+  organization_role: "owner" | "admin" | "member"
+  created_at: string
+  is_current_user: boolean
+}
+
+export type WorkspaceInvitation = {
+  id: string
+  workspace_id: string
+  display_name: string
+  role: "editor" | "viewer"
+  status: "pending"
+  expires_at: string
+  created_at: string
+  invited_by_nickname: string
 }
 
 export type Submission = {
@@ -133,9 +167,14 @@ export type TodoItem = {
 
 const apiBase = import.meta.env.DEV ? "" : ""
 let csrfToken = ""
+let unauthorizedHandler: (() => void) | null = null
 
 export function setCsrfToken(value: string) {
   csrfToken = value
+}
+
+export function setUnauthorizedHandler(handler: (() => void) | null) {
+  unauthorizedHandler = handler
 }
 
 export class ApiError extends Error {
@@ -151,6 +190,7 @@ export class ApiError extends Error {
 
 async function parseResponse<T>(response: Response): Promise<T> {
   const payload = (await response.json().catch(() => ({ error: "响应格式无效" }))) as Record<string, unknown>
+  if (response.status === 401) unauthorizedHandler?.()
   if (!response.ok) throw new ApiError(response.status, payload)
   return payload as T
 }
@@ -182,6 +222,9 @@ export const queryKeys = {
   status: ["status"] as const,
   modelSettings: ["model-settings"] as const,
   session: ["session"] as const,
+  workspaces: ["workspaces"] as const,
+  workspaceMembers: ["workspace-members"] as const,
+  invitations: ["workspace-invitations"] as const,
   submissions: ["submissions"] as const,
   submission: (id: string) => ["submission", id] as const,
   notifications: ["notifications"] as const,

@@ -21,6 +21,7 @@ import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTi
 import { Separator } from "@/components/ui/separator"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { useSession } from "@/features/session-context"
 
 function pathFromLocation(pathname: string) {
   return decodeURIComponent(pathname.replace(/^\//, ""))
@@ -107,6 +108,8 @@ function MetadataPanel({ article }: { article: Article }) {
 }
 
 export function ArticlePage() {
+  const { hasPermission } = useSession()
+  const canWrite = hasPermission("wiki.write")
   const location = useLocation()
   const navigate = useNavigate()
   const [generation, setGeneration] = useState<GenerationRequest | null>(null)
@@ -125,7 +128,7 @@ export function ArticlePage() {
   const content = useMemo(() => article.data ? stripMetadata(article.data.markdown) : "", [article.data])
 
   if (articles.isLoading || (articlePath && article.isLoading)) return <PageFrame><div className="mx-auto max-w-3xl"><Skeleton className="h-6 w-40" /><Skeleton className="mt-8 h-12 w-3/5" /><Skeleton className="mt-12 h-72 w-full" /></div></PageFrame>
-  if (!articlePath) return <PageFrame><Empty className="min-h-[60svh]"><EmptyHeader><EmptyMedia variant="icon"><FilePenLineIcon /></EmptyMedia><EmptyTitle>知识库还是空的</EmptyTitle><EmptyDescription>将 Markdown 放入 Raw 后，从原料箱创建第一篇正本。</EmptyDescription></EmptyHeader><EmptyContent><Button render={<Link to="/inbox" />}>打开原料箱</Button></EmptyContent></Empty></PageFrame>
+  if (!articlePath) return <PageFrame><Empty className="min-h-[60svh]"><EmptyHeader><EmptyMedia variant="icon"><FilePenLineIcon /></EmptyMedia><EmptyTitle>知识库还是空的</EmptyTitle><EmptyDescription>{canWrite ? "将 Markdown 放入 Raw 后，从原料箱创建第一篇正本。" : "当前空间还没有可阅读的词条。"}</EmptyDescription></EmptyHeader>{canWrite && <EmptyContent><Button render={<Link to="/inbox" />}>打开原料箱</Button></EmptyContent>}</Empty></PageFrame>
   if (article.isError || !article.data) return <PageFrame><Empty className="min-h-[60svh]"><EmptyHeader><EmptyMedia variant="icon"><FilePenLineIcon /></EmptyMedia><EmptyTitle>找不到这篇词条</EmptyTitle><EmptyDescription>{article.error?.message || articlePath}</EmptyDescription></EmptyHeader><EmptyContent><Button variant="outline" onClick={() => navigate("/")}>返回词库</Button></EmptyContent></Empty></PageFrame>
   const data = article.data
   const taskState = taskPresentation(data.remote_task)
@@ -148,35 +151,37 @@ export function ArticlePage() {
       <PageFrame aside={<MetadataPanel article={data} />}>
         <article className="mx-auto max-w-[760px]">
           {data.redirected_from && <Alert className="mb-6"><InfoIcon /><AlertTitle>已跳转到正本</AlertTitle><AlertDescription>旧路径 {data.redirected_from} 仍可访问，当前正本为 {data.path}。</AlertDescription></Alert>}
-          {data.classification_status !== "confirmed" && <Alert className="mb-6"><InfoIcon /><AlertTitle>{data.classification_status === "sync_conflict" ? "分类与磁盘状态存在冲突" : "这篇词条等待归类确认"}</AlertTitle><AlertDescription>正文可以正常阅读和编辑，未经确认不会移动文件。<Button className="mt-3" size="sm" variant="outline" render={<Link to={`/classification?article=${data.article_id}`} />}>打开归类工作台</Button></AlertDescription></Alert>}
+          {data.classification_status !== "confirmed" && <Alert className="mb-6"><InfoIcon /><AlertTitle>{data.classification_status === "sync_conflict" ? "分类与磁盘状态存在冲突" : "这篇词条等待归类确认"}</AlertTitle><AlertDescription>正文可以正常阅读，未经确认不会移动文件。{canWrite && <Button className="mt-3" size="sm" variant="outline" render={<Link to={`/classification?article=${data.article_id}`} />}>打开归类工作台</Button>}</AlertDescription></Alert>}
           {data.remote_task && ["queued", "running"].includes(data.remote_task.status) && <Alert className="mb-6"><InfoIcon /><AlertTitle>词条正在生成</AlertTitle><AlertDescription>当前先展示本地草稿；后台任务完成后，本页会自动刷新为生成结果。</AlertDescription></Alert>}
           {data.remote_task?.status === "failed" && <Alert variant="destructive" className="mb-6"><InfoIcon /><AlertTitle>词条生成失败</AlertTitle><AlertDescription>{data.remote_task.error_type || "model_error"} · {data.remote_task.error_message || "请在任务中心重试。"}</AlertDescription></Alert>}
           {data.remote_task?.result?.conflict === true && <Alert className="mb-6"><InfoIcon /><AlertTitle>生成结果未覆盖当前正文</AlertTitle><AlertDescription>生成期间正文发生变化，结果已被冲突保护拦截；请在任务中心基于当前正文重试。</AlertDescription></Alert>}
-          {data.publication.state === "update_available" && <Alert className="mb-6"><RefreshCwIcon /><AlertTitle>广场版本需要更新</AlertTitle><AlertDescription className="flex flex-wrap items-center justify-between gap-3"><span>当前私有正文已修改，广场仍展示版本 {data.publication.public_version}。是否提交本次更新重新审核？</span><Button size="sm" render={<Link to={`/share?article=${encodeURIComponent(data.path)}`} />}>提交广场更新</Button></AlertDescription></Alert>}
-          {data.publication.state === "removed" && <Alert variant="destructive" className="mb-6"><InfoIcon /><AlertTitle>该词条已从广场下架</AlertTitle><AlertDescription className="flex flex-wrap items-center justify-between gap-3"><span>{data.publication.moderation_reason || "请根据通知中的处理理由修改私有正本。原公开快照不会被改写。"}</span><Button variant="outline" size="sm" render={<Link to={`/edit/${data.path}`} />}>修改正文</Button></AlertDescription></Alert>}
-          {data.publication.state === "relist_available" && <Alert className="mb-6"><RefreshCwIcon /><AlertTitle>修改完成后可申请重新上架</AlertTitle><AlertDescription className="flex flex-wrap items-center justify-between gap-3"><span>当前正文已不同于被下架版本。提交后会创建新快照，并重新经过 AI 预审和 Admin 审核。</span><Button size="sm" render={<Link to={`/share?article=${encodeURIComponent(data.path)}`} />}>申请重新上架</Button></AlertDescription></Alert>}
-          {(data.publication.state === "submitted" || data.publication.state === "update_pending" || data.publication.state === "relist_pending") && <Alert className="mb-6"><Clock3Icon /><AlertTitle>{data.publication.state === "update_pending" ? "广场更新正在审核" : data.publication.state === "relist_pending" ? "重新上架申请正在审核" : "广场投稿正在审核"}</AlertTitle><AlertDescription className="flex flex-wrap items-center justify-between gap-3"><span>{data.publication.submission_matches_current ? "当前正文已固化为审核快照，审核通过前不会改变广场内容。" : "提交审核后正文又发生了变化；当前审核快照不会自动变化，审核结束后可再次提交。"}</span>{data.publication.submission_id && <Button variant="outline" size="sm" render={<Link to={`/submissions/${data.publication.submission_id}`} />}>查看进度</Button>}</AlertDescription></Alert>}
+          {data.publication.state === "update_available" && <Alert className="mb-6"><RefreshCwIcon /><AlertTitle>广场版本需要更新</AlertTitle><AlertDescription className="flex flex-wrap items-center justify-between gap-3"><span>当前私有正文已修改，广场仍展示版本 {data.publication.public_version}。{canWrite ? "是否提交本次更新重新审核？" : "请联系 Editor 或 Owner 提交更新。"}</span>{canWrite && <Button size="sm" render={<Link to={`/share?article=${encodeURIComponent(data.path)}`} />}>提交广场更新</Button>}</AlertDescription></Alert>}
+          {data.publication.state === "removed" && <Alert variant="destructive" className="mb-6"><InfoIcon /><AlertTitle>该词条已从广场下架</AlertTitle><AlertDescription className="flex flex-wrap items-center justify-between gap-3"><span>{data.publication.moderation_reason || (canWrite ? "请根据通知中的处理理由修改私有正本。原公开快照不会被改写。" : "原公开快照已下架，私有正文仍可阅读。")}</span>{canWrite && <Button variant="outline" size="sm" render={<Link to={`/edit/${data.path}`} />}>修改正文</Button>}</AlertDescription></Alert>}
+          {data.publication.state === "relist_available" && <Alert className="mb-6"><RefreshCwIcon /><AlertTitle>修改完成后可申请重新上架</AlertTitle><AlertDescription className="flex flex-wrap items-center justify-between gap-3"><span>当前正文已不同于被下架版本。{canWrite ? "提交后会创建新快照，并重新经过 AI 预审和 Admin 审核。" : "请联系 Editor 或 Owner 申请重新上架。"}</span>{canWrite && <Button size="sm" render={<Link to={`/share?article=${encodeURIComponent(data.path)}`} />}>申请重新上架</Button>}</AlertDescription></Alert>}
+          {(data.publication.state === "submitted" || data.publication.state === "update_pending" || data.publication.state === "relist_pending") && <Alert className="mb-6"><Clock3Icon /><AlertTitle>{data.publication.state === "update_pending" ? "广场更新正在审核" : data.publication.state === "relist_pending" ? "重新上架申请正在审核" : "广场投稿正在审核"}</AlertTitle><AlertDescription className="flex flex-wrap items-center justify-between gap-3"><span>{data.publication.submission_matches_current ? "当前正文已固化为审核快照，审核通过前不会改变广场内容。" : "提交审核后正文又发生了变化；当前审核快照不会自动变化，审核结束后可再次提交。"}</span>{canWrite && data.publication.submission_id && <Button variant="outline" size="sm" render={<Link to={`/submissions/${data.publication.submission_id}`} />}>查看进度</Button>}</AlertDescription></Alert>}
           <PageTitle
             eyebrow={<Breadcrumb><BreadcrumbList><BreadcrumbItem><BreadcrumbLink render={<Link to="/" />}>知识库</BreadcrumbLink></BreadcrumbItem><BreadcrumbSeparator /><BreadcrumbItem><BreadcrumbLink>{data.category_label}</BreadcrumbLink></BreadcrumbItem><BreadcrumbSeparator /><BreadcrumbItem><BreadcrumbPage>{data.title}</BreadcrumbPage></BreadcrumbItem></BreadcrumbList></Breadcrumb>}
             title={data.title}
             description={<div className="flex flex-wrap gap-1.5">{badges}</div>}
             actions={<>
+              {canWrite && <>
               <Button variant="outline" size="sm" render={<Link to={`/edit/${data.path}`} />}><FilePenLineIcon data-icon="inline-start" />编辑</Button>
               <Button variant="outline" size="sm" onClick={() => setGovern(true)}><Settings2Icon data-icon="inline-start" />治理</Button>
               <PublicationAction article={data} />
+              </>}
               <DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="更多操作" />}><EllipsisIcon /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuGroup>
                 <DropdownMenuItem onClick={() => { void navigator.clipboard.writeText(window.location.href); toast.success("深链已复制") }}><CopyIcon />复制深链</DropdownMenuItem>
-                <DropdownMenuItem onClick={() => navigate(`/merge?source=${encodeURIComponent(data.path)}`)}><MergeIcon />合并正本</DropdownMenuItem>
+                {canWrite && <DropdownMenuItem onClick={() => navigate(`/merge?source=${encodeURIComponent(data.path)}`)}><MergeIcon />合并正本</DropdownMenuItem>}
               </DropdownMenuGroup></DropdownMenuContent></DropdownMenu>
               <Drawer><DrawerTrigger render={<Button variant="ghost" size="icon-sm" className="xl:hidden" aria-label="查看页面信息" />}><InfoIcon /></DrawerTrigger><DrawerContent><DrawerHeader><DrawerTitle>词条信息</DrawerTitle><DrawerDescription>来源、生成路径与反链</DrawerDescription></DrawerHeader><div className="max-h-[70dvh] overflow-y-auto px-4 pb-6"><MetadataPanel article={data} /></div></DrawerContent></Drawer>
             </>}
           />
-          <MarkdownContent markdown={content} fromPath={data.path} keywords={keywords.data} onMissingKeyword={(keyword) => setGeneration({ keyword, from_path: data.path })} />
+          <MarkdownContent markdown={content} fromPath={data.path} keywords={keywords.data} onMissingKeyword={canWrite ? (keyword) => setGeneration({ keyword, from_path: data.path }) : undefined} />
         </article>
       </PageFrame>
-      <GenerationDialog request={generation} onOpenChange={(open) => !open && setGeneration(null)} />
-      <GovernanceDialog key={data.revision} article={data} open={govern} onOpenChange={setGovern} />
-      {data.publication.state === "update_available" && <PublicationUpdatePrompt key={data.revision} article={data} />}
+      {canWrite && <GenerationDialog request={generation} onOpenChange={(open) => !open && setGeneration(null)} />}
+      {canWrite && <GovernanceDialog key={data.revision} article={data} open={govern} onOpenChange={setGovern} />}
+      {canWrite && data.publication.state === "update_available" && <PublicationUpdatePrompt key={data.revision} article={data} />}
     </>
   )
 }

@@ -27,6 +27,7 @@ const NotificationsPage = lazy(() => import("@/pages/notifications-page").then((
 const ClassificationPage = lazy(() => import("@/pages/classification-page").then((module) => ({ default: module.ClassificationPage })))
 const CategoriesPage = lazy(() => import("@/pages/categories-page").then((module) => ({ default: module.CategoriesPage })))
 const ReconciliationPage = lazy(() => import("@/pages/reconciliation-page").then((module) => ({ default: module.ReconciliationPage })))
+const WorkspacePage = lazy(() => import("@/pages/workspace-page").then((module) => ({ default: module.WorkspacePage })))
 const AdminReviewsPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminReviewsPage })))
 const AdminReviewDetailPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminReviewDetailPage })))
 const AdminReportsPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminReportsPage })))
@@ -47,22 +48,23 @@ export function App() {
               <Route path="/forbidden" element={<main className="mx-auto max-w-xl px-4 py-20"><h1 className="text-2xl font-semibold">没有访问权限</h1><p className="mt-3 text-muted-foreground">当前账号没有执行此操作所需的角色。</p></main>} />
             </Route>
             <Route element={<RequireSession><WikiShell /></RequireSession>}>
-            <Route path="/inbox" element={<InboxPage />} />
-            <Route path="/ingest/*" element={<IngestPage />} />
-            <Route path="/todo" element={<TodoPage />} />
+            <Route path="/inbox" element={<RequireSession permission="wiki.write"><InboxPage /></RequireSession>} />
+            <Route path="/ingest/*" element={<RequireSession permission="wiki.write"><IngestPage /></RequireSession>} />
+            <Route path="/todo" element={<RequireSession permission="wiki.write"><TodoPage /></RequireSession>} />
             <Route path="/health" element={<HealthPage />} />
             <Route path="/tasks" element={<TasksPage />} />
-            <Route path="/merge" element={<MergePage />} />
-            <Route path="/edit/*" element={<EditorPage />} />
+            <Route path="/merge" element={<RequireSession permission="wiki.write"><MergePage /></RequireSession>} />
+            <Route path="/edit/*" element={<RequireSession permission="wiki.write"><EditorPage /></RequireSession>} />
             <Route path="/raw/*" element={<RawPage />} />
             <Route path="/settings" element={<SettingsPage />} />
-            <Route path="/share" element={<SharePage />} />
-            <Route path="/submissions" element={<SubmissionsPage />} />
-            <Route path="/submissions/:id" element={<SubmissionDetailPage />} />
+            <Route path="/share" element={<RequireSession permission="wiki.write"><SharePage /></RequireSession>} />
+            <Route path="/submissions" element={<RequireSession permission="wiki.write"><SubmissionsPage /></RequireSession>} />
+            <Route path="/submissions/:id" element={<RequireSession permission="wiki.write"><SubmissionDetailPage /></RequireSession>} />
             <Route path="/notifications" element={<NotificationsPage />} />
-            <Route path="/classification" element={<ClassificationPage />} />
-            <Route path="/categories" element={<CategoriesPage />} />
-            <Route path="/reconciliation" element={<ReconciliationPage />} />
+            <Route path="/classification" element={<RequireSession permission="wiki.write"><ClassificationPage /></RequireSession>} />
+            <Route path="/categories" element={<RequireSession permission="wiki.write"><CategoriesPage /></RequireSession>} />
+            <Route path="/reconciliation" element={<RequireSession permission="wiki.write"><ReconciliationPage /></RequireSession>} />
+            <Route path="/workspace" element={<WorkspacePage />} />
             <Route path="/*" element={<ArticlePage />} />
             </Route>
             <Route element={<RequireSession role="admin"><AdminShell /></RequireSession>}>
