@@ -8,6 +8,31 @@ import re
 META_RE = re.compile(r"^>\s*([^:]+):\s*(.*)$")
 TITLE_RE = re.compile(r"^#\s+\S")
 CANONICAL_ANCHORS = {"article-id", "category-id", "classification"}
+LEGACY_GENERATION_MODES = {"ai-governed", "local+llm", "local-extractive", "seed-adopted", "web+llm"}
+
+
+def _legacy_generation_value(value: str) -> bool:
+    parts = [part.strip() for part in value.split(";")]
+    if not parts or parts[0].casefold() not in LEGACY_GENERATION_MODES:
+        return False
+    fields: dict[str, str] = {}
+    for part in parts[1:]:
+        key, separator, field_value = part.partition("=")
+        if not separator or key.casefold() not in {"task", "state", "source-preserved"}:
+            return False
+        fields[key.casefold()] = field_value.strip()
+    task = fields.get("task")
+    state = fields.get("state")
+    source_preserved = fields.get("source-preserved")
+    return bool(
+        (
+            task
+            and re.fullmatch(r"[a-f0-9]{32}", task, re.I)
+            and state in {"queued", "running", "succeeded", "failed", "complete"}
+        )
+        or (parts[0].casefold() == "local-extractive" and state == "complete")
+        or source_preserved == "true"
+    )
 
 
 def canonical_header(markdown: str) -> tuple[list[str], int, int, int] | None:
@@ -53,18 +78,30 @@ def canonical_metadata_header(markdown: str) -> tuple[list[str], int, int, int] 
 
 
 def canonical_metadata_preamble(markdown: str) -> tuple[list[str], int, int, int] | None:
-    """Return the anchored metadata preamble, including blank-separated quote blocks."""
+    """Return the anchored block and a recognized legacy runtime block, if present."""
     header = canonical_metadata_header(markdown)
     if header is None:
         return None
     lines, title_index, block_start, block_end = header
-    index = block_end
+    candidate = block_end
+    while candidate < len(lines) and not lines[candidate].rstrip("\r\n").strip():
+        candidate += 1
+    if candidate >= len(lines):
+        return header
+    index = candidate
+    matches: list[re.Match[str]] = []
     while index < len(lines):
-        probe = lines[index].rstrip("\r\n")
-        if not probe.strip() or META_RE.match(probe):
-            index += 1
-            continue
-        break
+        match = META_RE.match(lines[index].rstrip("\r\n"))
+        if match is None:
+            break
+        matches.append(match)
+        index += 1
+    if not any(
+        match.group(1).strip().casefold() == "generation"
+        and _legacy_generation_value(match.group(2).strip())
+        for match in matches
+    ):
+        return header
     return lines, title_index, block_start, index
 
 

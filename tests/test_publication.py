@@ -85,14 +85,27 @@ def test_public_projection_filters_blank_separated_private_metadata_blocks():
         "# Title\n\n> Article-ID: " + "c" * 32 + "\n"
         "> Category-ID: " + "d" * 32 + "\n> Classification: confirmed\n"
         "> Category: concepts\n\n"
-        "> Generation: local+llm; task=private-task-id\n> Updated: 2026-08-16\n"
+        "> Generation: local+llm; task=" + "e" * 32 + "; state=succeeded\n> Updated: 2026-08-16\n"
         "> Sources: Public source\n\n## Body\n\n> Generation: quoted body value\n"
     )
     projected = public_markdown(markdown)
-    assert "private-task-id" not in projected
+    assert "task=" + "e" * 32 not in projected
     assert "> Updated: 2026-08-16" not in projected
     assert "> Sources: Public source" in projected
     assert "> Generation: quoted body value" in projected
+
+
+@pytest.mark.parametrize("field", ["Updated", "Archived", "Generation"])
+def test_private_named_quote_immediately_after_canonical_header_is_visible_body(field: str):
+    markdown = (
+        "# Title\n\n> Article-ID: " + "a" * 32 + "\n"
+        "> Category-ID: " + "b" * 32 + "\n> Classification: confirmed\n"
+        "> Category: concepts\n\n"
+        f"> {field}: quoted source, not metadata\n\nBody\n"
+    )
+    assert public_markdown(markdown).endswith(f"> {field}: quoted source, not metadata\n\nBody\n")
+    changed = markdown.replace("quoted source", "changed source")
+    assert snapshot_fingerprint(snapshot(markdown)) != snapshot_fingerprint(snapshot(changed))
 
 
 def test_unanchored_leading_blockquote_is_visible_body_not_metadata():
@@ -275,8 +288,9 @@ def test_publication_pipeline_preserves_visible_markdown_bytes(tmp_path):
     _token, context = platform.create_session(user["id"])
     article_id = "9" * 32
     private_markdown = (
-        f"# Exact Markdown\n\n> Article-ID: {article_id}\n> Category: concepts\n"
-        "> Classification: confirmed\n\nFirst line  \nSecond line\n\n"
+        f"# Exact Markdown\n\n> Article-ID: {article_id}\n> Category-ID: " + "8" * 32 + "\n"
+        "> Category: concepts\n> Classification: confirmed\n\n"
+        "> Generation: quoted source, not metadata\n\nFirst line  \nSecond line\n\n"
         "~~~text\ncode tail   \n\n\n> Updated: code value\n~~~\n\n"
         "> Updated: body quote\n"
     )
@@ -292,6 +306,7 @@ def test_publication_pipeline_preserves_visible_markdown_bytes(tmp_path):
     stored = json.loads(row["snapshot_json"])
     canonical = json.dumps(stored, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     assert stored["markdown"] == expected
+    assert "> Generation: quoted source, not metadata" in stored["markdown"]
     assert "First line  \n" in stored["markdown"]
     assert "code tail   \n\n\n> Updated: code value" in stored["markdown"]
     assert "> Updated: body quote" in stored["markdown"]
