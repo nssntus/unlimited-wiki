@@ -40,12 +40,12 @@ function taskLabel(task: Task) {
   return task.kind
 }
 
-function taskHref(task: Task) {
+function taskHref(task: Task, canWrite: boolean) {
   if (task.kind === "raw-classification-plan" && typeof task.payload.raw_path === "string") {
-    return `/ingest/${task.payload.raw_path}`
+    return canWrite ? `/ingest/${task.payload.raw_path}` : null
   }
   if (task.kind === "article-classification" && typeof task.payload.article_id === "string") {
-    return `/classification?article=${task.payload.article_id}`
+    return canWrite ? `/classification?article=${task.payload.article_id}` : null
   }
   return typeof task.payload.path === "string" ? `/${task.payload.path}` : null
 }
@@ -143,10 +143,10 @@ export function TasksPage() {
                         取消
                       </Button>
                     )}
-                    {taskHref(task) && (
+                    {taskHref(task, canWrite) && (
                       <Button
                         size="sm"
-                        render={<Link to={taskHref(task)!} />}
+                        render={<Link to={taskHref(task, canWrite)!} />}
                       >
                         {task.kind === "raw-classification-plan" ? "打开原料" : task.kind === "article-classification" ? "打开归类" : "打开词条"}
                       </Button>

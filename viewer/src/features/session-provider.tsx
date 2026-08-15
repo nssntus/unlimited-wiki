@@ -105,7 +105,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   const switchingWorkspace = switchState.kind !== "idle"
   const hasPermission = (permission: string) => query.data?.workspace?.permissions.includes(permission) ?? false
   const value = { session: query.data, loading: query.isLoading, signOut, switchWorkspace, switchingWorkspace, hasPermission }
-  return <SessionContext.Provider value={value}>{switchState.kind === "confirming" ? <WorkspaceSwitchGate /> : switchState.kind === "error" ? <WorkspaceSwitchGate error={switchState.message} onRetry={retryWorkspaceConfirmation} /> : children}</SessionContext.Provider>
+  return <SessionContext.Provider value={value}>{switchState.kind === "idle" ? children : switchState.kind === "error" ? <WorkspaceSwitchGate error={switchState.message} onRetry={retryWorkspaceConfirmation} /> : <WorkspaceSwitchGate />}</SessionContext.Provider>
 }
 
 function WorkspaceSwitchGate({ error, onRetry }: { error?: string; onRetry?: () => Promise<void> }) {
