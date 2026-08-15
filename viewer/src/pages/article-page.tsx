@@ -21,6 +21,7 @@ import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTi
 import { Separator } from "@/components/ui/separator"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { useSession } from "@/features/session-context"
 
 function pathFromLocation(pathname: string) {
   return decodeURIComponent(pathname.replace(/^\//, ""))
@@ -107,6 +108,8 @@ function MetadataPanel({ article }: { article: Article }) {
 }
 
 export function ArticlePage() {
+  const { hasPermission } = useSession()
+  const canWrite = hasPermission("wiki.write")
   const location = useLocation()
   const navigate = useNavigate()
   const [generation, setGeneration] = useState<GenerationRequest | null>(null)
@@ -161,22 +164,24 @@ export function ArticlePage() {
             title={data.title}
             description={<div className="flex flex-wrap gap-1.5">{badges}</div>}
             actions={<>
+              {canWrite && <>
               <Button variant="outline" size="sm" render={<Link to={`/edit/${data.path}`} />}><FilePenLineIcon data-icon="inline-start" />编辑</Button>
               <Button variant="outline" size="sm" onClick={() => setGovern(true)}><Settings2Icon data-icon="inline-start" />治理</Button>
               <PublicationAction article={data} />
+              </>}
               <DropdownMenu><DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="更多操作" />}><EllipsisIcon /></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuGroup>
                 <DropdownMenuItem onClick={() => { void navigator.clipboard.writeText(window.location.href); toast.success("深链已复制") }}><CopyIcon />复制深链</DropdownMenuItem>
-                <DropdownMenuItem onClick={() => navigate(`/merge?source=${encodeURIComponent(data.path)}`)}><MergeIcon />合并正本</DropdownMenuItem>
+                {canWrite && <DropdownMenuItem onClick={() => navigate(`/merge?source=${encodeURIComponent(data.path)}`)}><MergeIcon />合并正本</DropdownMenuItem>}
               </DropdownMenuGroup></DropdownMenuContent></DropdownMenu>
               <Drawer><DrawerTrigger render={<Button variant="ghost" size="icon-sm" className="xl:hidden" aria-label="查看页面信息" />}><InfoIcon /></DrawerTrigger><DrawerContent><DrawerHeader><DrawerTitle>词条信息</DrawerTitle><DrawerDescription>来源、生成路径与反链</DrawerDescription></DrawerHeader><div className="max-h-[70dvh] overflow-y-auto px-4 pb-6"><MetadataPanel article={data} /></div></DrawerContent></Drawer>
             </>}
           />
-          <MarkdownContent markdown={content} fromPath={data.path} keywords={keywords.data} onMissingKeyword={(keyword) => setGeneration({ keyword, from_path: data.path })} />
+          <MarkdownContent markdown={content} fromPath={data.path} keywords={keywords.data} onMissingKeyword={canWrite ? (keyword) => setGeneration({ keyword, from_path: data.path }) : undefined} />
         </article>
       </PageFrame>
-      <GenerationDialog request={generation} onOpenChange={(open) => !open && setGeneration(null)} />
-      <GovernanceDialog key={data.revision} article={data} open={govern} onOpenChange={setGovern} />
-      {data.publication.state === "update_available" && <PublicationUpdatePrompt key={data.revision} article={data} />}
+      {canWrite && <GenerationDialog request={generation} onOpenChange={(open) => !open && setGeneration(null)} />}
+      {canWrite && <GovernanceDialog key={data.revision} article={data} open={govern} onOpenChange={setGovern} />}
+      {canWrite && data.publication.state === "update_available" && <PublicationUpdatePrompt key={data.revision} article={data} />}
     </>
   )
 }

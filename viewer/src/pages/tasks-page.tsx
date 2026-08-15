@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/empty"
 import { Progress } from "@/components/ui/progress"
 import { Skeleton } from "@/components/ui/skeleton"
+import { useSession } from "@/features/session-context"
 
 const statusKind = (status: Task["status"]) =>
   status === "succeeded"
@@ -50,6 +51,8 @@ function taskHref(task: Task) {
 }
 
 export function TasksPage() {
+  const { hasPermission } = useSession()
+  const canWrite = hasPermission("wiki.write")
   const client = useQueryClient()
   const tasks = useQuery({
     queryKey: queryKeys.tasks,
@@ -117,7 +120,7 @@ export function TasksPage() {
                     </p>
                   </div>
                   <div className="flex gap-2">
-                    {(["failed", "cancelled"].includes(task.status) ||
+                    {canWrite && ((["failed", "cancelled"].includes(task.status) ||
                       task.result?.conflict === true) && (
                       <Button
                         size="sm"
@@ -127,8 +130,8 @@ export function TasksPage() {
                         <RotateCcwIcon data-icon="inline-start" />
                           {task.kind.includes("classification") ? "重试归类建议" : "基于当前正文重试"}
                       </Button>
-                    )}
-                    {["queued", "running"].includes(task.status) && (
+                    ))}
+                    {canWrite && ["queued", "running"].includes(task.status) && (
                       <Button
                         size="sm"
                         variant="outline"

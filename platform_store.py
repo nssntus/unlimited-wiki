@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import threading
 import uuid
@@ -34,6 +36,10 @@ SUBMISSION_STATES = {
 }
 PUBLIC_STATES = {"published", "withdrawn_by_author", "removed_by_admin", "superseded"}
 ACTIVE_SUBMISSION_STATES = {"ai_queued", "ai_reviewing", "pending_admin"}
+
+
+class PlatformIdempotencyError(RuntimeError):
+    pass
 
 
 def now_iso() -> str:
@@ -80,6 +86,7 @@ class SessionContext:
     workspace_id: str
     workspace_root_name: str
     workspace_name: str
+    workspace_kind: str
     organization_id: str
     organization_role: str
     workspace_role: str
@@ -87,9 +94,19 @@ class SessionContext:
     expires_at: str
 
     def public(self) -> dict:
+        permissions = sorted(WORKSPACE_PERMISSIONS.get(self.workspace_role, frozenset()))
         return {
             "user": {"id": self.user_id, "email": self.email, "nickname": self.nickname, "role": self.role},
-            "workspace": {"display_name": self.workspace_name, "role": self.workspace_role},
+            "workspace": {
+                "id": self.workspace_id,
+                "organization_id": self.organization_id,
+                "kind": self.workspace_kind,
+                "display_name": self.workspace_name,
+                "status": "active",
+                "role": self.workspace_role,
+                "organization_role": self.organization_role,
+                "permissions": permissions,
+            },
             "csrf_token": self.csrf_token,
             "session_expires_at": self.expires_at,
         }
@@ -133,6 +150,33 @@ class SecretVault:
         return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
 
 
+class _BorrowedConnection:
+    """Let nested store methods join an outer platform transaction."""
+
+    def __init__(self, db: sqlite3.Connection):
+        self._db = db
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        return False
+
+    def execute(self, sql: str, parameters=()):
+        if sql.lstrip().upper().startswith("BEGIN"):
+            return self
+        return self._db.execute(sql, parameters)
+
+    def commit(self) -> None:
+        return None
+
+    def rollback(self) -> None:
+        return None
+
+    def __getattr__(self, name: str):
+        return getattr(self._db, name)
+
+
 class PlatformStore:
     def __init__(self, project_root: Path):
         self.project_root = project_root.resolve()
@@ -145,9 +189,16 @@ class PlatformStore:
         self.db_path = self.state_root / "platform.sqlite3"
         self.vault = SecretVault(self.state_root)
         self._lock = threading.RLock()
+        self._transaction_context = threading.local()
         self._initialize()
 
     def connect(self) -> sqlite3.Connection:
+        borrowed = getattr(self._transaction_context, "connection", None)
+        if borrowed is not None:
+            return _BorrowedConnection(borrowed)
+        return self._new_connection()
+
+    def _new_connection(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.db_path, timeout=30)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
@@ -171,7 +222,9 @@ class PlatformStore:
                 CREATE TABLE IF NOT EXISTS workspaces (
                     id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(id),
                     organization_id TEXT REFERENCES organizations(id), root_name TEXT NOT NULL UNIQUE,
-                    display_name TEXT NOT NULL, created_at TEXT NOT NULL
+                    display_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active'
+                        CHECK(status IN ('active','suspended','deleted')),
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS organization_members (
                     organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -195,7 +248,27 @@ class PlatformStore:
                     ON workspace_members(user_id) WHERE is_default=1 AND status='active';
                 CREATE TABLE IF NOT EXISTS sessions (
                     token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    csrf_hash TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL
+                    csrf_hash TEXT NOT NULL, current_workspace_id TEXT REFERENCES workspaces(id),
+                    expires_at TEXT NOT NULL, created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS workspace_invitations (
+                    id TEXT PRIMARY KEY, organization_id TEXT NOT NULL REFERENCES organizations(id),
+                    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+                    invitee_user_id TEXT NOT NULL REFERENCES users(id), role TEXT NOT NULL
+                        CHECK(role IN ('editor','viewer')),
+                    status TEXT NOT NULL CHECK(status IN ('pending','accepted','declined','revoked','expired')),
+                    invited_by TEXT NOT NULL REFERENCES users(id), expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_invitation_pending
+                    ON workspace_invitations(workspace_id,invitee_user_id) WHERE status='pending';
+                CREATE INDEX IF NOT EXISTS idx_workspace_invitation_invitee
+                    ON workspace_invitations(invitee_user_id,status,created_at DESC);
+                CREATE TABLE IF NOT EXISTS platform_idempotency (
+                    scope TEXT NOT NULL, endpoint TEXT NOT NULL, key TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('running','done')),
+                    response_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    PRIMARY KEY(scope,endpoint,key)
                 );
                 CREATE TABLE IF NOT EXISTS recovery_codes (
                     code_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -255,6 +328,38 @@ class PlatformStore:
             workspace_columns = {row["name"] for row in db.execute("PRAGMA table_info(workspaces)").fetchall()}
             if "organization_id" not in workspace_columns:
                 db.execute("ALTER TABLE workspaces ADD COLUMN organization_id TEXT REFERENCES organizations(id)")
+            if "status" not in workspace_columns:
+                db.execute("ALTER TABLE workspaces ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+            if "updated_at" not in workspace_columns:
+                db.execute("ALTER TABLE workspaces ADD COLUMN updated_at TEXT")
+                db.execute("UPDATE workspaces SET updated_at=created_at WHERE updated_at IS NULL")
+            session_columns = {row["name"] for row in db.execute("PRAGMA table_info(sessions)").fetchall()}
+            if "current_workspace_id" not in session_columns:
+                db.execute("ALTER TABLE sessions ADD COLUMN current_workspace_id TEXT REFERENCES workspaces(id)")
+                db.execute("""
+                    UPDATE sessions SET current_workspace_id=(
+                        SELECT workspace_id FROM workspace_members member
+                        WHERE member.user_id=sessions.user_id AND member.status='active'
+                        ORDER BY member.is_default DESC,member.created_at,member.workspace_id LIMIT 1
+                    )
+                """)
+            idempotency_columns = {row["name"] for row in db.execute("PRAGMA table_info(platform_idempotency)").fetchall()}
+            if "scope" not in idempotency_columns:
+                db.execute("ALTER TABLE platform_idempotency RENAME TO platform_idempotency_legacy")
+                db.execute("""
+                    CREATE TABLE platform_idempotency (
+                        scope TEXT NOT NULL, endpoint TEXT NOT NULL, key TEXT NOT NULL,
+                        payload_hash TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('running','done')),
+                        response_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                        PRIMARY KEY(scope,endpoint,key)
+                    )
+                """)
+                db.execute("""
+                    INSERT INTO platform_idempotency
+                    SELECT 'account:' || user_id,endpoint,key,payload_hash,status,response_json,created_at,updated_at
+                    FROM platform_idempotency_legacy WHERE status='done'
+                """)
+                db.execute("DROP TABLE platform_idempotency_legacy")
             db.commit()
             self._remove_workspace_owner_unique(db)
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_org_identity ON workspaces(id, organization_id)")
@@ -291,12 +396,17 @@ class PlatformStore:
                 CREATE TABLE workspaces_rebuild (
                     id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(id),
                     organization_id TEXT REFERENCES organizations(id), root_name TEXT NOT NULL UNIQUE,
-                    display_name TEXT NOT NULL, created_at TEXT NOT NULL
+                    display_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active'
+                        CHECK(status IN ('active','suspended','deleted')),
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 )
             """)
             db.execute("""
-                INSERT INTO workspaces_rebuild(id,owner_id,organization_id,root_name,display_name,created_at)
-                SELECT id,owner_id,organization_id,root_name,display_name,created_at FROM workspaces
+                INSERT INTO workspaces_rebuild(
+                    id,owner_id,organization_id,root_name,display_name,status,created_at,updated_at
+                )
+                SELECT id,owner_id,organization_id,root_name,display_name,status,created_at,updated_at
+                FROM workspaces
             """)
             db.execute("DROP TABLE workspaces")
             db.execute("ALTER TABLE workspaces_rebuild RENAME TO workspaces")
@@ -422,9 +532,10 @@ class PlatformStore:
                     VALUES(?,?,'owner','active',?,?,?)
                 """, (organization_id, user_id, user_id, created, created))
                 db.execute("""
-                    INSERT INTO workspaces(id,owner_id,organization_id,root_name,display_name,created_at)
-                    VALUES(?,?,?,?,?,?)
-                """, (workspace_id, user_id, organization_id, root_name, f"{nickname} 的 Wiki", created))
+                    INSERT INTO workspaces(
+                        id,owner_id,organization_id,root_name,display_name,status,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,'active',?,?)
+                """, (workspace_id, user_id, organization_id, root_name, f"{nickname} 的 Wiki", created, created))
                 db.execute("""
                     INSERT INTO workspace_members
                         (organization_id,workspace_id,user_id,role,status,is_default,added_by,created_at,updated_at)
@@ -474,9 +585,24 @@ class PlatformStore:
         csrf = self.vault.derive(token, scope="session-csrf")
         expires = future_iso(hours=hours)
         with self.connect() as db:
+            workspace = db.execute("""
+                SELECT member.workspace_id FROM workspace_members member
+                JOIN workspaces workspace ON workspace.id=member.workspace_id AND workspace.status='active'
+                JOIN organizations organization
+                  ON organization.id=workspace.organization_id AND organization.status='active'
+                JOIN organization_members organization_member
+                  ON organization_member.organization_id=workspace.organization_id
+                 AND organization_member.user_id=member.user_id AND organization_member.status='active'
+                WHERE member.user_id=? AND member.status='active'
+                ORDER BY member.is_default DESC,member.created_at,member.workspace_id LIMIT 1
+            """, (user_id,)).fetchone()
+            if workspace is None:
+                raise RuntimeError("user has no active workspace")
             db.execute(
-                "INSERT INTO sessions VALUES(?,?,?,?,?)",
-                (hash_token(token), user_id, hash_token(csrf), expires, now_iso()),
+                """INSERT INTO sessions(
+                    token_hash,user_id,csrf_hash,current_workspace_id,expires_at,created_at
+                ) VALUES(?,?,?,?,?,?)""",
+                (hash_token(token), user_id, hash_token(csrf), workspace["workspace_id"], expires, now_iso()),
             )
         context = self.resolve_session(token)
         if context is None:
@@ -491,45 +617,71 @@ class PlatformStore:
             row = db.execute("""
                 SELECT u.id user_id,u.email,u.nickname,u.role,u.status,
                        w.id workspace_id,w.root_name,w.display_name,w.organization_id,
-                       om.role organization_role,wm.role workspace_role,o.status organization_status,
+                       om.role organization_role,wm.role workspace_role,o.kind workspace_kind,
+                       o.status organization_status,w.status workspace_status,
                        s.csrf_hash,s.expires_at
                 FROM sessions s
                 JOIN users u ON u.id=s.user_id
-                JOIN workspace_members wm ON wm.user_id=u.id AND wm.status='active' AND wm.is_default=1
+                JOIN workspace_members wm ON wm.user_id=u.id AND wm.status='active'
+                    AND wm.workspace_id=s.current_workspace_id
                 JOIN workspaces w ON w.id=wm.workspace_id AND w.organization_id=wm.organization_id
                 JOIN organization_members om ON om.organization_id=w.organization_id
                     AND om.user_id=u.id AND om.status='active'
                 JOIN organizations o ON o.id=w.organization_id
                 WHERE s.token_hash=? AND s.expires_at>?
             """, (hash_token(token), now_iso())).fetchone()
-        if row is None or row["status"] != "active" or row["organization_status"] != "active":
+        if (
+            row is None
+            or row["status"] != "active"
+            or row["organization_status"] != "active"
+            or row["workspace_status"] != "active"
+        ):
             return None
         csrf = self.vault.derive(token, scope="session-csrf")
         if not hmac.compare_digest(hash_token(csrf), row["csrf_hash"]):
             return None
         return SessionContext(
             row["user_id"], row["email"], row["nickname"], row["role"], row["workspace_id"],
-            row["root_name"], row["display_name"], row["organization_id"], row["organization_role"],
+            row["root_name"], row["display_name"], row["workspace_kind"], row["organization_id"], row["organization_role"],
             row["workspace_role"], csrf, row["expires_at"],
         )
 
     def authorize_workspace(self, user_id: str, workspace_id: str, permission: str) -> dict:
         with self.connect() as db:
-            row = db.execute("""
-                SELECT w.*,wm.role workspace_role,wm.status workspace_member_status,
-                       om.role organization_role,om.status organization_member_status,
-                       o.status organization_status,u.status user_status
-                FROM workspaces w
-                JOIN workspace_members wm ON wm.workspace_id=w.id AND wm.organization_id=w.organization_id
-                JOIN organization_members om ON om.organization_id=w.organization_id AND om.user_id=wm.user_id
-                JOIN organizations o ON o.id=w.organization_id
-                JOIN users u ON u.id=wm.user_id
-                WHERE w.id=? AND wm.user_id=?
-            """, (workspace_id, user_id)).fetchone()
+            row = self._workspace_access_row(db, user_id, workspace_id)
+        self._check_workspace_permission(row, workspace_id, permission)
+        return dict(row)
+
+    @contextlib.contextmanager
+    def authorized_workspace_action(self, user_id: str, workspace_id: str, permission: str):
+        """Serialize a final side effect with membership changes in this process."""
+        with self._lock:
+            with self.connect() as db:
+                row = self._workspace_access_row(db, user_id, workspace_id)
+            self._check_workspace_permission(row, workspace_id, permission)
+            yield
+
+    @staticmethod
+    def _workspace_access_row(db: sqlite3.Connection, user_id: str, workspace_id: str) -> sqlite3.Row | None:
+        return db.execute("""
+            SELECT w.*,wm.role workspace_role,wm.status workspace_member_status,
+                   om.role organization_role,om.status organization_member_status,
+                   o.kind organization_kind,o.status organization_status,u.status user_status
+            FROM workspaces w
+            JOIN workspace_members wm ON wm.workspace_id=w.id AND wm.organization_id=w.organization_id
+            JOIN organization_members om ON om.organization_id=w.organization_id AND om.user_id=wm.user_id
+            JOIN organizations o ON o.id=w.organization_id
+            JOIN users u ON u.id=wm.user_id
+            WHERE w.id=? AND wm.user_id=?
+        """, (workspace_id, user_id)).fetchone()
+
+    @staticmethod
+    def _check_workspace_permission(row: sqlite3.Row | None, workspace_id: str, permission: str) -> None:
         if (
             row is None
             or row["user_status"] != "active"
             or row["organization_status"] != "active"
+            or row["status"] != "active"
             or row["workspace_member_status"] != "active"
             or row["organization_member_status"] != "active"
         ):
@@ -537,7 +689,459 @@ class PlatformStore:
         allowed = WORKSPACE_PERMISSIONS.get(row["workspace_role"], frozenset())
         if permission not in allowed:
             raise PermissionError(permission)
-        return dict(row)
+
+    @staticmethod
+    def _workspace_summary(row: sqlite3.Row | dict, *, current: bool = False) -> dict:
+        role = row["workspace_role"]
+        return {
+            "id": row["id"],
+            "organization_id": row["organization_id"],
+            "kind": row["organization_kind"],
+            "display_name": row["display_name"],
+            "status": row["status"],
+            "role": role,
+            "organization_role": row["organization_role"],
+            "permissions": sorted(WORKSPACE_PERMISSIONS.get(role, frozenset())),
+            "current": current,
+        }
+
+    def list_workspaces(self, context: SessionContext) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute("""
+                SELECT workspace.*,organization.kind organization_kind,
+                       workspace_member.role workspace_role,
+                       organization_member.role organization_role
+                FROM workspace_members workspace_member
+                JOIN workspaces workspace ON workspace.id=workspace_member.workspace_id
+                JOIN organizations organization ON organization.id=workspace.organization_id
+                JOIN organization_members organization_member
+                  ON organization_member.organization_id=workspace.organization_id
+                 AND organization_member.user_id=workspace_member.user_id
+                JOIN users user ON user.id=workspace_member.user_id
+                WHERE workspace_member.user_id=? AND workspace_member.status='active'
+                  AND organization_member.status='active' AND user.status='active'
+                ORDER BY CASE organization.kind WHEN 'personal' THEN 0 ELSE 1 END,
+                         workspace.created_at,workspace.id
+            """, (context.user_id,)).fetchall()
+        return [self._workspace_summary(row, current=row["id"] == context.workspace_id) for row in rows]
+
+    @staticmethod
+    def _validate_workspace_name(value: str) -> str:
+        value = value.strip()
+        if not value or len(value) > 80 or any(ord(ch) < 32 for ch in value):
+            raise ValueError("workspace name must be between 1 and 80 characters")
+        return value
+
+    def create_team(self, context: SessionContext, display_name: str) -> dict:
+        display_name = self._validate_workspace_name(display_name)
+        organization_id, workspace_id = uuid.uuid4().hex, uuid.uuid4().hex
+        root = self.workspace_root(workspace_id)
+        (root / "wiki").mkdir(parents=True)
+        (root / "raw").mkdir()
+        created = now_iso()
+        try:
+            with self._lock, self.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                user = db.execute(
+                    "SELECT status FROM users WHERE id=?", (context.user_id,),
+                ).fetchone()
+                if user is None or user["status"] != "active":
+                    raise FileNotFoundError(context.user_id)
+                db.execute("""
+                    INSERT INTO organizations(
+                        id,kind,personal_owner_id,display_name,status,created_by,created_at,updated_at
+                    ) VALUES(?,'team',NULL,?,'active',?,?,?)
+                """, (organization_id, display_name, context.user_id, created, created))
+                db.execute("""
+                    INSERT INTO organization_members(
+                        organization_id,user_id,role,status,added_by,created_at,updated_at
+                    ) VALUES(?,?,'owner','active',?,?,?)
+                """, (organization_id, context.user_id, context.user_id, created, created))
+                db.execute("""
+                    INSERT INTO workspaces(
+                        id,owner_id,organization_id,root_name,display_name,status,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,'active',?,?)
+                """, (workspace_id, context.user_id, organization_id, workspace_id, display_name, created, created))
+                db.execute("""
+                    INSERT INTO workspace_members(
+                        organization_id,workspace_id,user_id,role,status,is_default,added_by,created_at,updated_at
+                    ) VALUES(?,?,?,'owner','active',0,?,?,?)
+                """, (organization_id, workspace_id, context.user_id, context.user_id, created, created))
+                db.execute(
+                    "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
+                    (uuid.uuid4().hex, context.user_id, "workspace.create", "workspace", workspace_id,
+                     json.dumps({"kind": "team", "display_name": display_name}, ensure_ascii=False), created),
+                )
+                db.commit()
+        except BaseException:
+            if root.exists():
+                shutil.rmtree(root)
+            raise
+        with self.connect() as db:
+            row = self._workspace_access_row(db, context.user_id, workspace_id)
+        return self._workspace_summary(row)
+
+    def list_workspace_members(self, context: SessionContext) -> list[dict]:
+        with self._lock, self.connect() as db:
+            access = self._workspace_access_row(db, context.user_id, context.workspace_id)
+            self._check_workspace_permission(access, context.workspace_id, "workspace.manage")
+            rows = db.execute("""
+                SELECT user.id user_id,user.email,user.nickname,member.role,member.status,
+                       organization_member.role organization_role,member.created_at
+                FROM workspace_members member
+                JOIN users user ON user.id=member.user_id
+                JOIN organization_members organization_member
+                  ON organization_member.organization_id=member.organization_id
+                 AND organization_member.user_id=member.user_id
+                WHERE member.workspace_id=? AND member.status='active'
+                  AND organization_member.status='active' AND user.status='active'
+                ORDER BY CASE member.role WHEN 'owner' THEN 0 WHEN 'editor' THEN 1 ELSE 2 END,
+                         member.created_at,user.id
+            """, (context.workspace_id,)).fetchall()
+        return [{**dict(row), "is_current_user": row["user_id"] == context.user_id} for row in rows]
+
+    def invite_workspace_member(self, context: SessionContext, email: str, role: str) -> dict:
+        email = email.strip().casefold()
+        if role not in {"editor", "viewer"}:
+            raise ValueError("invitation role must be editor or viewer")
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            access = self._workspace_access_row(db, context.user_id, context.workspace_id)
+            self._check_workspace_permission(access, context.workspace_id, "workspace.manage")
+            if access["organization_kind"] != "team":
+                raise ValueError("personal workspaces cannot invite members")
+            invitee = db.execute(
+                "SELECT id,status FROM users WHERE email=?", (email,),
+            ).fetchone()
+            if invitee is None or invitee["status"] != "active":
+                raise ValueError("the invited account is unavailable")
+            if invitee["id"] == context.user_id:
+                raise ValueError("cannot invite yourself")
+            active = db.execute("""
+                SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=? AND status='active'
+            """, (context.workspace_id, invitee["id"])).fetchone()
+            if active:
+                raise ValueError("user is already a workspace member")
+            invitation_id, created = uuid.uuid4().hex, now_iso()
+            db.execute("""
+                UPDATE workspace_invitations SET status='expired',updated_at=?
+                WHERE workspace_id=? AND invitee_user_id=? AND status='pending' AND expires_at<=?
+            """, (created, context.workspace_id, invitee["id"], created))
+            try:
+                db.execute("""
+                    INSERT INTO workspace_invitations(
+                        id,organization_id,workspace_id,invitee_user_id,role,status,invited_by,
+                        expires_at,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,'pending',?,?,?,?)
+                """, (
+                    invitation_id, access["organization_id"], context.workspace_id, invitee["id"], role,
+                    context.user_id, future_iso(hours=24 * 7), created, created,
+                ))
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("a pending invitation already exists") from exc
+            self._notify(
+                db, invitee["id"], "workspace_invitation", "workspace", context.workspace_id,
+                "新的团队空间邀请", f"你被邀请加入 {access['display_name']}。",
+            )
+            db.execute(
+                "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
+                (uuid.uuid4().hex, context.user_id, "workspace.invite", "workspace", context.workspace_id,
+                 json.dumps({"invitation_id": invitation_id, "role": role}, ensure_ascii=False), created),
+            )
+            db.commit()
+        return {"id": invitation_id, "workspace_id": context.workspace_id, "role": role, "status": "pending"}
+
+    def list_invitations(self, context: SessionContext) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute("""
+                SELECT invitation.id,invitation.workspace_id,invitation.role,invitation.status,
+                       invitation.expires_at,invitation.created_at,workspace.display_name,
+                       inviter.nickname invited_by_nickname
+                FROM workspace_invitations invitation
+                JOIN workspaces workspace ON workspace.id=invitation.workspace_id
+                JOIN organizations organization ON organization.id=workspace.organization_id
+                JOIN users inviter ON inviter.id=invitation.invited_by
+                WHERE invitation.invitee_user_id=? AND invitation.status='pending'
+                  AND invitation.expires_at>? AND workspace.status='active'
+                  AND organization.status='active'
+                ORDER BY invitation.created_at DESC
+            """, (context.user_id, now_iso())).fetchall()
+        return [dict(row) for row in rows]
+
+    def respond_to_invitation(self, context: SessionContext, invitation_id: str, *, accept: bool) -> dict:
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            invitation = db.execute("""
+                SELECT invitation.*,workspace.display_name,workspace.status workspace_status,
+                       organization.status organization_status,user.status user_status
+                FROM workspace_invitations invitation
+                JOIN workspaces workspace ON workspace.id=invitation.workspace_id
+                JOIN organizations organization ON organization.id=invitation.organization_id
+                JOIN users user ON user.id=invitation.invitee_user_id
+                WHERE invitation.id=? AND invitation.invitee_user_id=?
+            """, (invitation_id, context.user_id)).fetchone()
+            if invitation is None:
+                raise FileNotFoundError(invitation_id)
+            if invitation["status"] == "pending" and invitation["expires_at"] <= now_iso():
+                db.execute(
+                    "UPDATE workspace_invitations SET status='expired',updated_at=? WHERE id=?",
+                    (now_iso(), invitation_id),
+                )
+                db.commit()
+                return {"id": invitation_id, "workspace_id": invitation["workspace_id"], "status": "expired"}
+            if (
+                invitation["status"] != "pending"
+                or invitation["workspace_status"] != "active"
+                or invitation["organization_status"] != "active"
+                or invitation["user_status"] != "active"
+            ):
+                raise ValueError("invitation is no longer available")
+            created = now_iso()
+            status = "accepted" if accept else "declined"
+            if accept:
+                db.execute("""
+                    INSERT INTO organization_members(
+                        organization_id,user_id,role,status,added_by,created_at,updated_at
+                    ) VALUES(?,?,'member','active',?,?,?)
+                    ON CONFLICT(organization_id,user_id) DO UPDATE SET
+                        status='active',updated_at=excluded.updated_at
+                """, (
+                    invitation["organization_id"], context.user_id, invitation["invited_by"], created, created,
+                ))
+                db.execute("""
+                    INSERT INTO workspace_members(
+                        organization_id,workspace_id,user_id,role,status,is_default,added_by,created_at,updated_at
+                    ) VALUES(?,?,?,?,'active',0,?,?,?)
+                    ON CONFLICT(workspace_id,user_id) DO UPDATE SET
+                        role=excluded.role,status='active',updated_at=excluded.updated_at
+                """, (
+                    invitation["organization_id"], invitation["workspace_id"], context.user_id,
+                    invitation["role"], invitation["invited_by"], created, created,
+                ))
+            db.execute(
+                "UPDATE workspace_invitations SET status=?,updated_at=? WHERE id=? AND status='pending'",
+                (status, created, invitation_id),
+            )
+            self._notify(
+                db, invitation["invited_by"], "workspace_invitation_response", "workspace",
+                invitation["workspace_id"], "团队空间邀请已处理",
+                "受邀用户已接受邀请。" if accept else "受邀用户已拒绝邀请。",
+            )
+            db.execute(
+                "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
+                (uuid.uuid4().hex, context.user_id, f"workspace.invitation_{status}", "workspace",
+                 invitation["workspace_id"], json.dumps({"invitation_id": invitation_id}), created),
+            )
+            db.commit()
+        return {"id": invitation_id, "workspace_id": invitation["workspace_id"], "status": status}
+
+    def change_workspace_member_role(self, context: SessionContext, user_id: str, role: str) -> dict:
+        if role not in {"editor", "viewer"}:
+            raise ValueError("member role must be editor or viewer")
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            access = self._workspace_access_row(db, context.user_id, context.workspace_id)
+            self._check_workspace_permission(access, context.workspace_id, "workspace.manage")
+            target = db.execute("""
+                SELECT member.*,user.email,user.nickname,user.status user_status
+                FROM workspace_members member JOIN users user ON user.id=member.user_id
+                WHERE member.workspace_id=? AND member.user_id=? AND member.status='active'
+            """, (context.workspace_id, user_id)).fetchone()
+            if target is None or target["user_status"] != "active":
+                raise FileNotFoundError(user_id)
+            if target["role"] == "owner":
+                raise ValueError("transfer ownership before changing the owner role")
+            old_role, changed = target["role"], now_iso()
+            db.execute(
+                "UPDATE workspace_members SET role=?,updated_at=? WHERE workspace_id=? AND user_id=?",
+                (role, changed, context.workspace_id, user_id),
+            )
+            db.execute(
+                "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
+                (uuid.uuid4().hex, context.user_id, "workspace.member_role", "workspace", context.workspace_id,
+                 json.dumps({"user_id": user_id, "old_role": old_role, "new_role": role}), changed),
+            )
+            db.commit()
+        return {"user_id": user_id, "email": target["email"], "nickname": target["nickname"], "role": role, "status": "active"}
+
+    def remove_workspace_member(self, context: SessionContext, user_id: str) -> dict:
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            access = self._workspace_access_row(db, context.user_id, context.workspace_id)
+            self._check_workspace_permission(access, context.workspace_id, "workspace.manage")
+            target = db.execute("""
+                SELECT * FROM workspace_members
+                WHERE workspace_id=? AND user_id=? AND status='active'
+            """, (context.workspace_id, user_id)).fetchone()
+            if target is None:
+                raise FileNotFoundError(user_id)
+            if target["role"] == "owner":
+                raise ValueError("transfer ownership before removing the owner")
+            changed = now_iso()
+            db.execute("""
+                UPDATE workspace_members SET status='suspended',is_default=0,updated_at=?
+                WHERE workspace_id=? AND user_id=?
+            """, (changed, context.workspace_id, user_id))
+            remaining = db.execute("""
+                SELECT 1 FROM workspace_members
+                WHERE organization_id=? AND user_id=? AND status='active' LIMIT 1
+            """, (target["organization_id"], user_id)).fetchone()
+            if remaining is None:
+                db.execute("""
+                    UPDATE organization_members SET status='suspended',updated_at=?
+                    WHERE organization_id=? AND user_id=?
+                """, (changed, target["organization_id"], user_id))
+            db.execute(
+                "DELETE FROM sessions WHERE user_id=? AND current_workspace_id=?",
+                (user_id, context.workspace_id),
+            )
+            db.execute(
+                "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
+                (uuid.uuid4().hex, context.user_id, "workspace.member_remove", "workspace", context.workspace_id,
+                 json.dumps({"user_id": user_id, "old_role": target["role"]}), changed),
+            )
+            db.commit()
+        return {"user_id": user_id, "status": "suspended"}
+
+    def transfer_workspace_owner(self, context: SessionContext, user_id: str) -> dict:
+        if user_id == context.user_id:
+            raise ValueError("target user is already the owner")
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            access = self._workspace_access_row(db, context.user_id, context.workspace_id)
+            self._check_workspace_permission(access, context.workspace_id, "workspace.manage")
+            if access["organization_kind"] != "team":
+                raise ValueError("personal workspace ownership cannot be transferred")
+            if access["workspace_role"] != "owner":
+                raise PermissionError("workspace.manage")
+            target = self._workspace_access_row(db, user_id, context.workspace_id)
+            self._check_workspace_permission(target, context.workspace_id, "wiki.read")
+            changed = now_iso()
+            db.execute("""
+                UPDATE workspace_members SET role='editor',updated_at=?
+                WHERE workspace_id=? AND user_id=?
+            """, (changed, context.workspace_id, context.user_id))
+            db.execute("""
+                UPDATE workspace_members SET role='owner',updated_at=?
+                WHERE workspace_id=? AND user_id=?
+            """, (changed, context.workspace_id, user_id))
+            db.execute("UPDATE workspaces SET owner_id=?,updated_at=? WHERE id=?", (
+                user_id, changed, context.workspace_id,
+            ))
+            db.execute("""
+                UPDATE organization_members SET role='owner',updated_at=?
+                WHERE organization_id=? AND user_id=?
+            """, (changed, access["organization_id"], user_id))
+            other_owned = db.execute("""
+                SELECT 1 FROM workspace_members
+                WHERE organization_id=? AND user_id=? AND role='owner' AND status='active' LIMIT 1
+            """, (access["organization_id"], context.user_id)).fetchone()
+            if other_owned is None:
+                db.execute("""
+                    UPDATE organization_members SET role='member',updated_at=?
+                    WHERE organization_id=? AND user_id=?
+                """, (changed, access["organization_id"], context.user_id))
+            db.execute(
+                "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
+                (uuid.uuid4().hex, context.user_id, "workspace.owner_transfer", "workspace", context.workspace_id,
+                 json.dumps({"old_owner_id": context.user_id, "new_owner_id": user_id, "reason": "manual_transfer"}), changed),
+            )
+            self._notify(
+                db, user_id, "workspace_owner_transfer", "workspace", context.workspace_id,
+                "你已成为团队空间 Owner", f"你现在负责管理 {access['display_name']}。",
+            )
+            db.commit()
+        return {"workspace_id": context.workspace_id, "old_owner_id": context.user_id, "new_owner_id": user_id}
+
+    def switch_workspace(self, token: str, context: SessionContext, workspace_id: str) -> SessionContext:
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            target = self._workspace_access_row(db, context.user_id, workspace_id)
+            self._check_workspace_permission(target, workspace_id, "wiki.read")
+            if db.execute("""
+                UPDATE sessions SET current_workspace_id=?
+                WHERE token_hash=? AND user_id=? AND expires_at>?
+            """, (workspace_id, hash_token(token), context.user_id, now_iso())).rowcount != 1:
+                raise FileNotFoundError("session")
+            db.execute(
+                "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
+                (uuid.uuid4().hex, context.user_id, "session.workspace_switch", "workspace", workspace_id,
+                 json.dumps({"from_workspace_id": context.workspace_id}), now_iso()),
+            )
+            db.commit()
+        selected = self.resolve_session(token)
+        if selected is None:
+            raise RuntimeError("workspace switch failed")
+        return selected
+
+    def rename_workspace(self, context: SessionContext, display_name: str) -> dict:
+        display_name = self._validate_workspace_name(display_name)
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            access = self._workspace_access_row(db, context.user_id, context.workspace_id)
+            self._check_workspace_permission(access, context.workspace_id, "workspace.manage")
+            changed = now_iso()
+            db.execute(
+                "UPDATE workspaces SET display_name=?,updated_at=? WHERE id=?",
+                (display_name, changed, context.workspace_id),
+            )
+            if access["organization_kind"] == "team":
+                db.execute(
+                    "UPDATE organizations SET display_name=?,updated_at=? WHERE id=?",
+                    (display_name, changed, access["organization_id"]),
+                )
+            db.execute(
+                "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
+                (uuid.uuid4().hex, context.user_id, "workspace.rename", "workspace", context.workspace_id,
+                 json.dumps({"old_name": access["display_name"], "new_name": display_name}, ensure_ascii=False), changed),
+            )
+            db.commit()
+        return {"id": context.workspace_id, "display_name": display_name}
+
+    @staticmethod
+    def _platform_payload_hash(data: dict) -> str:
+        encoded = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def run_platform_idempotent(
+        self, scope: str, endpoint: str, key: str, data: dict, action,
+    ) -> tuple[dict, bool]:
+        """Commit the platform mutation and its replay record in one transaction."""
+        payload_hash = self._platform_payload_hash(data)
+        with self._lock:
+            db = self._new_connection()
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    "SELECT * FROM platform_idempotency WHERE scope=? AND endpoint=? AND key=?",
+                    (scope, endpoint, key),
+                ).fetchone()
+                if row is not None:
+                    if row["payload_hash"] != payload_hash:
+                        raise PlatformIdempotencyError("Idempotency-Key was already used with a different request")
+                    if row["status"] != "done":
+                        raise PlatformIdempotencyError("request with this Idempotency-Key is still in progress")
+                    db.commit()
+                    return json.loads(row["response_json"]), True
+                changed = now_iso()
+                db.execute(
+                    "INSERT INTO platform_idempotency VALUES(?,?,?,?,'running',NULL,?,?)",
+                    (scope, endpoint, key, payload_hash, changed, changed),
+                )
+                self._transaction_context.connection = db
+                response = action()
+                db.execute("""
+                    UPDATE platform_idempotency SET status='done',response_json=?,updated_at=?
+                    WHERE scope=? AND endpoint=? AND key=? AND status='running'
+                """, (json.dumps(response, ensure_ascii=False), now_iso(), scope, endpoint, key))
+                db.commit()
+                return response, False
+            except BaseException:
+                db.rollback()
+                raise
+            finally:
+                self._transaction_context.connection = None
+                db.close()
 
     def revoke_session(self, token: str) -> None:
         with self.connect() as db:

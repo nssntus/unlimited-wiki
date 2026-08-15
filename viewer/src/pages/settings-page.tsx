@@ -16,6 +16,7 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
+import { useSession } from "@/features/session-context"
 
 type Status = { configured: boolean; provider: string | null; model: string | null; web_fake_ip_allowed: boolean; network: string; queue: { active: number } }
 type ModelCatalog = { models: string[] }
@@ -29,9 +30,12 @@ const providers = [
 ]
 
 export function SettingsPage() {
+  const { hasPermission } = useSession()
+  const canManageModel = hasPermission("model.manage")
+  const canManageWorkspace = hasPermission("workspace.manage")
   const client = useQueryClient()
   const status = useQuery({ queryKey: queryKeys.status, queryFn: () => apiGet<Status>("/api/status") })
-  const settings = useQuery({ queryKey: queryKeys.modelSettings, queryFn: () => apiGet<ModelSettings>("/api/settings/model") })
+  const settings = useQuery({ queryKey: queryKeys.modelSettings, queryFn: () => apiGet<ModelSettings>("/api/settings/model"), enabled: canManageModel })
   const [form, setForm] = useState<ModelForm>({})
   const [models, setModels] = useState<string[]>([])
   const [showKey, setShowKey] = useState(false)
@@ -81,15 +85,15 @@ export function SettingsPage() {
   const canSave = Boolean(canConnect && model)
 
   return <PageFrame><div className="mx-auto max-w-3xl"><PageTitle eyebrow="本地运行" title="设置" description="模型凭据保存在本机，不会出现在状态接口、任务记录或日志中。" />
-    {settings.isLoading || status.isLoading ? <Skeleton className="h-96 w-full" /> : <div className="flex flex-col gap-10">
-      <FieldSet><FieldLegend>模型连接</FieldLegend><FieldGroup>
+    {(canManageModel && settings.isLoading) || status.isLoading ? <Skeleton className="h-96 w-full" /> : <div className="flex flex-col gap-10">
+      {canManageModel && <><FieldSet><FieldLegend>模型连接</FieldLegend><FieldGroup>
         <Field><FieldLabel>提供商</FieldLabel><Select value={provider} onValueChange={selectProvider}><SelectTrigger className="w-full"><SelectValue placeholder="选择模型提供商" /></SelectTrigger><SelectContent><SelectGroup>{providers.map((item) => <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>
         <Field><FieldLabel htmlFor="model-base-url">Base URL</FieldLabel><Input id="model-base-url" type="url" value={baseUrl} placeholder="http://127.0.0.1:8000/v1" onChange={(event) => { setForm((current) => ({ ...current, base_url: event.target.value, model: "" })); setModels([]) }} /><FieldDescription>支持 HTTP 和 HTTPS；URL 中不能包含用户名或密码。</FieldDescription></Field>
         <Field><FieldLabel htmlFor="model-api-key">API Key</FieldLabel><InputGroup><InputGroupInput id="model-api-key" type={showKey ? "text" : "password"} value={apiKey} placeholder={settings.data?.has_api_key ? "已保存，留空保持不变" : "本地模型可留空"} autoComplete="new-password" onChange={(event) => setForm((current) => ({ ...current, api_key: event.target.value }))} /><InputGroupAddon align="inline-end"><InputGroupButton aria-label={showKey ? "隐藏 API Key" : "显示 API Key"} onClick={() => setShowKey((current) => !current)}>{showKey ? <EyeOffIcon /> : <EyeIcon />}</InputGroupButton></InputGroupAddon></InputGroup><FieldDescription>保存后不会再次回显 Key。</FieldDescription></Field>
         <Field><FieldLabel>模型</FieldLabel>{models.length ? <Select value={model} onValueChange={(value) => value && setForm((current) => ({ ...current, model: value }))}><SelectTrigger className="w-full"><SelectValue placeholder="选择模型" /></SelectTrigger><SelectContent><SelectGroup>{modelOptions.map((item) => <SelectItem key={item} value={item}>{item}</SelectItem>)}</SelectGroup></SelectContent></Select> : <Input value={model} placeholder="先加载模型，或输入模型 ID" onChange={(event) => setForm((current) => ({ ...current, model: event.target.value }))} />}<div className="mt-2 flex justify-start"><Button type="button" size="sm" variant="outline" disabled={!canConnect || loadModels.isPending} onClick={() => loadModels.mutate()}>{loadModels.isPending ? <Spinner data-icon="inline-start" /> : <RefreshCwIcon data-icon="inline-start" />}加载模型</Button></div>{loadModels.isError && <FieldError>{loadModels.error.message}</FieldError>}</Field>
       </FieldGroup><div className="mt-6 flex justify-end"><Button disabled={!canSave || save.isPending} onClick={() => save.mutate()}>{save.isPending ? <Spinner data-icon="inline-start" /> : <SaveIcon data-icon="inline-start" />}保存模型配置</Button></div></FieldSet>
 
-      {baseUrl.toLowerCase().startsWith("http://") && <Alert variant="destructive"><TriangleAlertIcon /><AlertTitle>模型连接未加密</AlertTitle><AlertDescription>模型请求和 API Key 会通过 HTTP 明文传输。仅连接你信任的服务与网络。</AlertDescription></Alert>}
+      {baseUrl.toLowerCase().startsWith("http://") && <Alert variant="destructive"><TriangleAlertIcon /><AlertTitle>模型连接未加密</AlertTitle><AlertDescription>模型请求和 API Key 会通过 HTTP 明文传输。仅连接你信任的服务与网络。</AlertDescription></Alert>}</>}
 
       <FieldSet><FieldLegend>运行状态</FieldLegend><FieldGroup>
         <Field orientation="responsive"><FieldLabel>模型</FieldLabel><div className="flex items-center gap-2"><StatusBadge value={status.data?.configured ? "已配置" : "未配置"} kind={status.data?.configured ? "good" : "warn"} /><span className="text-sm text-muted-foreground">{status.data?.model || "本地摘录模式"}</span></div></Field>
@@ -98,7 +102,7 @@ export function SettingsPage() {
       </FieldGroup></FieldSet>
 
       <FieldSet><FieldLegend>账号与数据</FieldLegend><FieldGroup>
-        <Field orientation="responsive"><div><FieldLabel>导出私有空间</FieldLabel><FieldDescription>ZIP 只包含 Wiki 正本与 Raw 原料，不包含会话或模型密钥。</FieldDescription></div><Button variant="outline" render={<a href="/api/account/export" download />}><DownloadIcon data-icon="inline-start" />下载导出</Button></Field>
+        {canManageWorkspace && <Field orientation="responsive"><div><FieldLabel>导出私有空间</FieldLabel><FieldDescription>ZIP 只包含 Wiki 正本与 Raw 原料，不包含会话或模型密钥。</FieldDescription></div><Button variant="outline" render={<a href="/api/account/export" download />}><DownloadIcon data-icon="inline-start" />下载导出</Button></Field>}
         <Field orientation="responsive"><div><FieldLabel>撤销全部会话</FieldLabel><FieldDescription>包括当前设备在内的所有登录会立即失效。</FieldDescription></div><Button variant="outline" disabled={revokeSessions.isPending} onClick={() => revokeSessions.mutate()}><LogOutIcon data-icon="inline-start" />全部退出</Button></Field>
         <Field><FieldLabel htmlFor="delete-account-password">删除账号</FieldLabel><FieldDescription>将撤回公开内容并删除私有空间和模型配置。请输入当前密码确认。</FieldDescription><Input id="delete-account-password" type="password" autoComplete="current-password" value={deletePassword} onChange={(event) => setDeletePassword(event.target.value)} /><div className="mt-2 flex justify-end"><Button variant="destructive" disabled={!deletePassword || deleteAccount.isPending} onClick={() => deleteAccount.mutate()}><Trash2Icon data-icon="inline-start" />永久删除账号</Button></div></Field>
       </FieldGroup></FieldSet>

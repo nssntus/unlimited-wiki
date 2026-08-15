@@ -18,6 +18,7 @@ import {
   WorkflowIcon,
   ListChecksIcon,
   RefreshCcwDotIcon,
+  UsersIcon,
 } from "lucide-react"
 
 import { apiGet, type ArticleSummary, type Category, type Notification, queryKeys } from "@/lib/api"
@@ -44,18 +45,20 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { GlobalSearch } from "@/features/global-search"
 import { useSession } from "@/features/session-context"
+import { WorkspaceSwitcher } from "@/features/workspace-switcher"
 
 const routes = [
-  ["/inbox", "原料箱", InboxIcon],
-  ["/classification", "待归类", ListChecksIcon],
-  ["/categories", "分类管理", FolderCogIcon],
-  ["/reconciliation", "文件对账", RefreshCcwDotIcon],
-  ["/todo", "待写概念", ListTodoIcon],
-  ["/health", "健康检查", CheckCircle2Icon],
-  ["/tasks", "任务", WorkflowIcon],
-  ["/submissions", "我的投稿", SendIcon],
-  ["/notifications", "通知", BellIcon],
-  ["/settings", "设置", Settings2Icon],
+  ["/inbox", "原料箱", InboxIcon, "wiki.write"],
+  ["/classification", "待归类", ListChecksIcon, "wiki.write"],
+  ["/categories", "分类管理", FolderCogIcon, "wiki.write"],
+  ["/reconciliation", "文件对账", RefreshCcwDotIcon, "wiki.write"],
+  ["/todo", "待写概念", ListTodoIcon, "wiki.write"],
+  ["/health", "健康检查", CheckCircle2Icon, "wiki.read"],
+  ["/tasks", "任务", WorkflowIcon, "wiki.read"],
+  ["/submissions", "我的投稿", SendIcon, "wiki.write"],
+  ["/notifications", "通知", BellIcon, "wiki.read"],
+  ["/workspace", "团队与空间", UsersIcon, "wiki.read"],
+  ["/settings", "设置", Settings2Icon, "wiki.read"],
 ] as const
 
 function articleHref(path: string) {
@@ -65,7 +68,7 @@ function articleHref(path: string) {
 export function WikiShell() {
   const location = useLocation()
   const [searchOpen, setSearchOpen] = useState(false)
-  const { session, signOut } = useSession()
+  const { session, signOut, hasPermission } = useSession()
   const articles = useQuery({ queryKey: queryKeys.articles, queryFn: () => apiGet<ArticleSummary[]>("/api/articles") })
   const categories = useQuery({ queryKey: queryKeys.categories, queryFn: () => apiGet<Category[]>("/api/categories") })
   const notifications = useQuery({ queryKey: queryKeys.notifications, queryFn: () => apiGet<Notification[]>("/api/notifications"), refetchInterval: 15000 })
@@ -79,6 +82,7 @@ export function WikiShell() {
             <span className="flex size-8 items-center justify-center rounded-md bg-primary text-primary-foreground"><ArchiveIcon /></span>
             <span className="text-base">知库</span>
           </Link>
+          <WorkspaceSwitcher />
           <div className="grid grid-cols-2 gap-2"><Button size="sm" variant="outline" render={<Link to="/square" />}><StoreIcon data-icon="inline-start" />广场</Button>{session?.user?.role === "admin" ? <Button size="sm" variant="outline" render={<Link to="/admin/reviews" />}><ShieldCheckIcon data-icon="inline-start" />审核</Button> : <span />}</div>
           <Button variant="outline" className="w-full justify-start text-muted-foreground" onClick={() => setSearchOpen(true)}>
             <SearchIcon data-icon="inline-start" />搜索标题、别名或正文
@@ -91,7 +95,7 @@ export function WikiShell() {
               <SidebarGroupLabel>治理</SidebarGroupLabel>
               <SidebarGroupContent>
                 <SidebarMenu>
-                  {routes.map(([to, label, Icon]) => (
+                  {routes.filter(([, , , permission]) => hasPermission(permission)).map(([to, label, Icon]) => (
                     <SidebarMenuItem key={to}>
                       <SidebarMenuButton render={<Link to={to} />} isActive={location.pathname === to} tooltip={label}>
                         <Icon /><span>{label}</span>

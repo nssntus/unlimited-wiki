@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import json
 import os
 import re
@@ -188,6 +189,9 @@ class WikiService:
         remote_search: Callable[..., list[dict]] | None = None,
         start_worker: bool = True,
         remote_task_kinds: set[str] | None = None,
+        authorize_actor: Callable[[str], bool] | None = None,
+        actor_guard: Callable[[str], object] | None = None,
+        require_task_actor: bool = False,
     ):
         self.root = project_root.resolve()
         (self.root / "wiki").mkdir(exist_ok=True)
@@ -199,6 +203,10 @@ class WikiService:
         self.llm = llm_config or LLMConfig()
         self.remote_search = remote_search or websearch.search_sources
         self.remote_task_kinds = remote_task_kinds
+        self.authorize_actor = authorize_actor
+        self.actor_guard = actor_guard
+        self.require_task_actor = require_task_actor
+        self._request_context = threading.local()
         self._stop = threading.Event()
         self._intent_lock = threading.RLock()
         self._wake = threading.Event()
@@ -217,6 +225,41 @@ class WikiService:
         with self._intent_lock:
             self.llm = config
         self._wake.set()
+
+    def set_request_actor(self, user_id: str | None) -> None:
+        self._request_context.actor_user_id = user_id
+
+    def _request_actor(self) -> str | None:
+        return getattr(self._request_context, "actor_user_id", None)
+
+    def _actor_is_authorized(self, task: dict) -> bool:
+        actor = task.get("actor_user_id")
+        if not actor:
+            return not self.require_task_actor
+        if self.authorize_actor is None:
+            return True
+        try:
+            return bool(self.authorize_actor(actor))
+        except (FileNotFoundError, PermissionError):
+            return False
+
+    @contextlib.contextmanager
+    def _guard_task_actor(self, task: dict):
+        actor = task.get("actor_user_id")
+        if not actor:
+            yield not self.require_task_actor
+            return
+        if self.actor_guard is not None:
+            stack = contextlib.ExitStack()
+            try:
+                stack.enter_context(self.actor_guard(actor))
+            except (FileNotFoundError, PermissionError):
+                yield False
+                return
+            with stack:
+                yield True
+            return
+        yield True
 
     def categories(self) -> list[dict]:
         registry = dc.load_registry(self.root)
@@ -501,7 +544,9 @@ class WikiService:
             "needs_llm": needs_llm,
         }
         if needs_remote or needs_llm:
-            task, _created = self.state.enqueue_task(task_kind, term, task_payload, staged=True)
+            task, _created = self.state.enqueue_task(
+                task_kind, term, task_payload, staged=True, actor_user_id=self._request_actor(),
+            )
         evidence_status = "待补证" if needs_remote else "本地已核验"
         md = self._draft_markdown(term, preflight["excerpts"], rel, category, task_id=task["id"] if task else None, evidence_status=evidence_status)
         md = dc.ensure_article_metadata(md, category_id=None, status="pending")
@@ -694,6 +739,7 @@ class WikiService:
             "raw-classification-plan",
             f"{raw_path}:{raw_revision}:{registry['revision']}",
             {"raw_path": raw_path, "raw_revision": raw_revision, "taxonomy_revision": registry["revision"]},
+            actor_user_id=self._request_actor(),
         )
         self.state.save_raw_classification_plan(raw_path, raw_revision, registry["revision"], "queued", task_id=task["id"])
         self._wake.set()
@@ -869,6 +915,7 @@ class WikiService:
                     "base_revision": article["revision"],
                     "trigger": "raw_ingest",
                 },
+                actor_user_id=self._request_actor(),
             )
             self._wake.set()
         classification_task = self.enqueue_classification(article) if article and disposition in {"seed", "new"} else None
@@ -970,7 +1017,7 @@ class WikiService:
         payload = dict(task["payload"])
         if payload.get("path"):
             payload["base_revision"] = self.read_article(str(payload["path"]))["revision"]
-        task = self.state.retry_task(task_id, payload=payload)
+        task = self.state.retry_task(task_id, payload=payload, actor_user_id=self._request_actor())
         self._wake.set()
         return task
 
@@ -991,6 +1038,7 @@ class WikiService:
                 "governance",
                 rel,
                 {"path": rel, "base_revision": article["revision"]},
+                actor_user_id=self._request_actor(),
             )
             tasks.append(task)
             queued += int(created)
@@ -998,7 +1046,7 @@ class WikiService:
             self._wake.set()
         return {"queued": queued, "tasks": tasks}
 
-    def enqueue_classification(self, article: dict) -> dict | None:
+    def enqueue_classification(self, article: dict, *, actor_user_id: str | None = None) -> dict | None:
         article_id = article.get("article_id")
         if not article_id:
             raise ValueError("article has no stable id")
@@ -1019,6 +1067,7 @@ class WikiService:
                 "article_revision": article["revision"],
                 "taxonomy_revision": registry["revision"],
             },
+            actor_user_id=actor_user_id if actor_user_id is not None else self._request_actor(),
         )
         self.state.save_classification_suggestion(
             article_id, article["revision"], registry["revision"], "queued", task_id=task["id"]
@@ -1547,6 +1596,8 @@ class WikiService:
                 self._wake.clear()
                 continue
             try:
+                if not self._actor_is_authorized(task):
+                    raise RemoteError("auth_revoked", "The task initiator no longer has write access.", retryable=False)
                 result = self._run_remote_task(task)
                 self._finalize_remote_result(task, result)
             except RemoteError as exc:
@@ -1589,9 +1640,28 @@ class WikiService:
                     )
 
     def _finalize_remote_result(self, task: dict, result: dict) -> dict:
-        with self._intent_lock:
+        with self._intent_lock, self._guard_task_actor(task) as actor_authorized:
             current_task = self.state.get_task(task["id"])
             if current_task["status"] != "running" or current_task["attempts"] != task["attempts"]:
+                return current_task
+            if not actor_authorized:
+                current_task = self.state.fail_task(
+                    task["id"], "auth_revoked", "The task initiator no longer has write access.",
+                    retry=False, expected_attempt=task["attempts"],
+                )
+                if current_task["status"] == "failed" and current_task["attempts"] == task["attempts"]:
+                    if task["kind"] == "article-classification":
+                        self.state.save_classification_suggestion(
+                            task["payload"]["article_id"], task["payload"]["article_revision"],
+                            task["payload"]["taxonomy_revision"], "failed", task_id=task["id"],
+                            error_type="auth_revoked", error_message="The task initiator no longer has write access.",
+                        )
+                    elif task["kind"] == "raw-classification-plan":
+                        self.state.save_raw_classification_plan(
+                            task["payload"]["raw_path"], task["payload"]["raw_revision"],
+                            task["payload"]["taxonomy_revision"], "failed", task_id=task["id"],
+                            error_type="auth_revoked", error_message="The task initiator no longer has write access.",
+                        )
                 return current_task
             payload = task["payload"]
             stale = bool(result.get("stale"))
@@ -1717,19 +1787,22 @@ class WikiService:
         quality = wiki_ops.article_quality_issues(self.root, payload["path"], proposal, extra_paths=set(raw_changes))
         if quality:
             raise RemoteError("quality_gate", "AI output failed quality checks: " + "; ".join(quality), retryable=False)
-        latest = self.read_article(payload["path"])
-        if latest["revision"] != base_revision:
-            return {"conflict": True, "path": payload["path"], "proposal": proposal, "reason": "article_changed"}
-        if self.state.get_task(task["id"])["status"] == "cancelled":
-            return {"cancelled": True, "path": payload["path"]}
-        operation_id = f"task-{task['id']}"
-        log_path = self.root / "wiki" / "log.md"
-        changes = {**raw_changes, f"wiki/{payload['path']}": proposal, "wiki/index.md": render_index(self.root, {f"wiki/{payload['path']}": proposal})}
-        changes["wiki/log.md"] = append_log_text(log_path.read_text(encoding="utf-8") if log_path.exists() else "", operation_id=operation_id, kind="remote-complete", title=payload["keyword"])
-        self.files.commit(changes, kind="remote-complete", metadata={"task": task["id"], "path": payload["path"]}, operation_id=operation_id)
-        completed = self.read_article(payload["path"])
-        if completed.get("classification_status") == "pending":
-            self.enqueue_classification(completed)
+        with self._intent_lock, self._guard_task_actor(task) as actor_authorized:
+            if not actor_authorized:
+                raise RemoteError("auth_revoked", "The task initiator no longer has write access.", retryable=False)
+            latest = self.read_article(payload["path"])
+            if latest["revision"] != base_revision:
+                return {"conflict": True, "path": payload["path"], "proposal": proposal, "reason": "article_changed"}
+            if self.state.get_task(task["id"])["status"] == "cancelled":
+                return {"cancelled": True, "path": payload["path"]}
+            operation_id = f"task-{task['id']}"
+            log_path = self.root / "wiki" / "log.md"
+            changes = {**raw_changes, f"wiki/{payload['path']}": proposal, "wiki/index.md": render_index(self.root, {f"wiki/{payload['path']}": proposal})}
+            changes["wiki/log.md"] = append_log_text(log_path.read_text(encoding="utf-8") if log_path.exists() else "", operation_id=operation_id, kind="remote-complete", title=payload["keyword"])
+            self.files.commit(changes, kind="remote-complete", metadata={"task": task["id"], "path": payload["path"]}, operation_id=operation_id)
+            completed = self.read_article(payload["path"])
+            if completed.get("classification_status") == "pending":
+                self.enqueue_classification(completed, actor_user_id=task.get("actor_user_id"))
         return {"conflict": False, "path": payload["path"], "operation_id": operation_id, "raw_paths": list(raw_changes)}
 
     def _run_raw_classification_plan(self, task: dict) -> dict:
@@ -1926,22 +1999,27 @@ class WikiService:
         quality = wiki_ops.article_quality_issues(self.root, current["path"], proposal)
         if quality:
             raise RemoteError("quality_gate", "AI output failed quality checks: " + "; ".join(quality), retryable=False)
-        latest = self.read_article(current["path"])
-        if latest["revision"] != payload["base_revision"]:
-            return {"conflict": True, "path": current["path"], "proposal": proposal, "reason": "article_changed"}
-        operation_id = f"govern-{task['id']}"
-        log_path = self.root / "wiki" / "log.md"
-        changes = {
-            f"wiki/{current['path']}": proposal,
-            "wiki/index.md": render_index(self.root, {f"wiki/{current['path']}": proposal}),
-            "wiki/log.md": append_log_text(
-                log_path.read_text(encoding="utf-8") if log_path.exists() else "",
-                operation_id=operation_id,
-                kind="ai-govern",
-                title=current["title"],
-            ),
-        }
-        self.files.commit(changes, kind="ai-govern", metadata={"task": task["id"], "path": current["path"]}, operation_id=operation_id)
+        with self._intent_lock, self._guard_task_actor(task) as actor_authorized:
+            if not actor_authorized:
+                raise RemoteError("auth_revoked", "The task initiator no longer has write access.", retryable=False)
+            latest = self.read_article(current["path"])
+            if latest["revision"] != payload["base_revision"]:
+                return {"conflict": True, "path": current["path"], "proposal": proposal, "reason": "article_changed"}
+            if self.state.get_task(task["id"])["status"] == "cancelled":
+                return {"cancelled": True, "path": current["path"]}
+            operation_id = f"govern-{task['id']}"
+            log_path = self.root / "wiki" / "log.md"
+            changes = {
+                f"wiki/{current['path']}": proposal,
+                "wiki/index.md": render_index(self.root, {f"wiki/{current['path']}": proposal}),
+                "wiki/log.md": append_log_text(
+                    log_path.read_text(encoding="utf-8") if log_path.exists() else "",
+                    operation_id=operation_id,
+                    kind="ai-govern",
+                    title=current["title"],
+                ),
+            }
+            self.files.commit(changes, kind="ai-govern", metadata={"task": task["id"], "path": current["path"]}, operation_id=operation_id)
         return {"conflict": False, "path": current["path"], "operation_id": operation_id}
 
     def _call_governance_llm(self, article: dict) -> str:
