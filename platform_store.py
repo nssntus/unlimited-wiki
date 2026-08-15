@@ -720,6 +720,7 @@ class PlatformStore:
                 JOIN users user ON user.id=workspace_member.user_id
                 WHERE workspace_member.user_id=? AND workspace_member.status='active'
                   AND organization_member.status='active' AND user.status='active'
+                  AND workspace.status='active' AND organization.status='active'
                 ORDER BY CASE organization.kind WHEN 'personal' THEN 0 ELSE 1 END,
                          workspace.created_at,workspace.id
             """, (context.user_id,)).fetchall()
@@ -736,10 +737,14 @@ class PlatformStore:
         display_name = self._validate_workspace_name(display_name)
         organization_id, workspace_id = uuid.uuid4().hex, uuid.uuid4().hex
         root = self.workspace_root(workspace_id)
-        (root / "wiki").mkdir(parents=True)
-        (root / "raw").mkdir()
         created = now_iso()
+        created_root = False
         try:
+            root.mkdir()
+            created_root = True
+            self._register_transaction_rollback(lambda: shutil.rmtree(root) if root.exists() else None)
+            (root / "wiki").mkdir()
+            (root / "raw").mkdir()
             with self._lock, self.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
                 user = db.execute(
@@ -774,7 +779,7 @@ class PlatformStore:
                 )
                 db.commit()
         except BaseException:
-            if root.exists():
+            if created_root and root.exists():
                 shutil.rmtree(root)
             raise
         with self.connect() as db:
@@ -1110,6 +1115,7 @@ class PlatformStore:
         payload_hash = self._platform_payload_hash(data)
         with self._lock:
             db = self._new_connection()
+            self._transaction_context.rollback_callbacks = []
             try:
                 db.execute("BEGIN IMMEDIATE")
                 row = db.execute(
@@ -1138,10 +1144,18 @@ class PlatformStore:
                 return response, False
             except BaseException:
                 db.rollback()
+                for callback in reversed(self._transaction_context.rollback_callbacks):
+                    callback()
                 raise
             finally:
                 self._transaction_context.connection = None
+                self._transaction_context.rollback_callbacks = None
                 db.close()
+
+    def _register_transaction_rollback(self, callback) -> None:
+        callbacks = getattr(self._transaction_context, "rollback_callbacks", None)
+        if callbacks is not None:
+            callbacks.append(callback)
 
     def revoke_session(self, token: str) -> None:
         with self.connect() as db:

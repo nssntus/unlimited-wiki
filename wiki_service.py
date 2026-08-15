@@ -1013,13 +1013,14 @@ class WikiService:
         return manifest
 
     def retry_task(self, task_id: str) -> dict:
-        task = self.state.get_task(task_id)
-        payload = dict(task["payload"])
-        if payload.get("path"):
-            payload["base_revision"] = self.read_article(str(payload["path"]))["revision"]
-        task = self.state.retry_task(task_id, payload=payload, actor_user_id=self._request_actor())
-        self._wake.set()
-        return task
+        with self._intent_lock:
+            task = self.state.get_task(task_id)
+            payload = dict(task["payload"])
+            if payload.get("path"):
+                payload["base_revision"] = self.read_article(str(payload["path"]))["revision"]
+            task = self.state.retry_task(task_id, payload=payload, actor_user_id=self._request_actor())
+            self._wake.set()
+            return task
 
     def cancel_task(self, task_id: str) -> dict:
         with self._intent_lock:
@@ -1793,17 +1794,29 @@ class WikiService:
             latest = self.read_article(payload["path"])
             if latest["revision"] != base_revision:
                 return {"conflict": True, "path": payload["path"], "proposal": proposal, "reason": "article_changed"}
-            if self.state.get_task(task["id"])["status"] == "cancelled":
-                return {"cancelled": True, "path": payload["path"]}
-            operation_id = f"task-{task['id']}"
+            current_task = self.state.get_task(task["id"])
+            if current_task["status"] != "running" or current_task["attempts"] != task["attempts"]:
+                return {"superseded": True, "path": payload["path"]}
+            operation_id = f"task-{task['id']}-attempt-{task['attempts']}"
             log_path = self.root / "wiki" / "log.md"
             changes = {**raw_changes, f"wiki/{payload['path']}": proposal, "wiki/index.md": render_index(self.root, {f"wiki/{payload['path']}": proposal})}
             changes["wiki/log.md"] = append_log_text(log_path.read_text(encoding="utf-8") if log_path.exists() else "", operation_id=operation_id, kind="remote-complete", title=payload["keyword"])
             self.files.commit(changes, kind="remote-complete", metadata={"task": task["id"], "path": payload["path"]}, operation_id=operation_id)
+            result = {"conflict": False, "path": payload["path"], "operation_id": operation_id, "raw_paths": list(raw_changes)}
+            try:
+                finalized = self.state.complete_task(task["id"], result, expected_attempt=task["attempts"])
+            except BaseException:
+                current_task = self.state.get_task(task["id"])
+                if current_task["status"] != "succeeded" or current_task["attempts"] != task["attempts"]:
+                    self.files.rollback(operation_id)
+                raise
+            if finalized["status"] != "succeeded" or finalized["attempts"] != task["attempts"]:
+                self.files.rollback(operation_id)
+                return {"superseded": True, "path": payload["path"]}
             completed = self.read_article(payload["path"])
             if completed.get("classification_status") == "pending":
                 self.enqueue_classification(completed, actor_user_id=task.get("actor_user_id"))
-        return {"conflict": False, "path": payload["path"], "operation_id": operation_id, "raw_paths": list(raw_changes)}
+            return result
 
     def _run_raw_classification_plan(self, task: dict) -> dict:
         payload = task["payload"]
@@ -2005,9 +2018,10 @@ class WikiService:
             latest = self.read_article(current["path"])
             if latest["revision"] != payload["base_revision"]:
                 return {"conflict": True, "path": current["path"], "proposal": proposal, "reason": "article_changed"}
-            if self.state.get_task(task["id"])["status"] == "cancelled":
-                return {"cancelled": True, "path": current["path"]}
-            operation_id = f"govern-{task['id']}"
+            current_task = self.state.get_task(task["id"])
+            if current_task["status"] != "running" or current_task["attempts"] != task["attempts"]:
+                return {"superseded": True, "path": current["path"]}
+            operation_id = f"govern-{task['id']}-attempt-{task['attempts']}"
             log_path = self.root / "wiki" / "log.md"
             changes = {
                 f"wiki/{current['path']}": proposal,
@@ -2020,7 +2034,18 @@ class WikiService:
                 ),
             }
             self.files.commit(changes, kind="ai-govern", metadata={"task": task["id"], "path": current["path"]}, operation_id=operation_id)
-        return {"conflict": False, "path": current["path"], "operation_id": operation_id}
+            result = {"conflict": False, "path": current["path"], "operation_id": operation_id}
+            try:
+                finalized = self.state.complete_task(task["id"], result, expected_attempt=task["attempts"])
+            except BaseException:
+                current_task = self.state.get_task(task["id"])
+                if current_task["status"] != "succeeded" or current_task["attempts"] != task["attempts"]:
+                    self.files.rollback(operation_id)
+                raise
+            if finalized["status"] != "succeeded" or finalized["attempts"] != task["attempts"]:
+                self.files.rollback(operation_id)
+                return {"superseded": True, "path": current["path"]}
+            return result
 
     def _call_governance_llm(self, article: dict) -> str:
         try:

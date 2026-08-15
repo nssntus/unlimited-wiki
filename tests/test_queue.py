@@ -93,3 +93,32 @@ def test_conflicted_task_can_retry_from_current_revision(kb_root: Path):
     assert retried["status"] == "queued"
     assert retried["result"] is None
     assert retried["payload"]["base_revision"] == "current"
+
+
+def test_concurrent_retry_only_one_request_requeues_task(kb_root: Path):
+    state = StateStore(kb_root)
+    task, _ = state.enqueue_task("supplement", "Retry once", {"path": "concepts/base.md"})
+    claimed = state.claim_task()
+    assert claimed and claimed["id"] == task["id"]
+    state.fail_task(task["id"], "model_error", "failed", retry=False, expected_attempt=claimed["attempts"])
+    barrier = threading.Barrier(2)
+    retried: list[dict] = []
+    errors: list[Exception] = []
+
+    def retry() -> None:
+        barrier.wait()
+        try:
+            retried.append(state.retry_task(task["id"]))
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=retry) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert len(retried) == 1
+    assert retried[0]["status"] == "queued"
+    assert len(errors) == 1 and str(errors[0]) == "task cannot be retried"
+    assert state.get_task(task["id"])["status"] == "queued"

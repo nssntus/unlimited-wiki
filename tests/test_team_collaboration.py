@@ -263,6 +263,67 @@ def test_platform_idempotency_rolls_back_business_change_with_claim(team_server)
     assert replay is True and replayed == response
 
 
+def test_create_team_removes_root_when_outer_transaction_rolls_back(team_server):
+    app, base = team_server
+    owner = Client(base)
+    owner.register("team-rollback@example.com", "Rollback Owner")
+    context = context_for(app, owner)
+    before_roots = {path.name for path in app.platform.spaces_root.iterdir()}
+
+    def create_then_fail_serialization():
+        return {"team": app.platform.create_team(context, "Rolled back team"), "invalid": object()}
+
+    with pytest.raises(TypeError):
+        app.platform.run_platform_idempotent(
+            f"user:{context.user_id}", "/api/workspaces", "rollback-team", {"display_name": "Rolled back team"},
+            create_then_fail_serialization,
+        )
+
+    assert {path.name for path in app.platform.spaces_root.iterdir()} == before_roots
+    with app.platform.connect() as db:
+        assert db.execute("SELECT 1 FROM workspaces WHERE display_name='Rolled back team'").fetchone() is None
+        assert db.execute("SELECT 1 FROM organizations WHERE display_name='Rolled back team'").fetchone() is None
+
+
+def test_create_team_removes_partial_root_when_raw_directory_creation_fails(team_server, monkeypatch):
+    app, base = team_server
+    owner = Client(base)
+    owner.register("team-mkdir@example.com", "Mkdir Owner")
+    context = context_for(app, owner)
+    before_roots = {path.name for path in app.platform.spaces_root.iterdir()}
+    real_mkdir = Path.mkdir
+
+    def fail_raw(path: Path, *args, **kwargs):
+        if path.name == "raw" and path.parent.parent == app.platform.spaces_root:
+            raise OSError("simulated raw mkdir failure")
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", fail_raw)
+    with pytest.raises(OSError, match="simulated raw mkdir failure"):
+        app.platform.create_team(context, "Partial team")
+
+    assert {path.name for path in app.platform.spaces_root.iterdir()} == before_roots
+    with app.platform.connect() as db:
+        assert db.execute("SELECT 1 FROM workspaces WHERE display_name='Partial team'").fetchone() is None
+
+
+def test_workspace_list_excludes_inactive_workspace_or_organization(team_server):
+    app, base = team_server
+    owner = Client(base)
+    owner.register("inactive-team@example.com", "Inactive Owner")
+    team = _create_team(owner, "Inactive Team")
+    assert team["id"] in {item["id"] for item in owner.request("GET", "/api/workspaces")[1]}
+
+    with app.platform.connect() as db:
+        db.execute("UPDATE workspaces SET status='suspended' WHERE id=?", (team["id"],))
+    assert team["id"] not in {item["id"] for item in owner.request("GET", "/api/workspaces")[1]}
+
+    with app.platform.connect() as db:
+        db.execute("UPDATE workspaces SET status='active' WHERE id=?", (team["id"],))
+        db.execute("UPDATE organizations SET status='suspended' WHERE id=?", (team["organization_id"],))
+    assert team["id"] not in {item["id"] for item in owner.request("GET", "/api/workspaces")[1]}
+
+
 def test_expired_invitation_is_closed_and_can_be_reissued(team_server):
     app, base = team_server
     owner, member = Client(base), Client(base)
@@ -341,7 +402,7 @@ def test_governance_result_cannot_commit_after_actor_revocation(team_server, mon
     assert not thread.is_alive()
     assert getattr(outcome.get("error"), "code", None) == "auth_revoked"
     assert (service.root / "wiki" / "concepts" / "shared.md").read_bytes() == before
-    assert not (service.root / ".wiki-state" / "history" / f"govern-{task['id']}").exists()
+    assert list(service.files.history_root.glob(f"govern-{task['id']}-attempt-*")) == []
 
 
 def test_revoked_task_actor_cannot_finalize(team_server):

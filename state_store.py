@@ -387,18 +387,27 @@ class StateStore:
     def retry_task(
         self, task_id: str, *, payload: dict | None = None, actor_user_id: str | None = None,
     ) -> dict:
-        task = self.get_task(task_id)
-        retryable_conflict = task["status"] == "succeeded" and bool(task.get("result", {}).get("conflict"))
-        allowed_status = task["status"] in {"failed", "cancelled"} or retryable_conflict
-        if not allowed_status:
-            raise ValueError("task cannot be retried")
-        next_payload = payload or task["payload"]
-        with self.connect() as db:
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise FileNotFoundError(task_id)
+            task = self._task(row)
+            retryable_conflict = task["status"] == "succeeded" and bool(task.get("result", {}).get("conflict"))
+            allowed_status = task["status"] in {"failed", "cancelled"} or retryable_conflict
+            if not allowed_status:
+                raise ValueError("task cannot be retried")
+            next_payload = payload or task["payload"]
             changed = db.execute(
                 """UPDATE tasks SET status='queued', payload_json=?, actor_user_id=?, result_json=NULL,
-                error_type=NULL, error_message=NULL, next_run_at=?, updated_at=? WHERE id=?""",
-                (json.dumps(next_payload, ensure_ascii=False), actor_user_id, now_iso(), now_iso(), task_id),
+                error_type=NULL, error_message=NULL, next_run_at=?, updated_at=?
+                WHERE id=? AND status=? AND attempts=?""",
+                (
+                    json.dumps(next_payload, ensure_ascii=False), actor_user_id, now_iso(), now_iso(),
+                    task_id, task["status"], task["attempts"],
+                ),
             ).rowcount
+            db.commit()
         if not changed:
             raise ValueError("task cannot be retried")
         return self.get_task(task_id)
