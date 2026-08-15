@@ -16,6 +16,8 @@ type SwitchState =
   | { kind: "confirming"; target: string }
   | { kind: "error"; target: string; message: string }
 
+const UNCOMMITTED_SWITCH_STATUSES = new Set([400, 403, 404, 422])
+
 export function SessionProvider({ children }: { children: ReactNode }) {
   const client = useQueryClient()
   const navigate = useNavigate()
@@ -80,7 +82,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     try {
       await apiPost<Session>("/api/workspaces/switch", { workspace_id: workspaceId })
     } catch (error) {
-      if (error instanceof ApiError && error.status >= 400 && error.status < 500) {
+      if (error instanceof ApiError && UNCOMMITTED_SWITCH_STATUSES.has(error.status)) {
         switchingRef.current = false
         setSwitchState({ kind: "idle" })
         throw error
