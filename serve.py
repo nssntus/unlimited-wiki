@@ -205,6 +205,8 @@ class WikiApp:
         if context is None:
             return self.diagnostics
         with self._service_lock:
+            if service.retired or self._services.get(context.workspace_id) is not service:
+                raise FileNotFoundError(context.workspace_id)
             cache = self._diagnostics.get(context.workspace_id)
             if cache is None:
                 cache = DiagnosticCache(service)
@@ -252,6 +254,22 @@ class WikiApp:
                             }
                         close_service = service
                     self._reconcile_workspace_storage(record, service)
+                    response = {
+                        **response,
+                        "status": record["status"],
+                        "can_suspend": response.get("kind") == "team"
+                        and response.get("role") == "owner"
+                        and record["status"] == "active",
+                        "can_restore": response.get("kind") == "team"
+                        and response.get("role") == "owner"
+                        and record["status"] == "suspended",
+                        "can_delete": response.get("kind") == "team"
+                        and response.get("role") == "owner"
+                        and record["status"] == "suspended",
+                        "can_leave": response.get("kind") == "team"
+                        and response.get("role") != "owner"
+                        and record["status"] in {"active", "suspended"},
+                    }
                 return response, replay
         finally:
             if close_service is not None:
@@ -519,7 +537,6 @@ def make_handler(app: WikiApp):
             if self.context is None:
                 return
             self.service = app.workspace_service(self.context)
-            self.diagnostics = app.diagnostics_for(self.context, self.service)
 
         def _require_csrf(self) -> None:
             if app.platform is None:
@@ -563,6 +580,11 @@ def make_handler(app: WikiApp):
             except FileNotFoundError as exc:
                 raise ApiError(409, "workspace selection required", details={"code": "workspace_selection_required"}) from exc
             self._workspace_action = action
+            try:
+                self.diagnostics = app.diagnostics_for(self.context, self.service)
+            except Exception:
+                self._release_workspace_action()
+                raise
 
         def _release_workspace_action(self) -> None:
             action = self._workspace_action
@@ -715,6 +737,14 @@ def make_handler(app: WikiApp):
                 return self._serve_static(path)
 
             service = self._private_service()
+            permission = (
+                "model.manage" if path == "/api/settings/model"
+                else "wiki.write" if path in {"/api/ingest/preview", "/api/operations"}
+                else "wiki.read"
+            )
+            self._enter_workspace_action(permission)
+            if permission == "wiki.write" and self.context is not None:
+                service.set_request_actor(self.context.user_id)
             if path == "/api/status":
                 return self._json(200, app.status(service))
             if path == "/api/settings/model":
@@ -1240,6 +1270,8 @@ def make_handler(app: WikiApp):
                 print(f"Unhandled GET error operation={operation_id}", file=sys.stderr)
                 self._json(500, {"error": "internal error", "operation_id": operation_id})
             finally:
+                if self.service is not None:
+                    self.service.set_request_actor(None)
                 self._release_workspace_action()
 
         def do_POST(self) -> None:

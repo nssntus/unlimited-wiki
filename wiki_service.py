@@ -1643,47 +1643,52 @@ class WikiService:
                 result = self._run_remote_task(task)
                 self._finalize_remote_result(task, result)
             except RemoteError as exc:
+                self._finalize_remote_failure(task, exc.code, str(exc), retry=exc.retryable)
+            except Exception as exc:
+                self._finalize_remote_failure(task, "model_error", str(exc), retry=False)
+
+    def _finalize_remote_failure(
+        self, task: dict, error_type: str, error_message: str, *, retry: bool,
+    ) -> dict:
+        with self._intent_lock:
+            current_task = self.state.get_task(task["id"])
+            if (
+                self._retired
+                or current_task["status"] != "running"
+                or current_task["attempts"] != task["attempts"]
+            ):
+                return current_task
+            with self._guard_task_actor(task) as actor_authorized:
                 if self._retired:
-                    continue
+                    return self.state.get_task(task["id"])
+                if not actor_authorized:
+                    error_type = "auth_revoked"
+                    error_message = "The task initiator no longer has write access."
+                    retry = False
                 current_task = self.state.fail_task(
-                    task["id"], exc.code, str(exc), retry=exc.retryable, expected_attempt=task["attempts"],
+                    task["id"], error_type, error_message,
+                    retry=retry, expected_attempt=task["attempts"],
                 )
-                if current_task["status"] not in {"queued", "failed"} or current_task["attempts"] != task["attempts"]:
-                    continue
+                if (
+                    current_task["status"] not in {"queued", "failed"}
+                    or current_task["attempts"] != task["attempts"]
+                ):
+                    return current_task
+                derived_status = "queued" if current_task["status"] == "queued" else "failed"
+                payload = task["payload"]
                 if task["kind"] == "article-classification":
-                    payload = task["payload"]
                     self.state.save_classification_suggestion(
                         payload["article_id"], payload["article_revision"], payload["taxonomy_revision"],
-                        "queued" if current_task["status"] == "queued" else "failed",
-                        task_id=task["id"], error_type=exc.code, error_message=str(exc),
+                        derived_status, task_id=task["id"], error_type=error_type,
+                        error_message=error_message,
                     )
                 elif task["kind"] == "raw-classification-plan":
-                    payload = task["payload"]
                     self.state.save_raw_classification_plan(
                         payload["raw_path"], payload["raw_revision"], payload["taxonomy_revision"],
-                        "queued" if current_task["status"] == "queued" else "failed",
-                        task_id=task["id"], error_type=exc.code, error_message=str(exc),
+                        derived_status, task_id=task["id"], error_type=error_type,
+                        error_message=error_message,
                     )
-            except Exception as exc:
-                if self._retired:
-                    continue
-                current_task = self.state.fail_task(
-                    task["id"], "model_error", str(exc), retry=False, expected_attempt=task["attempts"],
-                )
-                if current_task["status"] not in {"queued", "failed"} or current_task["attempts"] != task["attempts"]:
-                    continue
-                if task["kind"] == "article-classification":
-                    payload = task["payload"]
-                    self.state.save_classification_suggestion(
-                        payload["article_id"], payload["article_revision"], payload["taxonomy_revision"], "failed",
-                        task_id=task["id"], error_type="model_error", error_message=str(exc),
-                    )
-                elif task["kind"] == "raw-classification-plan":
-                    payload = task["payload"]
-                    self.state.save_raw_classification_plan(
-                        payload["raw_path"], payload["raw_revision"], payload["taxonomy_revision"], "failed",
-                        task_id=task["id"], error_type="model_error", error_message=str(exc),
-                    )
+                return current_task
 
     def _finalize_remote_result(self, task: dict, result: dict) -> dict:
         with self._intent_lock:
