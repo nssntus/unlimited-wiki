@@ -153,29 +153,33 @@ class WikiApp:
             workspace = self.platform.authorize_workspace(context.user_id, context.workspace_id, "wiki.read")
             with self._service_lock:
                 service = self._services.get(context.workspace_id)
-                if service is None:
-                    values = self.platform.load_model(context.workspace_id)
-                    config = build_config(**values, allow_private=False) if values else LLMConfig()
-                    service = WikiService(
-                        self.platform.workspace_root(workspace["root_name"]),
-                        llm_config=config,
-                        remote_search=self.remote_search,
-                        start_worker=self.start_worker,
-                        remote_task_kinds=self.remote_task_kinds,
-                        authorize_actor=lambda user_id, workspace_id=context.workspace_id: bool(
-                            self.platform.authorize_workspace(user_id, workspace_id, "wiki.write")
-                        ),
-                        actor_guard=lambda user_id, workspace_id=context.workspace_id: (
-                            self.platform.authorized_workspace_action(user_id, workspace_id, "wiki.write")
-                        ),
-                        require_task_actor=True,
-                    )
+            if service is None:
+                values = self.platform.load_model(context.workspace_id)
+                config = build_config(**values, allow_private=False) if values else LLMConfig()
+                service = WikiService(
+                    self.platform.workspace_root(workspace["root_name"]),
+                    llm_config=config,
+                    remote_search=self.remote_search,
+                    start_worker=self.start_worker,
+                    remote_task_kinds=self.remote_task_kinds,
+                    authorize_actor=lambda user_id, workspace_id=context.workspace_id: bool(
+                        self.platform.authorize_workspace(user_id, workspace_id, "wiki.write")
+                    ),
+                    actor_guard=lambda user_id, workspace_id=context.workspace_id: (
+                        self.platform.authorized_workspace_action(user_id, workspace_id, "wiki.write")
+                    ),
+                    require_task_actor=True,
+                )
+                with self._service_lock:
                     self._services[context.workspace_id] = service
-                backfill_key = (context.workspace_id, context.user_id)
-                if backfill_key not in self._publication_backfills:
-                    self.platform.backfill_workspace_publication_sources(context, service.articles())
+            backfill_key = (context.workspace_id, context.user_id)
+            with self._service_lock:
+                needs_backfill = backfill_key not in self._publication_backfills
+            if needs_backfill:
+                self.platform.backfill_workspace_publication_sources(context, service.articles())
+                with self._service_lock:
                     self._publication_backfills.add(backfill_key)
-                return service
+            return service
 
     def _workspace_gate(self, workspace_id: str) -> threading.RLock:
         with self._workspace_gates_lock:
@@ -185,12 +189,22 @@ class WikiApp:
     def workspace_action(self, context: SessionContext, service: WikiService, permission: str):
         if self.platform is None:
             with service.intent_guard():
-                yield
+                yield self.diagnostics
             return
         with self._workspace_gate(context.workspace_id):
+            self.platform.authorize_workspace(context.user_id, context.workspace_id, permission)
             with self._service_lock:
                 if self._services.get(context.workspace_id) is not service:
                     raise FileNotFoundError(context.workspace_id)
+                if service.retired:
+                    raise FileNotFoundError(context.workspace_id)
+                diagnostics = self._diagnostics.get(context.workspace_id)
+                if diagnostics is None:
+                    diagnostics = DiagnosticCache(service)
+                    self._diagnostics[context.workspace_id] = diagnostics
+            if permission == "wiki.read":
+                yield diagnostics
+                return
             with service.intent_guard():
                 if service.retired:
                     raise FileNotFoundError(context.workspace_id)
@@ -199,7 +213,7 @@ class WikiApp:
                 ):
                     if service.retired:
                         raise FileNotFoundError(context.workspace_id)
-                    yield
+                    yield diagnostics
 
     def diagnostics_for(self, context: SessionContext | None, service: WikiService) -> DiagnosticCache:
         if context is None:
@@ -233,7 +247,7 @@ class WikiApp:
         for record in self.platform.workspace_storage_states():
             self._reconcile_workspace_storage(record)
 
-    def run_workspace_lifecycle(self, workspace_id: str, transition) -> tuple[dict, bool]:
+    def run_workspace_lifecycle(self, user_id: str, workspace_id: str, transition) -> tuple[dict, bool]:
         if self.platform is None:
             raise RuntimeError("workspace lifecycle is unavailable")
         close_service: WikiService | None = None
@@ -254,22 +268,7 @@ class WikiApp:
                             }
                         close_service = service
                     self._reconcile_workspace_storage(record, service)
-                    response = {
-                        **response,
-                        "status": record["status"],
-                        "can_suspend": response.get("kind") == "team"
-                        and response.get("role") == "owner"
-                        and record["status"] == "active",
-                        "can_restore": response.get("kind") == "team"
-                        and response.get("role") == "owner"
-                        and record["status"] == "suspended",
-                        "can_delete": response.get("kind") == "team"
-                        and response.get("role") == "owner"
-                        and record["status"] == "suspended",
-                        "can_leave": response.get("kind") == "team"
-                        and response.get("role") != "owner"
-                        and record["status"] in {"active", "suspended"},
-                    }
+                    response = self.platform.workspace_summary_for_user(user_id, workspace_id)
                 return response, replay
         finally:
             if close_service is not None:
@@ -576,15 +575,10 @@ def make_handler(app: WikiApp):
                 raise ApiError(409, "workspace selection required", details={"code": "workspace_selection_required"})
             action = app.workspace_action(self.context, self.service, permission)
             try:
-                action.__enter__()
+                self.diagnostics = action.__enter__()
             except FileNotFoundError as exc:
                 raise ApiError(409, "workspace selection required", details={"code": "workspace_selection_required"}) from exc
             self._workspace_action = action
-            try:
-                self.diagnostics = app.diagnostics_for(self.context, self.service)
-            except Exception:
-                self._release_workspace_action()
-                raise
 
         def _release_workspace_action(self) -> None:
             action = self._workspace_action
@@ -965,7 +959,7 @@ def make_handler(app: WikiApp):
                         scope=f"account:{self.account_context.user_id}:workspace:{workspace_id}",
                     )
                 else:
-                    response, replay = app.run_workspace_lifecycle(workspace_id, transition)
+                    response, replay = app.run_workspace_lifecycle(account.user_id, workspace_id, transition)
                 return self._json(200, response)
 
             if path == "/api/auth/logout":

@@ -252,6 +252,129 @@ def test_ingest_preview_task_records_current_actor(lifecycle_server):
     assert service.state.get_task(task_id)["actor_user_id"] == context.user_id
 
 
+def test_cross_workspace_service_creation_does_not_invert_platform_and_cache_locks(lifecycle_server, monkeypatch):
+    app, base = lifecycle_server
+    owner = Client(base)
+    owner.register("lock-order@example.com", "Lock Order")
+    team_a = _create_team(owner, "Lock A", key="lock-team-a")
+    team_b = _create_team(owner, "Lock B", key="lock-team-b")
+    owner.request("POST", "/api/workspaces/switch", {"workspace_id": team_a["id"]}, key="lock-switch-a")
+    context_a = context_for(app, owner)
+    service_a = app.workspace_service(context_a)
+    owner.request("POST", "/api/workspaces/switch", {"workspace_id": team_b["id"]}, key="lock-switch-b")
+    context_b = context_for(app, owner)
+    owner.request("POST", "/api/workspaces/switch", {"workspace_id": team_a["id"]}, key="lock-switch-a-again")
+    with app._service_lock:
+        warmed_b = app._services.pop(team_b["id"], None)
+        app._diagnostics.pop(team_b["id"], None)
+        app._publication_backfills = {
+            key for key in app._publication_backfills if key[0] != team_b["id"]
+        }
+    if warmed_b is not None:
+        warmed_b.close()
+
+    original_authorize = app.platform.authorize_workspace
+    original_backfill = app.platform.backfill_workspace_publication_sources
+    original_action = app.platform.authorized_workspace_action
+    b_authorized = threading.Event()
+    release_b = threading.Event()
+    a_has_platform = threading.Event()
+    b_in_backfill = threading.Event()
+    release_backfill = threading.Event()
+
+    def delayed_authorize(user_id, workspace_id, permission):
+        result = original_authorize(user_id, workspace_id, permission)
+        if threading.current_thread().name == "workspace-b" and workspace_id == team_b["id"]:
+            b_authorized.set()
+            assert release_b.wait(10)
+        return result
+
+    def delayed_backfill(context, articles):
+        if threading.current_thread().name == "workspace-b" and context.workspace_id == team_b["id"]:
+            b_in_backfill.set()
+            assert release_backfill.wait(10)
+        return original_backfill(context, articles)
+
+    @contextlib.contextmanager
+    def delayed_platform_action(user_id, workspace_id, permission):
+        with original_action(user_id, workspace_id, permission):
+            if threading.current_thread().name == "workspace-a" and workspace_id == team_a["id"]:
+                a_has_platform.set()
+                release_backfill.set()
+            yield
+
+    monkeypatch.setattr(app.platform, "authorize_workspace", delayed_authorize)
+    monkeypatch.setattr(app.platform, "backfill_workspace_publication_sources", delayed_backfill)
+    monkeypatch.setattr(app.platform, "authorized_workspace_action", delayed_platform_action)
+    outcomes: dict = {}
+
+    def create_b():
+        try:
+            outcomes["b"] = app.workspace_service(context_b)
+        except Exception as exc:
+            outcomes["b_error"] = exc
+
+    def write_action_a():
+        action = app.workspace_action(context_a, service_a, "wiki.write")
+        try:
+            diagnostics = action.__enter__()
+            if diagnostics is None:
+                diagnostics = app.diagnostics_for(context_a, service_a)
+            outcomes["a"] = diagnostics
+        except Exception as exc:
+            outcomes["a_error"] = exc
+        finally:
+            action.__exit__(None, None, None)
+
+    b_thread = threading.Thread(target=create_b, name="workspace-b", daemon=True)
+    a_thread = threading.Thread(target=write_action_a, name="workspace-a", daemon=True)
+    b_thread.start()
+    assert b_authorized.wait(10)
+    release_b.set()
+    assert b_in_backfill.wait(10)
+    a_thread.start()
+    assert a_has_platform.wait(10)
+    a_thread.join(timeout=10)
+    b_thread.join(timeout=10)
+
+    assert not a_thread.is_alive()
+    assert not b_thread.is_alive()
+    assert outcomes.get("a_error") is None
+    assert outcomes.get("b_error") is None
+    assert outcomes["a"] is app._diagnostics[team_a["id"]]
+    assert outcomes["b"] is app._services[team_b["id"]]
+
+
+def test_long_workspace_read_does_not_hold_global_platform_lock(lifecycle_server):
+    app, owner, _member, team, _owner_personal, _member_personal = _team_world(lifecycle_server)
+    context = context_for(app, owner)
+    service = app.workspace_service(context)
+    read_entered = threading.Event()
+    release_read = threading.Event()
+
+    def long_read():
+        with app.workspace_action(context, service, "wiki.read"):
+            read_entered.set()
+            assert release_read.wait(3)
+
+    read_thread = threading.Thread(target=long_read)
+    read_thread.start()
+    assert read_entered.wait(3)
+    platform_done = threading.Event()
+    platform_thread = threading.Thread(target=lambda: (
+        app.platform.workspace_summary_for_user(context.user_id, team["id"]),
+        platform_done.set(),
+    ))
+    platform_thread.start()
+
+    assert platform_done.wait(0.5)
+    release_read.set()
+    read_thread.join(timeout=3)
+    platform_thread.join(timeout=3)
+    assert not read_thread.is_alive()
+    assert not platform_thread.is_alive()
+
+
 def test_lifecycle_replay_reconciles_authoritative_status(lifecycle_server):
     app, owner, _member, team, _owner_personal, _member_personal = _team_world(lifecycle_server)
     service = app.workspace_service(context_for(app, owner))
@@ -279,6 +402,47 @@ def test_lifecycle_replay_reconciles_authoritative_status(lifecycle_server):
     assert stale_restore[1]["can_restore"] is True
     assert stale_restore[1]["can_delete"] is True
     assert StateStore(service.root, recover_running=False).get_task(task["id"])["status"] == "paused"
+
+
+def test_lifecycle_replay_uses_current_membership_and_permissions(lifecycle_server):
+    app, owner, member, team, _owner_personal, _member_personal = _team_world(lifecycle_server)
+    owner_id = context_for(app, owner).user_id
+    member_id = context_for(app, member).user_id
+    assert owner.request("POST", f"/api/workspaces/{team['id']}/suspend", {}, key="identity-suspend")[0] == 200
+    assert owner.request("POST", f"/api/workspaces/{team['id']}/restore", {}, key="identity-restore")[0] == 200
+    for client, key in ((owner, "identity-owner-switch"), (member, "identity-member-switch")):
+        assert client.request("POST", "/api/workspaces/switch", {"workspace_id": team["id"]}, key=key)[0] == 200
+    assert owner.request(
+        "POST", "/api/workspace/owner-transfer", {"user_id": member_id}, key="identity-transfer",
+    )[0] == 200
+    assert member.request(
+        "POST", "/api/workspace/rename", {"display_name": "Current Identity Team"}, key="identity-rename",
+    )[0] == 200
+
+    replay = owner.request("POST", f"/api/workspaces/{team['id']}/suspend", {}, key="identity-suspend")
+    assert replay == (200, app.platform.workspace_summary_for_user(owner_id, team["id"]))
+    assert replay[1]["role"] == "editor"
+    assert replay[1]["display_name"] == "Current Identity Team"
+    assert replay[1]["can_suspend"] is False
+    assert replay[1]["can_leave"] is True
+
+    assert member.request(
+        "POST", f"/api/workspace/members/{owner_id}/role", {"role": "viewer"}, key="identity-viewer",
+    )[0] == 200
+    downgraded = owner.request("POST", f"/api/workspaces/{team['id']}/suspend", {}, key="identity-suspend")
+    assert downgraded == (200, app.platform.workspace_summary_for_user(owner_id, team["id"]))
+    assert downgraded[1]["role"] == "viewer"
+    assert downgraded[1]["permissions"] == ["wiki.read"]
+
+    assert member.request(
+        "POST", f"/api/workspace/members/{owner_id}/remove", {}, key="identity-remove",
+    )[0] == 200
+    owner.request("POST", "/api/auth/login", {
+        "email": "lifecycle-owner@example.com", "password": "correct-horse-123",
+    }, key="identity-login")
+    removed = owner.request("POST", f"/api/workspaces/{team['id']}/suspend", {}, key="identity-suspend")
+    assert removed[0] == 404
+    assert app.platform.workspace_storage_state(team["id"])["status"] == "active"
 
 
 def test_lifecycle_replay_repairs_failed_local_projection(lifecycle_server, monkeypatch):

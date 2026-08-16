@@ -897,6 +897,19 @@ class PlatformStore:
         current_workspace_id = getattr(context, "workspace_id", None) or context.current_workspace_id
         return [self._workspace_summary(row, current=row["id"] == current_workspace_id) for row in rows]
 
+    def workspace_summary_for_user(self, user_id: str, workspace_id: str) -> dict:
+        with self._lock, self.connect() as db:
+            row = self._workspace_access_row(db, user_id, workspace_id)
+        if (
+            row is None
+            or row["user_status"] != "active"
+            or row["organization_status"] != "active"
+            or row["workspace_member_status"] != "active"
+            or row["organization_member_status"] != "active"
+        ):
+            raise FileNotFoundError(workspace_id)
+        return self._workspace_summary(row, current=False)
+
     @staticmethod
     def _validate_workspace_name(value: str) -> str:
         value = value.strip()
