@@ -6,6 +6,7 @@ import { PublicShell } from "@/layouts/public-shell"
 import { AdminShell } from "@/layouts/admin-shell"
 import { Skeleton } from "@/components/ui/skeleton"
 import { RequireSession, SessionProvider } from "@/features/session-provider"
+import { WorkspaceDirectoryPage } from "@/features/workspace-selection-gate"
 
 const ArticlePage = lazy(() => import("@/pages/article-page").then((module) => ({ default: module.ArticlePage })))
 const EditorPage = lazy(() => import("@/pages/editor-page").then((module) => ({ default: module.EditorPage })))
@@ -47,6 +48,7 @@ export function App() {
               <Route path="/square/:id" element={<PublicEntryPage />} />
               <Route path="/forbidden" element={<main className="mx-auto max-w-xl px-4 py-20"><h1 className="text-2xl font-semibold">没有访问权限</h1><p className="mt-3 text-muted-foreground">当前账号没有执行此操作所需的角色。</p></main>} />
             </Route>
+            <Route path="/workspaces" element={<RequireSession><WorkspaceDirectoryPage /></RequireSession>} />
             <Route element={<RequireSession><WikiShell /></RequireSession>}>
             <Route path="/inbox" element={<RequireSession permission="wiki.write"><InboxPage /></RequireSession>} />
             <Route path="/ingest/*" element={<RequireSession permission="wiki.write"><IngestPage /></RequireSession>} />

@@ -3,18 +3,19 @@ import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { AlertTriangleIcon, RefreshCwIcon } from "lucide-react"
 import { Navigate, useLocation, useNavigate } from "react-router-dom"
 
-import { ApiError, apiGet, apiPost, queryKeys, setCsrfToken, setUnauthorizedHandler, type Session } from "@/lib/api"
+import { ApiError, apiGet, apiPost, queryKeys, setCsrfToken, setUnauthorizedHandler, setWorkspaceUnavailableHandler, type Session } from "@/lib/api"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import { SessionContext, useSession } from "@/features/session-context"
+import { WorkspaceSelectionGate } from "@/features/workspace-selection-gate"
 
 type SwitchState =
   | { kind: "idle" }
   | { kind: "requesting"; target: string }
-  | { kind: "confirming"; target: string }
-  | { kind: "error"; target: string; message: string }
+  | { kind: "confirming"; target: string | null }
+  | { kind: "error"; target: string | null; message: string }
 
 const UNCOMMITTED_SWITCH_STATUSES = new Set([400, 403, 404, 422])
 
@@ -45,11 +46,11 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     await client.cancelQueries()
     client.removeQueries({ predicate: (entry) => entry.queryKey[0] !== "session" })
   }
-  const confirmWorkspace = async (target: string) => {
+  const confirmWorkspace = async (target: string | null) => {
     setSwitchState({ kind: "confirming", target })
     try {
       const next = await apiGet<Session>("/api/auth/session")
-      if (!next.authenticated || !next.workspace) {
+      if (!next.authenticated) {
         setCsrfToken("")
         client.clear()
         switchingRef.current = false
@@ -95,6 +96,25 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     if (postError) throw postError
     throw new Error(`空间切换未生效，当前仍是 ${next.workspace?.display_name ?? "其他空间"}`)
   }
+  const changeWorkspaceLifecycle = async (workspaceId: string, action: "suspend" | "restore" | "delete" | "leave") => {
+    if (switchingRef.current) return
+    switchingRef.current = true
+    setSwitchState({ kind: "requesting", target: workspaceId })
+    let postError: unknown = null
+    try {
+      await apiPost(`/api/workspaces/${workspaceId}/${action}`, {})
+    } catch (error) {
+      if (error instanceof ApiError && UNCOMMITTED_SWITCH_STATUSES.has(error.status)) {
+        switchingRef.current = false
+        setSwitchState({ kind: "idle" })
+        throw error
+      }
+      postError = error
+    }
+    await clearTenantCache()
+    await confirmWorkspace(null)
+    if (postError) throw postError
+  }
   const retryWorkspaceConfirmation = async () => {
     if (switchState.kind !== "error") return
     await clearTenantCache()
@@ -106,8 +126,24 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   }
   const switchingWorkspace = switchState.kind !== "idle"
   const hasPermission = (permission: string) => query.data?.workspace?.permissions.includes(permission) ?? false
-  const value = { session: query.data, loading: query.isLoading, signOut, switchWorkspace, switchingWorkspace, hasPermission }
-  return <SessionContext.Provider value={value}>{switchState.kind === "idle" ? children : switchState.kind === "error" ? <WorkspaceSwitchGate error={switchState.message} onRetry={retryWorkspaceConfirmation} /> : <WorkspaceSwitchGate />}</SessionContext.Provider>
+  useEffect(() => {
+    setWorkspaceUnavailableHandler(() => {
+      if (switchingRef.current) return
+      switchingRef.current = true
+      setSwitchState({ kind: "confirming", target: "" })
+      void clearTenantCache().then(() => confirmWorkspace(null)).catch(() => undefined)
+    })
+    return () => setWorkspaceUnavailableHandler(null)
+  })
+  const value = { session: query.data, loading: query.isLoading, signOut, switchWorkspace, changeWorkspaceLifecycle, switchingWorkspace, hasPermission }
+  const content = switchState.kind !== "idle"
+    ? switchState.kind === "error"
+      ? <WorkspaceSwitchGate error={switchState.message} onRetry={retryWorkspaceConfirmation} />
+      : <WorkspaceSwitchGate />
+    : query.data?.authenticated && (!query.data.workspace || query.data.workspace_selection_required)
+      ? <WorkspaceSelectionGate onSwitch={switchWorkspace} onLifecycle={changeWorkspaceLifecycle} onSignOut={signOut} />
+      : children
+  return <SessionContext.Provider value={value}>{content}</SessionContext.Provider>
 }
 
 function WorkspaceSwitchGate({ error, onRetry }: { error?: string; onRetry?: () => Promise<void> }) {

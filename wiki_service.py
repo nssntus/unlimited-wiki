@@ -221,6 +221,21 @@ class WikiService:
         if self._worker:
             self._worker.join(timeout=3)
 
+    def pause_for_workspace_suspend(self) -> list[dict]:
+        with self._intent_lock:
+            return self.state.pause_active_tasks()
+
+    def resume_after_workspace_restore(self) -> list[dict]:
+        with self._intent_lock:
+            tasks = self.state.resume_paused_tasks()
+            if tasks:
+                self._wake.set()
+            return tasks
+
+    def terminate_for_workspace_delete(self) -> list[dict]:
+        with self._intent_lock:
+            return self.state.terminate_workspace_tasks()
+
     def configure_llm(self, config: LLMConfig) -> None:
         with self._intent_lock:
             self.llm = config
@@ -1605,7 +1620,7 @@ class WikiService:
                 current_task = self.state.fail_task(
                     task["id"], exc.code, str(exc), retry=exc.retryable, expected_attempt=task["attempts"],
                 )
-                if current_task["status"] == "cancelled" or current_task["attempts"] != task["attempts"]:
+                if current_task["status"] not in {"queued", "failed"} or current_task["attempts"] != task["attempts"]:
                     continue
                 if task["kind"] == "article-classification":
                     payload = task["payload"]
@@ -1625,7 +1640,7 @@ class WikiService:
                 current_task = self.state.fail_task(
                     task["id"], "model_error", str(exc), retry=False, expected_attempt=task["attempts"],
                 )
-                if current_task["status"] == "cancelled" or current_task["attempts"] != task["attempts"]:
+                if current_task["status"] not in {"queued", "failed"} or current_task["attempts"] != task["attempts"]:
                     continue
                 if task["kind"] == "article-classification":
                     payload = task["payload"]

@@ -32,9 +32,10 @@ import wiki_ops
 from document_ingest import MAX_INPUT_BYTES
 from model_settings import build_config, load_model_settings, public_model_settings, save_model_settings
 from legacy_migration import migrate_legacy_workspace
-from platform_store import PlatformIdempotencyError, PlatformStore, SessionContext
+from platform_store import AccountSessionContext, PlatformIdempotencyError, PlatformStore, SessionContext
 from platform_review import PlatformReviewWorker
 from publication import public_markdown, snapshot_fingerprint
+from state_store import StateStore
 from wiki_service import LLMConfig, WikiService, article_summary
 
 ROOT = Path(__file__).resolve().parent
@@ -180,6 +181,36 @@ class WikiApp:
                 self._diagnostics[context.workspace_id] = cache
             return cache
 
+    def apply_workspace_lifecycle(self, workspace_id: str, action: str) -> None:
+        if self.platform is None:
+            return
+        with self.platform.connect() as db:
+            row = db.execute("SELECT root_name FROM workspaces WHERE id=?", (workspace_id,)).fetchone()
+        if row is None:
+            return
+        with self._service_lock:
+            service = self._services.pop(workspace_id, None)
+            self._diagnostics.pop(workspace_id, None)
+            self._publication_backfills = {
+                key for key in self._publication_backfills if key[0] != workspace_id
+            }
+        if service is not None:
+            if action == "suspend":
+                service.pause_for_workspace_suspend()
+            elif action == "restore":
+                service.resume_after_workspace_restore()
+            elif action == "delete":
+                service.terminate_for_workspace_delete()
+            service.close()
+            return
+        state = StateStore(self.platform.workspace_root(row["root_name"]), recover_running=False)
+        if action == "suspend":
+            state.pause_active_tasks()
+        elif action == "restore":
+            state.resume_paused_tasks()
+        elif action == "delete":
+            state.terminate_workspace_tasks()
+
     def close(self) -> None:
         if self.service is not None:
             self.service.close()
@@ -199,7 +230,7 @@ class WikiApp:
                         archive.write(path, path.relative_to(root).as_posix())
         return output.getvalue()
 
-    def delete_account(self, context: SessionContext, password: str) -> None:
+    def delete_account(self, context: SessionContext | AccountSessionContext, password: str) -> None:
         result = self.platform.delete_account(context, password)
         for workspace in result["cleanup_workspaces"]:
             service = self._services.pop(workspace["id"], None)
@@ -374,6 +405,7 @@ def make_handler(app: WikiApp):
         sys_version = ""
 
         context: SessionContext | None = None
+        account_context: AccountSessionContext | None = None
         service: WikiService | None = None
         diagnostics: DiagnosticCache | None = None
         _extra_headers: list[tuple[str, str]]
@@ -430,10 +462,14 @@ def make_handler(app: WikiApp):
                 self.service = app.service
                 self.diagnostics = app.diagnostics
                 return
-            self.context = app.platform.resolve_session(self._session_token())
-            if self.context is None:
+            token = self._session_token()
+            self.account_context = app.platform.resolve_account_session(token)
+            if self.account_context is None:
                 if required:
                     raise ApiError(401, "authentication required")
+                return
+            self.context = app.platform.resolve_session(token)
+            if self.context is None:
                 return
             self.service = app.workspace_service(self.context)
             self.diagnostics = app.diagnostics_for(self.context, self.service)
@@ -441,13 +477,13 @@ def make_handler(app: WikiApp):
         def _require_csrf(self) -> None:
             if app.platform is None:
                 return
-            if self.context is None or not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), self.context.csrf_token):
+            if self.account_context is None or not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), self.account_context.csrf_token):
                 raise ApiError(403, "invalid CSRF token")
 
         def _require_role(self, role: str) -> None:
-            if self.context is None:
+            if self.account_context is None:
                 raise ApiError(401, "authentication required")
-            if self.context.role != role:
+            if self.account_context.role != role:
                 raise ApiError(403, "insufficient role")
 
         def _require_workspace_permission(self, permission: str) -> None:
@@ -464,6 +500,8 @@ def make_handler(app: WikiApp):
 
         def _private_service(self) -> WikiService:
             if self.service is None:
+                if self.account_context is not None:
+                    raise ApiError(409, "workspace selection required", details={"code": "workspace_selection_required"})
                 raise ApiError(401, "authentication required")
             return self.service
 
@@ -533,13 +571,16 @@ def make_handler(app: WikiApp):
                 raise
 
         def _platform_idempotency(self, data: dict, action, *, scope: str | None = None):
-            if app.platform is None or self.context is None:
+            if app.platform is None or self.account_context is None:
                 raise ApiError(401, "authentication required")
             key = self.headers.get("Idempotency-Key", "")
             if not key or len(key) > 128 or not key.isascii() or any(ord(ch) < 33 for ch in key):
                 raise ApiError(422, "a printable ASCII Idempotency-Key is required")
             endpoint = urlparse(self.path).path
-            scope = scope or f"workspace:{self.context.workspace_id}"
+            if scope is None:
+                if self.context is None:
+                    raise ApiError(409, "workspace selection required", details={"code": "workspace_selection_required"})
+                scope = f"workspace:{self.context.workspace_id}"
             try:
                 return app.platform.run_platform_idempotent(scope, endpoint, key, data, action)
             except PlatformIdempotencyError as exc:
@@ -569,9 +610,10 @@ def make_handler(app: WikiApp):
             if path == "/api/platform/config":
                 return self._json(200, {"registration_enabled": True, "public_square_enabled": True})
             if path == "/api/auth/session":
-                if self.context is None:
+                if self.account_context is None:
                     return self._json(200, {"authenticated": False, "registration_enabled": True})
-                return self._json(200, {"authenticated": True, **self.context.public(), "registration_enabled": True})
+                public_context = self.context.public() if self.context is not None else self.account_context.public()
+                return self._json(200, {"authenticated": True, **public_context, "registration_enabled": True})
             if path == "/api/account/export":
                 if self.context is None:
                     raise ApiError(401, "authentication required")
@@ -580,13 +622,16 @@ def make_handler(app: WikiApp):
                 self._extra_headers.append(("Content-Disposition", "attachment; filename=wiki-export.zip"))
                 return self._send(200, payload, "application/zip")
             if path == "/api/workspaces":
-                if self.context is None:
+                if self.account_context is None:
                     raise ApiError(401, "authentication required")
-                return self._json(200, app.platform.list_workspaces(self.context))
+                include_inactive = _single_query(parsed, "include_inactive") == "1"
+                return self._json(200, app.platform.list_workspaces(
+                    self.context or self.account_context, include_inactive=include_inactive,
+                ))
             if path == "/api/invitations":
-                if self.context is None:
+                if self.account_context is None:
                     raise ApiError(401, "authentication required")
-                return self._json(200, app.platform.list_invitations(self.context))
+                return self._json(200, app.platform.list_invitations(self.context or self.account_context))
             if path == "/api/workspace/members":
                 if self.context is None:
                     raise ApiError(401, "authentication required")
@@ -743,7 +788,7 @@ def make_handler(app: WikiApp):
                     raise ApiError(404, "not found")
                 _fields(data, {"reason_code", "detail"}, {"reason_code"})
                 response = app.platform.report_public(
-                    match.group(1), self.context.user_id if self.context else None,
+                    match.group(1), self.account_context.user_id if self.account_context else None,
                     _string(data, "reason_code", maximum=40, required=True), _string(data, "detail", maximum=1000),
                 )
                 return self._json(201, response)
@@ -751,15 +796,15 @@ def make_handler(app: WikiApp):
             if path == "/api/workspaces":
                 _fields(data, {"display_name"}, {"display_name"})
                 response, replay = self._platform_idempotency(data, lambda: app.platform.create_team(
-                    self.context, _string(data, "display_name", maximum=80, required=True),
-                ), scope=f"account:{self.context.user_id}")
+                    self.context or self.account_context, _string(data, "display_name", maximum=80, required=True),
+                ), scope=f"account:{self.account_context.user_id}")
                 return self._json(200 if replay else 201, response)
             if path == "/api/workspaces/switch":
                 _fields(data, {"workspace_id"}, {"workspace_id"})
                 token = self._session_token()
                 _, _ = self._platform_idempotency(data, lambda: {
                     "workspace_id": app.platform.switch_workspace(
-                        token, self.context, _string(data, "workspace_id", maximum=64, required=True),
+                        token, self.context or self.account_context, _string(data, "workspace_id", maximum=64, required=True),
                     ).workspace_id,
                 }, scope=f"session:{hashlib.sha256(token.encode('utf-8')).hexdigest()}")
                 selected = app.platform.resolve_session(token)
@@ -779,8 +824,8 @@ def make_handler(app: WikiApp):
             if match:
                 _fields(data, set())
                 response, _ = self._platform_idempotency(data, lambda: app.platform.respond_to_invitation(
-                    self.context, match.group(1), accept=match.group("action") == "accept",
-                ), scope=f"invitation:{self.context.user_id}:{match.group(1)}")
+                    self.context or self.account_context, match.group(1), accept=match.group("action") == "accept",
+                ), scope=f"invitation:{self.account_context.user_id}:{match.group(1)}")
                 if response.get("status") == "expired":
                     raise ApiError(422, "invitation is no longer available")
                 return self._json(200, response)
@@ -806,6 +851,41 @@ def make_handler(app: WikiApp):
                     self.context, _string(data, "display_name", maximum=80, required=True),
                 ))
                 return self._json(200, response)
+
+            match = re.fullmatch(r"/api/workspaces/([a-f0-9]{32})/(?P<action>suspend|restore|delete|leave)", path)
+            if match:
+                action = match.group("action")
+                _fields(data, set())
+                workspace_id = match.group(1)
+                account = self.context or self.account_context
+                response, replay = self._platform_idempotency(
+                    data,
+                    lambda: (
+                        app.platform.leave_workspace(account, workspace_id)
+                        if action == "leave"
+                        else app.platform.change_workspace_lifecycle(account, workspace_id, action)
+                    ),
+                    scope=f"account:{self.account_context.user_id}:workspace:{workspace_id}",
+                )
+                if action != "leave":
+                    app.apply_workspace_lifecycle(workspace_id, action)
+                return self._json(200, response)
+
+            if path == "/api/auth/logout":
+                _fields(data, set())
+                app.platform.revoke_session(self._session_token())
+                self._set_session_cookie("", clear=True)
+                return self._json(200, {"authenticated": False})
+            if path == "/api/auth/sessions/revoke-all":
+                _fields(data, set())
+                app.platform.revoke_all_sessions(self.account_context.user_id)
+                self._set_session_cookie("", clear=True)
+                return self._json(200, {"authenticated": False})
+            if path == "/api/account/delete":
+                _fields(data, {"password"}, {"password"})
+                app.delete_account(self.context or self.account_context, _string(data, "password", maximum=1024, required=True))
+                self._set_session_cookie("", clear=True)
+                return self._json(200, {"deleted": True})
 
             service = self._private_service()
             content_write_paths = {
@@ -993,22 +1073,6 @@ def make_handler(app: WikiApp):
                 response, _ = self._idempotency(data, lambda: service.rollback(match.group(1)))
                 self.diagnostics.refresh()
                 return self._json(200, response)
-            if path == "/api/auth/logout":
-                _fields(data, set())
-                if app.platform is not None:
-                    app.platform.revoke_session(self._session_token())
-                    self._set_session_cookie("", clear=True)
-                return self._json(200, {"authenticated": False})
-            if path == "/api/auth/sessions/revoke-all":
-                _fields(data, set())
-                app.platform.revoke_all_sessions(self.context.user_id)
-                self._set_session_cookie("", clear=True)
-                return self._json(200, {"authenticated": False})
-            if path == "/api/account/delete":
-                _fields(data, {"password"}, {"password"})
-                app.delete_account(self.context, _string(data, "password", maximum=1024, required=True))
-                self._set_session_cookie("", clear=True)
-                return self._json(200, {"deleted": True})
             if path == "/api/share-previews":
                 _fields(data, {"article_path", "source_revision", "attribution"}, {"article_path", "source_revision", "attribution"})
                 article_path = _string(data, "article_path", maximum=512, required=True)

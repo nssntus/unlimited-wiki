@@ -57,7 +57,7 @@ export type Task = {
   id: string
   kind: string
   subject: string
-  status: "queued" | "running" | "succeeded" | "failed" | "cancelled"
+  status: "queued" | "running" | "paused" | "succeeded" | "failed" | "cancelled"
   attempts: number
   error_type: string | null
   error_message: string | null
@@ -80,6 +80,7 @@ export type Session = {
   authenticated: boolean
   user?: { id: string; email: string; nickname: string; role: "user" | "admin" }
   workspace?: WorkspaceSummary
+  workspace_selection_required?: boolean
   csrf_token?: string
   session_expires_at?: string
   registration_enabled: boolean
@@ -95,6 +96,10 @@ export type WorkspaceSummary = {
   organization_role: "owner" | "admin" | "member"
   permissions: string[]
   current?: boolean
+  can_suspend: boolean
+  can_restore: boolean
+  can_delete: boolean
+  can_leave: boolean
 }
 
 export type WorkspaceMember = {
@@ -135,7 +140,7 @@ export type Submission = {
 export type PublicEntrySummary = { id: string; revision_id: string; version: number; title: string; category: string; attribution: string; summary: string; published_at: string; content_hash: string }
 export type PublicEntry = { id: string; revision_id: string; version: number; snapshot: Submission["snapshot"]; attribution: string; published_at: string; content_hash: string }
 export type PublicReport = { id: string; entry_id: string; reason_code: string; detail: string; status: string; created_at: string }
-export type Notification = { id: string; kind: "public_removed" | "public_relisted"; object_type: string; object_id: string; title: string; message: string; read_at: string | null; created_at: string }
+export type Notification = { id: string; kind: string; object_type: string; object_id: string; title: string; message: string; read_at: string | null; created_at: string }
 export type AdminPublicEntry = { id: string; status: "published" | "removed_by_admin"; author_id: string; author_nickname: string; revision_id: string; version: number; snapshot: Submission["snapshot"]; content_hash: string; published_at: string; moderation_reason: string | null; moderated_at: string | null }
 
 export type RawInboxItem = {
@@ -169,6 +174,7 @@ export type TodoItem = {
 const apiBase = import.meta.env.DEV ? "" : ""
 let csrfToken = ""
 let unauthorizedHandler: (() => void) | null = null
+let workspaceUnavailableHandler: (() => void) | null = null
 
 export function setCsrfToken(value: string) {
   csrfToken = value
@@ -176,6 +182,10 @@ export function setCsrfToken(value: string) {
 
 export function setUnauthorizedHandler(handler: (() => void) | null) {
   unauthorizedHandler = handler
+}
+
+export function setWorkspaceUnavailableHandler(handler: (() => void) | null) {
+  workspaceUnavailableHandler = handler
 }
 
 export class ApiError extends Error {
@@ -192,6 +202,7 @@ export class ApiError extends Error {
 async function parseResponse<T>(response: Response): Promise<T> {
   const payload = (await response.json().catch(() => ({ error: "响应格式无效" }))) as Record<string, unknown>
   if (response.status === 401) unauthorizedHandler?.()
+  if (response.status === 409 && payload.code === "workspace_selection_required") workspaceUnavailableHandler?.()
   if (!response.ok) throw new ApiError(response.status, payload)
   return payload as T
 }

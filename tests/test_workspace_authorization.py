@@ -443,7 +443,8 @@ def test_workspace_permissions_and_membership_revocation_take_effect_immediately
             "UPDATE workspace_members SET status='suspended',updated_at=? WHERE workspace_id=? AND user_id=?",
             (now_iso(), context.workspace_id, context.user_id),
         )
-    assert owner.request("GET", "/api/articles")[0] == 401
+    status, payload = owner.request("GET", "/api/articles")
+    assert status == 409 and payload["code"] == "workspace_selection_required"
 
 
 def test_platform_admin_has_no_implicit_private_workspace_access(tmp_path: Path):
