@@ -33,7 +33,13 @@ import wiki_ops
 from document_ingest import MAX_INPUT_BYTES
 from model_settings import build_config, load_model_settings, public_model_settings, save_model_settings
 from legacy_migration import migrate_legacy_workspace
-from platform_store import AccountSessionContext, PlatformIdempotencyError, PlatformStore, SessionContext
+from platform_store import (
+    AccountSessionContext,
+    AccountWorkspaceSetChanged,
+    PlatformIdempotencyError,
+    PlatformStore,
+    SessionContext,
+)
 from platform_review import PlatformReviewWorker
 from publication import public_markdown, snapshot_fingerprint
 from state_store import StateStore
@@ -298,29 +304,37 @@ class WikiApp:
         return output.getvalue()
 
     def delete_account(self, context: SessionContext | AccountSessionContext, password: str) -> None:
-        workspace_ids = self.platform.account_workspace_ids(context.user_id)
-        with contextlib.ExitStack() as gates:
-            for workspace_id in workspace_ids:
-                gates.enter_context(self._workspace_gate(workspace_id))
-            result = self.platform.delete_account(context, password)
-            cleanup_ids = {workspace["id"] for workspace in result["cleanup_workspaces"]}
-            services: list[WikiService] = []
-            with self._service_lock:
-                for workspace_id in cleanup_ids:
-                    service = self._services.get(workspace_id)
-                    if service is not None:
-                        self._services.pop(workspace_id, None)
-                        services.append(service)
-                    self._diagnostics.pop(workspace_id, None)
-                self._publication_backfills = {
-                    key for key in self._publication_backfills if key[0] not in cleanup_ids
-                }
-            for service in services:
-                service.close()
-            for workspace in result["cleanup_workspaces"]:
-                root = self.platform.workspace_root(workspace["root_name"])
-                if root.exists():
-                    shutil.rmtree(root)
+        workspace_ids = set(self.platform.account_workspace_ids(context.user_id))
+        while True:
+            with contextlib.ExitStack() as gates:
+                for workspace_id in sorted(workspace_ids):
+                    gates.enter_context(self._workspace_gate(workspace_id))
+                try:
+                    result = self.platform.delete_account(
+                        context, password, expected_workspace_ids=workspace_ids,
+                    )
+                except AccountWorkspaceSetChanged as exc:
+                    workspace_ids.update(exc.workspace_ids)
+                    continue
+                cleanup_ids = {workspace["id"] for workspace in result["cleanup_workspaces"]}
+                services: list[WikiService] = []
+                with self._service_lock:
+                    for workspace_id in cleanup_ids:
+                        service = self._services.get(workspace_id)
+                        if service is not None:
+                            self._services.pop(workspace_id, None)
+                            services.append(service)
+                        self._diagnostics.pop(workspace_id, None)
+                    self._publication_backfills = {
+                        key for key in self._publication_backfills if key[0] not in cleanup_ids
+                    }
+                for service in services:
+                    service.close()
+                for workspace in result["cleanup_workspaces"]:
+                    root = self.platform.workspace_root(workspace["root_name"])
+                    if root.exists():
+                        shutil.rmtree(root)
+                return
 
     def status(self, service: WikiService) -> dict:
         config = service.llm

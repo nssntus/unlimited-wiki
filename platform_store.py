@@ -44,6 +44,12 @@ class PlatformIdempotencyError(RuntimeError):
     pass
 
 
+class AccountWorkspaceSetChanged(RuntimeError):
+    def __init__(self, workspace_ids: set[str]):
+        super().__init__("account workspace set changed")
+        self.workspace_ids = frozenset(workspace_ids)
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -1521,9 +1527,9 @@ class PlatformStore:
                 raise FileNotFoundError(user_id)
         self.audit(actor_id, "user.role", "user", user_id, {"role": role})
 
-    def account_workspace_ids(self, user_id: str) -> list[str]:
-        with self._lock, self.connect() as db:
-            rows = db.execute("""
+    @staticmethod
+    def _account_workspace_ids(db: sqlite3.Connection, user_id: str) -> set[str]:
+        rows = db.execute("""
                 SELECT DISTINCT workspace.id
                 FROM workspaces workspace
                 JOIN organizations organization ON organization.id=workspace.organization_id
@@ -1532,17 +1538,31 @@ class PlatformStore:
                 WHERE member.user_id IS NOT NULL
                    OR workspace.owner_id=?
                    OR organization.personal_owner_id=?
-                ORDER BY workspace.id
             """, (user_id, user_id, user_id)).fetchall()
-        return [row["id"] for row in rows]
+        return {row["id"] for row in rows}
 
-    def delete_account(self, context: SessionContext | AccountSessionContext, password: str) -> dict:
+    def account_workspace_ids(self, user_id: str) -> list[str]:
+        with self._lock, self.connect() as db:
+            workspace_ids = self._account_workspace_ids(db, user_id)
+        return sorted(workspace_ids)
+
+    def delete_account(
+        self,
+        context: SessionContext | AccountSessionContext,
+        password: str,
+        *,
+        expected_workspace_ids: set[str] | None = None,
+    ) -> dict:
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             user = db.execute("SELECT * FROM users WHERE id=? AND status='active'", (context.user_id,)).fetchone()
             if user is None or not verify_password(password, user["password_hash"]):
                 db.rollback()
                 raise ValueError("password is invalid")
+            actual_workspace_ids = self._account_workspace_ids(db, context.user_id)
+            if expected_workspace_ids is not None and not actual_workspace_ids.issubset(expected_workspace_ids):
+                db.rollback()
+                raise AccountWorkspaceSetChanged(actual_workspace_ids)
             now = now_iso()
             shared_personal = db.execute("""
                 SELECT workspace.id FROM workspaces workspace

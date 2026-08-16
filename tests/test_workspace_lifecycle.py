@@ -535,6 +535,102 @@ def test_account_deletion_evicts_service_created_after_authorization(lifecycle_s
     assert all(key[0] != context.workspace_id for key in app._publication_backfills)
 
 
+@pytest.mark.parametrize("permission", ["wiki.read", "wiki.write"])
+def test_account_deletion_retries_when_invitation_expands_workspace_set(
+    lifecycle_server, monkeypatch, permission,
+):
+    app, base = lifecycle_server
+    owner, victim = Client(base), Client(base)
+    owner.register("expansion-owner@example.com", "Expansion Owner")
+    victim.register("expansion-victim@example.com", "Expansion Victim")
+    victim_context = context_for(app, victim)
+    victim_personal_root = app.platform.workspace_root(victim_context.workspace_root_name)
+    team = _create_team(owner, "Expansion Team", key=f"expansion-team-{permission}")
+    assert owner.request(
+        "POST", "/api/workspaces/switch", {"workspace_id": team["id"]}, key=f"expansion-owner-{permission}",
+    )[0] == 200
+    team_service = app.workspace_service(context_for(app, owner))
+    article_path = team_service.root / "wiki" / "concepts" / "private.md"
+    article_path.parent.mkdir(parents=True, exist_ok=True)
+    article_path.write_text("# Private\n\nPrivate body\n", encoding="utf-8")
+    invitation = owner.request(
+        "POST", "/api/workspace/invitations",
+        {"email": "expansion-victim@example.com", "role": "editor"},
+        key=f"expansion-invite-{permission}",
+    )[1]
+
+    original_workspace_ids = app.platform.account_workspace_ids
+    initial_enumeration = threading.Event()
+    release_deletion = threading.Event()
+
+    def delayed_workspace_ids(user_id):
+        workspace_ids = original_workspace_ids(user_id)
+        if threading.current_thread().name == "account-delete":
+            initial_enumeration.set()
+            assert release_deletion.wait(5)
+        return workspace_ids
+
+    monkeypatch.setattr(app.platform, "account_workspace_ids", delayed_workspace_ids)
+    outcomes: dict = {}
+    delete_done = threading.Event()
+
+    def delete_victim():
+        app.delete_account(victim_context, "correct-horse-123")
+        outcomes["deleted"] = True
+        delete_done.set()
+
+    delete_thread = threading.Thread(target=delete_victim, name="account-delete")
+    delete_thread.start()
+    assert initial_enumeration.wait(5)
+    assert victim.request(
+        "POST", f"/api/invitations/{invitation['id']}/accept", {},
+        key=f"expansion-accept-{permission}",
+    )[0] == 200
+    assert victim.request(
+        "POST", "/api/workspaces/switch", {"workspace_id": team["id"]},
+        key=f"expansion-switch-{permission}",
+    )[0] == 200
+    expanded_context = context_for(app, victim)
+    expanded_service = app.workspace_service(expanded_context)
+    before = expanded_service.read_article("concepts/private.md")
+    request_admitted = threading.Event()
+    release_request = threading.Event()
+
+    def workspace_request():
+        with app.workspace_action(expanded_context, expanded_service, permission):
+            request_admitted.set()
+            assert release_request.wait(5)
+            if permission == "wiki.read":
+                outcomes["request"] = expanded_service.read_article("concepts/private.md")
+            else:
+                updated = before["markdown"] + "\nUpdated before deletion.\n"
+                outcomes["request"] = expanded_service.files.commit(
+                    {"wiki/concepts/private.md": updated.encode("utf-8")},
+                    kind="test-expanded-workspace-write",
+                    operation_id="test-expanded-workspace-write",
+                )
+
+    request_thread = threading.Thread(target=workspace_request, name="expanded-workspace-request")
+    request_thread.start()
+    assert request_admitted.wait(5)
+    release_deletion.set()
+    assert not delete_done.wait(0.2)
+    release_request.set()
+    request_thread.join(timeout=5)
+    delete_thread.join(timeout=5)
+
+    assert outcomes["deleted"] is True
+    if permission == "wiki.read":
+        assert "Private body" in outcomes["request"]["markdown"]
+    else:
+        assert outcomes["request"]["status"] == "committed"
+        assert "Updated before deletion." in article_path.read_text(encoding="utf-8")
+    assert not victim_personal_root.exists()
+    assert app.platform.workspace_storage_state(team["id"])["status"] == "active"
+    assert app._services[team["id"]] is expanded_service
+    assert not expanded_service.retired
+
+
 def test_lifecycle_replay_reconciles_authoritative_status(lifecycle_server):
     app, owner, _member, team, _owner_personal, _member_personal = _team_world(lifecycle_server)
     service = app.workspace_service(context_for(app, owner))
