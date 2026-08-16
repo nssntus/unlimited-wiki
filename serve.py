@@ -274,6 +274,10 @@ class WikiApp:
             if close_service is not None:
                 close_service.close()
 
+    def run_workspace_access_mutation(self, workspace_id: str, action):
+        with self._workspace_gate(workspace_id):
+            return action()
+
     def close(self) -> None:
         if self.service is not None:
             self.service.close()
@@ -294,15 +298,29 @@ class WikiApp:
         return output.getvalue()
 
     def delete_account(self, context: SessionContext | AccountSessionContext, password: str) -> None:
-        result = self.platform.delete_account(context, password)
-        for workspace in result["cleanup_workspaces"]:
-            service = self._services.pop(workspace["id"], None)
-            self._diagnostics.pop(workspace["id"], None)
-            if service is not None:
+        workspace_ids = self.platform.account_workspace_ids(context.user_id)
+        with contextlib.ExitStack() as gates:
+            for workspace_id in workspace_ids:
+                gates.enter_context(self._workspace_gate(workspace_id))
+            result = self.platform.delete_account(context, password)
+            cleanup_ids = {workspace["id"] for workspace in result["cleanup_workspaces"]}
+            services: list[WikiService] = []
+            with self._service_lock:
+                for workspace_id in cleanup_ids:
+                    service = self._services.get(workspace_id)
+                    if service is not None:
+                        self._services.pop(workspace_id, None)
+                        services.append(service)
+                    self._diagnostics.pop(workspace_id, None)
+                self._publication_backfills = {
+                    key for key in self._publication_backfills if key[0] not in cleanup_ids
+                }
+            for service in services:
                 service.close()
-            root = self.platform.workspace_root(workspace["root_name"])
-            if root.exists():
-                shutil.rmtree(root)
+            for workspace in result["cleanup_workspaces"]:
+                root = self.platform.workspace_root(workspace["root_name"])
+                if root.exists():
+                    shutil.rmtree(root)
 
     def status(self, service: WikiService) -> dict:
         config = service.llm
@@ -923,17 +941,23 @@ def make_handler(app: WikiApp):
             if match:
                 action = match.group("action")
                 _fields(data, {"role"} if action == "role" else set(), {"role"} if action == "role" else set())
-                response, _ = self._platform_idempotency(data, lambda: (
-                    app.platform.change_workspace_member_role(
-                        self.context, match.group(1), _string(data, "role", maximum=20, required=True),
-                    ) if action == "role" else app.platform.remove_workspace_member(self.context, match.group(1))
-                ))
+                response, _ = app.run_workspace_access_mutation(
+                    self.context.workspace_id,
+                    lambda: self._platform_idempotency(data, lambda: (
+                        app.platform.change_workspace_member_role(
+                            self.context, match.group(1), _string(data, "role", maximum=20, required=True),
+                        ) if action == "role" else app.platform.remove_workspace_member(self.context, match.group(1))
+                    )),
+                )
                 return self._json(200, response)
             if path == "/api/workspace/owner-transfer":
                 _fields(data, {"user_id"}, {"user_id"})
-                response, _ = self._platform_idempotency(data, lambda: app.platform.transfer_workspace_owner(
-                    self.context, _string(data, "user_id", maximum=64, required=True),
-                ))
+                response, _ = app.run_workspace_access_mutation(
+                    self.context.workspace_id,
+                    lambda: self._platform_idempotency(data, lambda: app.platform.transfer_workspace_owner(
+                        self.context, _string(data, "user_id", maximum=64, required=True),
+                    )),
+                )
                 return self._json(200, response)
             if path == "/api/workspace/rename":
                 _fields(data, {"display_name"}, {"display_name"})
@@ -954,9 +978,12 @@ def make_handler(app: WikiApp):
                     scope=f"account:{self.account_context.user_id}:workspace:{workspace_id}",
                 )
                 if action == "leave":
-                    response, replay = self._platform_idempotency(
-                        data, lambda: app.platform.leave_workspace(account, workspace_id),
-                        scope=f"account:{self.account_context.user_id}:workspace:{workspace_id}",
+                    response, replay = app.run_workspace_access_mutation(
+                        workspace_id,
+                        lambda: self._platform_idempotency(
+                            data, lambda: app.platform.leave_workspace(account, workspace_id),
+                            scope=f"account:{self.account_context.user_id}:workspace:{workspace_id}",
+                        ),
                     )
                 else:
                     response, replay = app.run_workspace_lifecycle(account.user_id, workspace_id, transition)

@@ -1521,6 +1521,21 @@ class PlatformStore:
                 raise FileNotFoundError(user_id)
         self.audit(actor_id, "user.role", "user", user_id, {"role": role})
 
+    def account_workspace_ids(self, user_id: str) -> list[str]:
+        with self._lock, self.connect() as db:
+            rows = db.execute("""
+                SELECT DISTINCT workspace.id
+                FROM workspaces workspace
+                JOIN organizations organization ON organization.id=workspace.organization_id
+                LEFT JOIN workspace_members member
+                  ON member.workspace_id=workspace.id AND member.user_id=?
+                WHERE member.user_id IS NOT NULL
+                   OR workspace.owner_id=?
+                   OR organization.personal_owner_id=?
+                ORDER BY workspace.id
+            """, (user_id, user_id, user_id)).fetchall()
+        return [row["id"] for row in rows]
+
     def delete_account(self, context: SessionContext | AccountSessionContext, password: str) -> dict:
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")

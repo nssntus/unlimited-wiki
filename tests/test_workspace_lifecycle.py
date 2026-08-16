@@ -375,6 +375,166 @@ def test_long_workspace_read_does_not_hold_global_platform_lock(lifecycle_server
     assert not platform_thread.is_alive()
 
 
+def test_member_removal_waits_for_admitted_private_read(lifecycle_server):
+    app, owner, member, team, _owner_personal, _member_personal = _team_world(lifecycle_server)
+    owner_context = context_for(app, owner)
+    member_context = context_for(app, member)
+    member_id = context_for(app, member).user_id
+    assert owner.request(
+        "POST", f"/api/workspace/members/{member_id}/role", {"role": "viewer"}, key="read-viewer",
+    )[0] == 200
+    service = app.workspace_service(member_context)
+    article = service.root / "wiki" / "concepts" / "secret.md"
+    article.parent.mkdir(parents=True, exist_ok=True)
+    article.write_text("# Secret\n\nSecret body\n", encoding="utf-8")
+
+    read_authorized = threading.Event()
+    release_read = threading.Event()
+    mutation_waiting = threading.Event()
+    outcomes: dict = {}
+
+    def read_article():
+        with app.workspace_action(member_context, service, "wiki.read"):
+            read_authorized.set()
+            assert release_read.wait(5)
+            outcomes["read"] = service.read_article("concepts/secret.md")
+
+    read_thread = threading.Thread(target=read_article)
+    remove_done = threading.Event()
+
+    def remove_member():
+        mutation_waiting.set()
+        outcomes["remove"] = app.run_workspace_access_mutation(
+            team["id"], lambda: app.platform.remove_workspace_member(owner_context, member_id),
+        )
+        remove_done.set()
+
+    remove_thread = threading.Thread(target=remove_member)
+    read_thread.start()
+    assert read_authorized.wait(5)
+    remove_thread.start()
+    assert mutation_waiting.wait(5)
+    assert not remove_done.wait(0.2)
+    release_read.set()
+    read_thread.join(timeout=5)
+    remove_thread.join(timeout=5)
+
+    assert "Secret body" in outcomes["read"]["markdown"]
+    assert outcomes["remove"]["status"] == "suspended"
+    assert member.request("GET", "/api/article?path=concepts/secret.md")[0] == 401
+
+
+def test_account_deletion_waits_for_admitted_read_and_evicts_cache(lifecycle_server, monkeypatch):
+    app, base = lifecycle_server
+    owner = Client(base)
+    owner.register("delete-read@example.com", "Delete Read")
+    context = context_for(app, owner)
+    service = app.workspace_service(context)
+    article = service.root / "wiki" / "concepts" / "delete-secret.md"
+    article.parent.mkdir(parents=True, exist_ok=True)
+    article.write_text("# Delete Secret\n\nSecret body\n", encoding="utf-8")
+
+    original_authorize = app.platform.authorize_workspace
+    read_authorized = threading.Event()
+    release_read = threading.Event()
+    read_checks = 0
+
+    def delayed_read(user_id, workspace_id, permission):
+        nonlocal read_checks
+        result = original_authorize(user_id, workspace_id, permission)
+        if user_id == context.user_id and workspace_id == context.workspace_id and permission == "wiki.read":
+            read_checks += 1
+            if read_checks == 2:
+                read_authorized.set()
+                assert release_read.wait(5)
+        return result
+
+    monkeypatch.setattr(app.platform, "authorize_workspace", delayed_read)
+    outcomes: dict = {}
+    read_thread = threading.Thread(
+        target=lambda: outcomes.setdefault(
+            "read", owner.request("GET", "/api/article?path=concepts/delete-secret.md"),
+        ),
+    )
+    delete_done = threading.Event()
+
+    def delete_owner():
+        app.delete_account(context, "correct-horse-123")
+        outcomes["deleted"] = True
+        delete_done.set()
+
+    delete_thread = threading.Thread(target=delete_owner)
+    read_thread.start()
+    assert read_authorized.wait(5)
+    delete_thread.start()
+    assert not delete_done.wait(0.2)
+    assert service.root.exists()
+    release_read.set()
+    read_thread.join(timeout=5)
+    delete_thread.join(timeout=5)
+
+    assert outcomes["read"][0] == 200
+    assert outcomes["deleted"] is True
+    assert not service.root.exists()
+    assert service.retired
+    assert context.workspace_id not in app._services
+    assert context.workspace_id not in app._diagnostics
+    assert all(key[0] != context.workspace_id for key in app._publication_backfills)
+
+
+def test_account_deletion_evicts_service_created_after_authorization(lifecycle_server, monkeypatch):
+    app, base = lifecycle_server
+    owner = Client(base)
+    owner.register("delete-create@example.com", "Delete Create")
+    context = context_for(app, owner)
+    with app._service_lock:
+        prior = app._services.pop(context.workspace_id, None)
+        app._diagnostics.pop(context.workspace_id, None)
+        app._publication_backfills = {
+            key for key in app._publication_backfills if key[0] != context.workspace_id
+        }
+    if prior is not None:
+        prior.close()
+
+    original_authorize = app.platform.authorize_workspace
+    service_authorized = threading.Event()
+    release_service = threading.Event()
+
+    def delayed_service_authorization(user_id, workspace_id, permission):
+        result = original_authorize(user_id, workspace_id, permission)
+        if threading.current_thread().name == "service-create" and workspace_id == context.workspace_id:
+            service_authorized.set()
+            assert release_service.wait(5)
+        return result
+
+    monkeypatch.setattr(app.platform, "authorize_workspace", delayed_service_authorization)
+    outcomes: dict = {}
+
+    def create_service():
+        outcomes["service"] = app.workspace_service(context)
+
+    def delete_owner():
+        app.delete_account(context, "correct-horse-123")
+        outcomes["deleted"] = True
+
+    create_thread = threading.Thread(target=create_service, name="service-create")
+    delete_thread = threading.Thread(target=delete_owner, name="account-delete")
+    create_thread.start()
+    assert service_authorized.wait(5)
+    delete_thread.start()
+    assert delete_thread.is_alive()
+    release_service.set()
+    create_thread.join(timeout=5)
+    delete_thread.join(timeout=5)
+
+    assert outcomes["deleted"] is True
+    assert outcomes["service"].retired
+    assert not outcomes["service"].root.exists()
+    assert context.workspace_id not in app._services
+    assert context.workspace_id not in app._diagnostics
+    assert all(key[0] != context.workspace_id for key in app._publication_backfills)
+
+
 def test_lifecycle_replay_reconciles_authoritative_status(lifecycle_server):
     app, owner, _member, team, _owner_personal, _member_personal = _team_world(lifecycle_server)
     service = app.workspace_service(context_for(app, owner))
