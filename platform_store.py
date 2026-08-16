@@ -1341,6 +1341,29 @@ class PlatformStore:
             updated["status"] = target
         return self._workspace_summary(updated, current=False)
 
+    def workspace_storage_state(self, workspace_id: str) -> dict:
+        with self.connect() as db:
+            row = db.execute("""
+                SELECT workspace.id,workspace.root_name,workspace.status
+                FROM workspaces workspace
+                JOIN organizations organization ON organization.id=workspace.organization_id
+                WHERE workspace.id=? AND organization.kind='team'
+            """, (workspace_id,)).fetchone()
+        if row is None:
+            raise FileNotFoundError(workspace_id)
+        return dict(row)
+
+    def workspace_storage_states(self) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute("""
+                SELECT workspace.id,workspace.root_name,workspace.status
+                FROM workspaces workspace
+                JOIN organizations organization ON organization.id=workspace.organization_id
+                WHERE organization.kind='team'
+                ORDER BY workspace.created_at,workspace.id
+            """).fetchall()
+        return [dict(row) for row in rows]
+
     def leave_workspace(
         self, context: SessionContext | AccountSessionContext, workspace_id: str,
     ) -> dict:
@@ -1513,7 +1536,8 @@ class PlatformStore:
                 SELECT DISTINCT w.id,w.organization_id,w.owner_id FROM workspaces w
                 JOIN organizations o ON o.id=w.organization_id AND o.kind='team'
                 LEFT JOIN workspace_members own ON own.workspace_id=w.id AND own.user_id=?
-                WHERE w.owner_id=? OR (own.role='owner' AND own.status='active')
+                WHERE (w.owner_id=? OR (own.role='owner' AND own.status='active'))
+                  AND w.status IN ('active','suspended') AND o.status<>'deleted'
             """, (context.user_id, context.user_id)).fetchall()
             workspace_transfers = []
             for workspace in team_workspaces:
@@ -1539,6 +1563,12 @@ class PlatformStore:
                 JOIN organization_members own ON own.organization_id=organization.id
                 WHERE organization.kind='team' AND own.user_id=?
                   AND own.role='owner' AND own.status='active'
+                  AND organization.status<>'deleted'
+                  AND EXISTS (
+                    SELECT 1 FROM workspaces live
+                    WHERE live.organization_id=organization.id
+                      AND live.status IN ('active','suspended')
+                  )
             """, (context.user_id,)).fetchall()
             organization_transfers = []
             for organization in team_organizations:

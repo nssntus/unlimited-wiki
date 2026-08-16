@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from serve import create_app, create_server
+from publication import public_markdown, snapshot_fingerprint
 from state_store import StateStore
 from tests.test_multitenant import Client, context_for
 from tests.test_team_collaboration import _create_team, _invite_and_accept
@@ -135,3 +136,206 @@ def test_lifecycle_rejects_personal_low_role_and_foreign_workspace(lifecycle_ser
     outsider = Client(member.origin)
     outsider.register("lifecycle-outsider@example.com", "Lifecycle Outsider")
     assert outsider.request("POST", f"/api/workspaces/{team['id']}/suspend", {}, key="foreign-suspend")[0] == 404
+
+
+def test_stale_service_cannot_write_after_suspend(lifecycle_server):
+    app, owner, _member, team, _owner_personal, _member_personal = _team_world(lifecycle_server)
+    context = context_for(app, owner)
+    service = app.workspace_service(context)
+    article_path = service.root / "wiki" / "concepts" / "guarded.md"
+    article_path.parent.mkdir(parents=True, exist_ok=True)
+    article_path.write_text("# Guarded\n\nBefore.\n", encoding="utf-8")
+    article = service.read_article("concepts/guarded.md")
+    captured = threading.Event()
+    release = threading.Event()
+    outcome: dict = {}
+
+    def stale_request():
+        captured.set()
+        assert release.wait(3)
+        try:
+            with app.workspace_action(context, service, "wiki.write"):
+                outcome["result"] = service.save_article(
+                    article["path"], article["markdown"] + "\nAfter.\n", article["revision"],
+                )
+        except Exception as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=stale_request)
+    thread.start()
+    assert captured.wait(3)
+    before = article_path.read_bytes()
+    assert owner.request("POST", f"/api/workspaces/{team['id']}/suspend", {}, key="guard-suspend")[0] == 200
+    release.set()
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+    assert isinstance(outcome.get("error"), FileNotFoundError)
+    assert article_path.read_bytes() == before
+    assert team["id"] not in app._services
+
+
+def test_lifecycle_replay_reconciles_authoritative_status(lifecycle_server):
+    app, owner, _member, team, _owner_personal, _member_personal = _team_world(lifecycle_server)
+    service = app.workspace_service(context_for(app, owner))
+    task, _ = service.state.enqueue_task("supplement", "replay", {"path": "concepts/missing.md"})
+
+    assert owner.request("POST", f"/api/workspaces/{team['id']}/suspend", {}, key="replay-suspend")[0] == 200
+    assert owner.request("POST", f"/api/workspaces/{team['id']}/restore", {}, key="replay-restore")[0] == 200
+    assert owner.request("POST", f"/api/workspaces/{team['id']}/suspend", {}, key="replay-suspend")[0] == 200
+
+    record = app.platform.workspace_storage_state(team["id"])
+    current = StateStore(app.platform.workspace_root(record["root_name"]), recover_running=False).get_task(task["id"])
+    assert record["status"] == "active"
+    assert current["status"] == "queued"
+
+
+def test_lifecycle_replay_repairs_failed_local_projection(lifecycle_server, monkeypatch):
+    app, owner, _member, team, _owner_personal, _member_personal = _team_world(lifecycle_server)
+    service = app.workspace_service(context_for(app, owner))
+    task, _ = service.state.enqueue_task("supplement", "repair", {"path": "concepts/missing.md"})
+    original = app._reconcile_workspace_storage
+    calls = 0
+
+    def fail_once(record, cached_service=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("injected lifecycle projection failure")
+        return original(record, cached_service)
+
+    monkeypatch.setattr(app, "_reconcile_workspace_storage", fail_once)
+    first = owner.request("POST", f"/api/workspaces/{team['id']}/suspend", {}, key="repair-suspend")
+    assert first[0] == 500
+    assert app.platform.workspace_storage_state(team["id"])["status"] == "suspended"
+
+    replay = owner.request("POST", f"/api/workspaces/{team['id']}/suspend", {}, key="repair-suspend")
+    assert replay[0] == 200
+    state = StateStore(service.root, recover_running=False)
+    assert state.get_task(task["id"])["status"] == "paused"
+
+
+def test_suspend_pauses_running_task_and_fences_late_result(lifecycle_server, monkeypatch):
+    app, owner, _member, team, _owner_personal, _member_personal = _team_world(lifecycle_server)
+    context = context_for(app, owner)
+    service = app.workspace_service(context)
+    article_path = service.root / "wiki" / "concepts" / "late.md"
+    article_path.parent.mkdir(parents=True, exist_ok=True)
+    article_path.write_text("# Late result\n\nBefore.\n", encoding="utf-8")
+    article = service.read_article("concepts/late.md")
+    task, _ = service.state.enqueue_task(
+        "governance", article["title"], {"path": article["path"], "base_revision": article["revision"]},
+        actor_user_id=context.user_id,
+    )
+    claimed = service.state.claim_task({"governance"})
+    model_started = threading.Event()
+    release_model = threading.Event()
+
+    def delayed_model(_article):
+        model_started.set()
+        assert release_model.wait(3)
+        return article["markdown"] + "\nLate mutation.\n"
+
+    monkeypatch.setattr(service, "_call_governance_llm", delayed_model)
+    monkeypatch.setattr("wiki_ops.article_quality_issues", lambda *_args, **_kwargs: [])
+    outcome: dict = {}
+
+    def run_task():
+        try:
+            outcome["result"] = service._run_governance_task(claimed)
+        except Exception as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=run_task)
+    thread.start()
+    assert model_started.wait(3)
+    before = article_path.read_bytes()
+    assert owner.request("POST", f"/api/workspaces/{team['id']}/suspend", {}, key="late-suspend")[0] == 200
+    assert service.state.get_task(task["id"])["status"] == "paused"
+    release_model.set()
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+    assert outcome.get("error") is None
+    assert outcome["result"]["superseded"] is True
+    assert article_path.read_bytes() == before
+    assert list(service.files.history_root.glob(f"govern-{task['id']}-attempt-*")) == []
+
+    assert owner.request("POST", f"/api/workspaces/{team['id']}/restore", {}, key="late-restore")[0] == 200
+    assert StateStore(service.root, recover_running=False).get_task(task["id"])["status"] == "queued"
+
+
+def test_startup_reconciles_platform_workspace_status(lifecycle_server):
+    app, owner, _member, team, _owner_personal, _member_personal = _team_world(lifecycle_server)
+    service = app.workspace_service(context_for(app, owner))
+    root = service.root
+    task, _ = service.state.enqueue_task("supplement", "crash", {"path": "concepts/missing.md"})
+    # Simulate a crash after the authoritative Platform transaction committed but before StateStore was projected.
+    with app.platform.connect() as db:
+        db.execute("UPDATE workspaces SET status='suspended' WHERE id=?", (team["id"],))
+    app.close()
+
+    restarted = create_app(app.project_root, app.viewer_dir, start_worker=False, multi_user=True)
+    try:
+        assert StateStore(root, recover_running=False).get_task(task["id"])["status"] == "paused"
+    finally:
+        restarted.close()
+
+
+def test_deleted_team_does_not_block_sole_owner_account_deletion(lifecycle_server):
+    app, base = lifecycle_server
+    owner = Client(base)
+    owner.register("deleted-owner@example.com", "Deleted Owner")
+    team = _create_team(owner, "Deleted Owner Team", key="deleted-owner-team")
+    owner.request("POST", "/api/workspaces/switch", {"workspace_id": team["id"]}, key="deleted-owner-switch")
+    context = context_for(app, owner)
+    service = app.workspace_service(context)
+    root = service.root
+    article_id = "a" * 32
+    markdown = (
+        f"# Retained publication\n\n> Article-ID: {article_id}\n> Category-ID: " + "b" * 32
+        + "\n> Classification: confirmed\n> Category: concepts\n> Status: 词条\n\nRetained body.\n"
+    )
+    article_path = root / "wiki" / "concepts" / "retained.md"
+    article_path.parent.mkdir(parents=True, exist_ok=True)
+    article_path.write_text(markdown, encoding="utf-8")
+    app.platform.save_model(team["id"], "openai-compatible", "https://example.com/v1", "secret", "model")
+    snapshot = {
+        "title": "Retained publication", "category": "concepts", "content_status": "词条",
+        "markdown": public_markdown(markdown), "summary": "Retained body.",
+        "attribution": "Deleted Owner", "source_summaries": [],
+    }
+    preview = app.platform.create_preview(
+        context, "concepts/retained.md", "revision", article_id, snapshot_fingerprint(snapshot), snapshot,
+    )
+    submission = app.platform.submit_preview(context, preview["preview_id"])
+    app.platform.ai_decide(submission["id"], "pass", {"summary": "accepted"})
+    approved = app.platform.admin_decide(context, submission["id"], "approve", "approved")
+    with app.platform.connect() as db:
+        before_submission = db.execute("SELECT snapshot_json,content_hash FROM submissions WHERE id=?", (submission["id"],)).fetchone()
+        before_revision = db.execute(
+            "SELECT snapshot_json,content_hash FROM public_revisions WHERE entry_id=?",
+            (approved["public_entry_id"],),
+        ).fetchone()
+
+    assert owner.request("POST", f"/api/workspaces/{team['id']}/suspend", {}, key="deleted-owner-suspend")[0] == 200
+    assert owner.request("POST", f"/api/workspaces/{team['id']}/delete", {}, key="deleted-owner-delete")[0] == 200
+    deleted = owner.request("POST", "/api/account/delete", {"password": "correct-horse-123"}, key="deleted-owner-account")
+    assert deleted == (200, {"deleted": True})
+    assert root.is_dir() and article_path.read_bytes() == markdown.encode("utf-8")
+    assert app.platform.load_model(team["id"])["model"] == "model"
+    with app.platform.connect() as db:
+        workspace = db.execute("SELECT status,owner_id FROM workspaces WHERE id=?", (team["id"],)).fetchone()
+        user = db.execute("SELECT status FROM users WHERE id=?", (context.user_id,)).fetchone()
+        after_submission = db.execute("SELECT snapshot_json,content_hash FROM submissions WHERE id=?", (submission["id"],)).fetchone()
+        after_revision = db.execute(
+            "SELECT snapshot_json,content_hash FROM public_revisions WHERE entry_id=?",
+            (approved["public_entry_id"],),
+        ).fetchone()
+        transfers = db.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE action IN ('workspace.owner_transfer','organization.owner_transfer') AND actor_id=?",
+            (context.user_id,),
+        ).fetchone()[0]
+    assert tuple(workspace) == ("deleted", context.user_id)
+    assert user["status"] == "deleted"
+    assert tuple(after_submission) == tuple(before_submission)
+    assert tuple(after_revision) == tuple(before_revision)
+    assert transfers == 0
