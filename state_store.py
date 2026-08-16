@@ -16,13 +16,13 @@ def now_iso() -> str:
 
 
 class StateStore:
-    def __init__(self, project_root: Path):
+    def __init__(self, project_root: Path, *, recover_running: bool = True):
         self.project_root = project_root.resolve()
         state = project_root / ".wiki-state"
         state.mkdir(parents=True, exist_ok=True)
         self.path = state / "state.sqlite3"
         self._lock = threading.RLock()
-        self._init_schema()
+        self._init_schema(recover_running=recover_running)
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=15, check_same_thread=False)
@@ -32,7 +32,7 @@ class StateStore:
         connection.execute("PRAGMA synchronous=FULL")
         return connection
 
-    def _init_schema(self) -> None:
+    def _init_schema(self, *, recover_running: bool) -> None:
         with self.connect() as db:
             db.executescript(
                 """
@@ -123,14 +123,17 @@ class StateStore:
             task_columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
             if "actor_user_id" not in task_columns:
                 db.execute("ALTER TABLE tasks ADD COLUMN actor_user_id TEXT")
+            if "paused_from_status" not in task_columns:
+                db.execute("ALTER TABLE tasks ADD COLUMN paused_from_status TEXT")
             db.execute("DROP INDEX IF EXISTS tasks_one_active")
             db.execute(
-                "CREATE UNIQUE INDEX tasks_one_active ON tasks(active_key) WHERE status IN ('staged','queued','running')"
+                "CREATE UNIQUE INDEX tasks_one_active ON tasks(active_key) WHERE status IN ('staged','queued','running','paused')"
             )
-            db.execute(
-                "UPDATE tasks SET status='queued', next_run_at=?, updated_at=? WHERE status='running'",
-                (now_iso(), now_iso()),
-            )
+            if recover_running:
+                db.execute(
+                    "UPDATE tasks SET status='queued', next_run_at=?, updated_at=? WHERE status='running'",
+                    (now_iso(), now_iso()),
+                )
             db.execute("DELETE FROM idempotency WHERE status='pending'")
             staged = db.execute("SELECT id,payload_json FROM tasks WHERE status='staged'").fetchall()
             for row in staged:
@@ -195,7 +198,7 @@ class StateStore:
         created = now_iso()
         with self._lock, self.connect() as db:
             existing = db.execute(
-                "SELECT * FROM tasks WHERE active_key=? AND status IN ('staged','queued','running')",
+                "SELECT * FROM tasks WHERE active_key=? AND status IN ('staged','queued','running','paused')",
                 (active_key,),
             ).fetchone()
             if existing:
@@ -383,6 +386,84 @@ class StateStore:
         if not changed and self.get_task(task_id)["status"] not in {"cancelled", "succeeded", "failed"}:
             raise ValueError("task cannot be cancelled")
         return self.get_task(task_id)
+
+    def pause_active_tasks(self) -> list[dict]:
+        stamp = now_iso()
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                "SELECT id FROM tasks WHERE status IN ('staged','queued','running')"
+            ).fetchall()
+            task_ids = [row["id"] for row in rows]
+            db.execute("""
+                UPDATE tasks SET paused_from_status=status,status='paused',next_run_at=NULL,updated_at=?
+                WHERE status IN ('staged','queued','running')
+            """, (stamp,))
+            if task_ids:
+                placeholders = ",".join("?" for _ in task_ids)
+                db.execute(
+                    f"UPDATE classification_suggestions SET status='paused',updated_at=? WHERE task_id IN ({placeholders})",
+                    [stamp, *task_ids],
+                )
+                db.execute(
+                    f"UPDATE raw_classification_plans SET status='paused',updated_at=? WHERE task_id IN ({placeholders})",
+                    [stamp, *task_ids],
+                )
+            db.commit()
+        return [self.get_task(task_id) for task_id in task_ids]
+
+    def resume_paused_tasks(self) -> list[dict]:
+        stamp = now_iso()
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute("SELECT id,paused_from_status FROM tasks WHERE status='paused'").fetchall()
+            task_ids = [row["id"] for row in rows]
+            for row in rows:
+                status = "staged" if row["paused_from_status"] == "staged" else "queued"
+                db.execute("""
+                    UPDATE tasks SET status=?,paused_from_status=NULL,next_run_at=?,updated_at=?
+                    WHERE id=? AND status='paused'
+                """, (status, stamp if status == "queued" else None, stamp, row["id"]))
+            if task_ids:
+                placeholders = ",".join("?" for _ in task_ids)
+                db.execute(
+                    f"UPDATE classification_suggestions SET status='queued',updated_at=? WHERE task_id IN ({placeholders}) AND status='paused'",
+                    [stamp, *task_ids],
+                )
+                db.execute(
+                    f"UPDATE raw_classification_plans SET status='queued',updated_at=? WHERE task_id IN ({placeholders}) AND status='paused'",
+                    [stamp, *task_ids],
+                )
+            db.commit()
+        return [self.get_task(task_id) for task_id in task_ids]
+
+    def terminate_workspace_tasks(self) -> list[dict]:
+        stamp = now_iso()
+        message = "The workspace was deleted."
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                "SELECT id FROM tasks WHERE status IN ('staged','queued','running','paused')"
+            ).fetchall()
+            task_ids = [row["id"] for row in rows]
+            db.execute("""
+                UPDATE tasks SET status='failed',paused_from_status=NULL,error_type='workspace_deleted',
+                    error_message=?,next_run_at=NULL,updated_at=?
+                WHERE status IN ('staged','queued','running','paused')
+            """, (message, stamp))
+            if task_ids:
+                placeholders = ",".join("?" for _ in task_ids)
+                params = [message, stamp, *task_ids]
+                db.execute(
+                    f"UPDATE classification_suggestions SET status='failed',error_type='workspace_deleted',error_message=?,updated_at=? WHERE task_id IN ({placeholders})",
+                    params,
+                )
+                db.execute(
+                    f"UPDATE raw_classification_plans SET status='failed',error_type='workspace_deleted',error_message=?,updated_at=? WHERE task_id IN ({placeholders})",
+                    params,
+                )
+            db.commit()
+        return [self.get_task(task_id) for task_id in task_ids]
 
     def retry_task(
         self, task_id: str, *, payload: dict | None = None, actor_user_id: str | None = None,

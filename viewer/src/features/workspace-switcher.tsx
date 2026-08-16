@@ -1,6 +1,7 @@
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { Building2Icon, CheckIcon, ChevronsUpDownIcon, PlusIcon, UserRoundIcon } from "lucide-react"
+import { Building2Icon, CheckIcon, ChevronsUpDownIcon, ListTreeIcon, PlusIcon, UserRoundIcon } from "lucide-react"
+import { useNavigate } from "react-router-dom"
 import { toast } from "sonner"
 
 import { apiGet, apiPost, queryKeys, type WorkspaceSummary } from "@/lib/api"
@@ -19,6 +20,7 @@ import { useSession } from "@/features/session-context"
 
 export function WorkspaceSwitcher() {
   const client = useQueryClient()
+  const navigate = useNavigate()
   const { session, switchWorkspace, switchingWorkspace } = useSession()
   const [createOpen, setCreateOpen] = useState(false)
   const [name, setName] = useState("")
@@ -61,7 +63,7 @@ export function WorkspaceSwitcher() {
           </DropdownMenuItem>)}
         </DropdownMenuGroup>
         <DropdownMenuSeparator />
-        <DropdownMenuGroup><DropdownMenuItem onClick={() => setCreateOpen(true)}><PlusIcon />创建团队空间</DropdownMenuItem></DropdownMenuGroup>
+        <DropdownMenuGroup><DropdownMenuItem onClick={() => navigate("/workspaces")}><ListTreeIcon />管理全部空间</DropdownMenuItem><DropdownMenuItem onClick={() => setCreateOpen(true)}><PlusIcon />创建团队空间</DropdownMenuItem></DropdownMenuGroup>
       </DropdownMenuContent>
     </DropdownMenu>
 

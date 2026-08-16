@@ -44,6 +44,12 @@ class PlatformIdempotencyError(RuntimeError):
     pass
 
 
+class AccountWorkspaceSetChanged(RuntimeError):
+    def __init__(self, workspace_ids: set[str]):
+        super().__init__("account workspace set changed")
+        self.workspace_ids = frozenset(workspace_ids)
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -80,6 +86,26 @@ def verify_password(password: str, encoded: str) -> bool:
 
 
 @dataclass(frozen=True)
+class AccountSessionContext:
+    user_id: str
+    email: str
+    nickname: str
+    role: str
+    csrf_token: str
+    expires_at: str
+    current_workspace_id: str | None
+
+    def public(self) -> dict:
+        return {
+            "user": {"id": self.user_id, "email": self.email, "nickname": self.nickname, "role": self.role},
+            "workspace": None,
+            "workspace_selection_required": True,
+            "csrf_token": self.csrf_token,
+            "session_expires_at": self.expires_at,
+        }
+
+
+@dataclass(frozen=True)
 class SessionContext:
     user_id: str
     email: str
@@ -111,6 +137,7 @@ class SessionContext:
             },
             "csrf_token": self.csrf_token,
             "session_expires_at": self.expires_at,
+            "workspace_selection_required": False,
         }
 
 
@@ -750,6 +777,26 @@ class PlatformStore:
             row["workspace_role"], csrf, row["expires_at"],
         )
 
+    def resolve_account_session(self, token: str) -> AccountSessionContext | None:
+        if not token:
+            return None
+        with self.connect() as db:
+            row = db.execute("""
+                SELECT u.id user_id,u.email,u.nickname,u.role,u.status,
+                       s.csrf_hash,s.expires_at,s.current_workspace_id
+                FROM sessions s JOIN users u ON u.id=s.user_id
+                WHERE s.token_hash=? AND s.expires_at>?
+            """, (hash_token(token), now_iso())).fetchone()
+        if row is None or row["status"] != "active":
+            return None
+        csrf = self.vault.derive(token, scope="session-csrf")
+        if not hmac.compare_digest(hash_token(csrf), row["csrf_hash"]):
+            return None
+        return AccountSessionContext(
+            row["user_id"], row["email"], row["nickname"], row["role"], csrf,
+            row["expires_at"], row["current_workspace_id"],
+        )
+
     def authorize_workspace(self, user_id: str, workspace_id: str, permission: str) -> dict:
         with self.connect() as db:
             row = self._workspace_access_row(db, user_id, workspace_id)
@@ -810,19 +857,27 @@ class PlatformStore:
     @staticmethod
     def _workspace_summary(row: sqlite3.Row | dict, *, current: bool = False) -> dict:
         role = row["workspace_role"]
+        status = row["status"]
+        kind = row["organization_kind"]
         return {
             "id": row["id"],
             "organization_id": row["organization_id"],
-            "kind": row["organization_kind"],
+            "kind": kind,
             "display_name": row["display_name"],
-            "status": row["status"],
+            "status": status,
             "role": role,
             "organization_role": row["organization_role"],
             "permissions": sorted(WORKSPACE_PERMISSIONS.get(role, frozenset())),
             "current": current,
+            "can_suspend": kind == "team" and role == "owner" and status == "active",
+            "can_restore": kind == "team" and role == "owner" and status == "suspended",
+            "can_delete": kind == "team" and role == "owner" and status == "suspended",
+            "can_leave": kind == "team" and role != "owner" and status in {"active", "suspended"},
         }
 
-    def list_workspaces(self, context: SessionContext) -> list[dict]:
+    def list_workspaces(
+        self, context: SessionContext | AccountSessionContext, *, include_inactive: bool = False,
+    ) -> list[dict]:
         with self.connect() as db:
             rows = db.execute("""
                 SELECT workspace.*,organization.kind organization_kind,
@@ -837,11 +892,29 @@ class PlatformStore:
                 JOIN users user ON user.id=workspace_member.user_id
                 WHERE workspace_member.user_id=? AND workspace_member.status='active'
                   AND organization_member.status='active' AND user.status='active'
-                  AND workspace.status='active' AND organization.status='active'
+                  AND organization.status='active'
+                  AND (
+                    workspace.status='active'
+                    OR (?=1 AND (workspace.status='suspended' OR workspace_member.role='owner'))
+                  )
                 ORDER BY CASE organization.kind WHEN 'personal' THEN 0 ELSE 1 END,
                          workspace.created_at,workspace.id
-            """, (context.user_id,)).fetchall()
-        return [self._workspace_summary(row, current=row["id"] == context.workspace_id) for row in rows]
+            """, (context.user_id, 1 if include_inactive else 0)).fetchall()
+        current_workspace_id = getattr(context, "workspace_id", None) or context.current_workspace_id
+        return [self._workspace_summary(row, current=row["id"] == current_workspace_id) for row in rows]
+
+    def workspace_summary_for_user(self, user_id: str, workspace_id: str) -> dict:
+        with self._lock, self.connect() as db:
+            row = self._workspace_access_row(db, user_id, workspace_id)
+        if (
+            row is None
+            or row["user_status"] != "active"
+            or row["organization_status"] != "active"
+            or row["workspace_member_status"] != "active"
+            or row["organization_member_status"] != "active"
+        ):
+            raise FileNotFoundError(workspace_id)
+        return self._workspace_summary(row, current=False)
 
     @staticmethod
     def _validate_workspace_name(value: str) -> str:
@@ -850,7 +923,7 @@ class PlatformStore:
             raise ValueError("workspace name must be between 1 and 80 characters")
         return value
 
-    def create_team(self, context: SessionContext, display_name: str) -> dict:
+    def create_team(self, context: SessionContext | AccountSessionContext, display_name: str) -> dict:
         display_name = self._validate_workspace_name(display_name)
         organization_id, workspace_id = uuid.uuid4().hex, uuid.uuid4().hex
         root = self.workspace_root(workspace_id)
@@ -973,7 +1046,7 @@ class PlatformStore:
             db.commit()
         return {"id": invitation_id, "workspace_id": context.workspace_id, "role": role, "status": "pending"}
 
-    def list_invitations(self, context: SessionContext) -> list[dict]:
+    def list_invitations(self, context: SessionContext | AccountSessionContext) -> list[dict]:
         with self.connect() as db:
             rows = db.execute("""
                 SELECT invitation.id,invitation.workspace_id,invitation.role,invitation.status,
@@ -990,7 +1063,7 @@ class PlatformStore:
             """, (context.user_id, now_iso())).fetchall()
         return [dict(row) for row in rows]
 
-    def respond_to_invitation(self, context: SessionContext, invitation_id: str, *, accept: bool) -> dict:
+    def respond_to_invitation(self, context: SessionContext | AccountSessionContext, invitation_id: str, *, accept: bool) -> dict:
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             invitation = db.execute("""
@@ -1175,7 +1248,7 @@ class PlatformStore:
             db.commit()
         return {"workspace_id": context.workspace_id, "old_owner_id": context.user_id, "new_owner_id": user_id}
 
-    def switch_workspace(self, token: str, context: SessionContext, workspace_id: str) -> SessionContext:
+    def switch_workspace(self, token: str, context: SessionContext | AccountSessionContext, workspace_id: str) -> SessionContext:
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             target = self._workspace_access_row(db, context.user_id, workspace_id)
@@ -1188,7 +1261,7 @@ class PlatformStore:
             db.execute(
                 "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
                 (uuid.uuid4().hex, context.user_id, "session.workspace_switch", "workspace", workspace_id,
-                 json.dumps({"from_workspace_id": context.workspace_id}), now_iso()),
+                 json.dumps({"from_workspace_id": getattr(context, "workspace_id", None) or context.current_workspace_id}), now_iso()),
             )
             db.commit()
         selected = self.resolve_session(token)
@@ -1219,6 +1292,150 @@ class PlatformStore:
             )
             db.commit()
         return {"id": context.workspace_id, "display_name": display_name}
+
+    def change_workspace_lifecycle(
+        self,
+        context: SessionContext | AccountSessionContext,
+        workspace_id: str,
+        action: str,
+    ) -> dict:
+        transitions = {
+            "suspend": ("active", "suspended"),
+            "restore": ("suspended", "active"),
+            "delete": ("suspended", "deleted"),
+        }
+        if action not in transitions:
+            raise ValueError("unsupported workspace lifecycle action")
+        expected, target = transitions[action]
+        stamp = now_iso()
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = self._workspace_access_row(db, context.user_id, workspace_id)
+            if (
+                row is None
+                or row["user_status"] != "active"
+                or row["organization_status"] != "active"
+                or row["workspace_member_status"] != "active"
+                or row["organization_member_status"] != "active"
+            ):
+                raise FileNotFoundError(workspace_id)
+            if row["organization_kind"] != "team":
+                raise ValueError("personal workspaces do not support lifecycle changes")
+            if row["workspace_role"] != "owner":
+                raise PermissionError("workspace.manage")
+            if row["status"] != expected:
+                raise ValueError(f"workspace must be {expected} before {action}")
+            db.execute(
+                "UPDATE workspaces SET status=?,updated_at=? WHERE id=? AND status=?",
+                (target, stamp, workspace_id, expected),
+            )
+            affected_sessions = 0
+            if target != "active":
+                affected_sessions = db.execute(
+                    "UPDATE sessions SET current_workspace_id=NULL WHERE current_workspace_id=?",
+                    (workspace_id,),
+                ).rowcount
+                db.execute(
+                    "UPDATE workspace_invitations SET status='revoked',updated_at=? WHERE workspace_id=? AND status='pending'",
+                    (stamp, workspace_id),
+                )
+            detail = {"from": expected, "to": target, "affected_session_count": affected_sessions}
+            db.execute(
+                "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
+                (uuid.uuid4().hex, context.user_id, f"workspace.{action}", "workspace", workspace_id,
+                 json.dumps(detail, ensure_ascii=False), stamp),
+            )
+            title = {"suspend": "团队空间已停用", "restore": "团队空间已恢复", "delete": "团队空间已删除"}[action]
+            members = db.execute("""
+                SELECT user_id FROM workspace_members
+                WHERE workspace_id=? AND status='active' AND user_id<>?
+            """, (workspace_id, context.user_id)).fetchall()
+            for member in members:
+                self._notify(
+                    db, member["user_id"], f"workspace_{action}", "workspace", workspace_id,
+                    title, row["display_name"],
+                )
+            db.commit()
+            updated = dict(row)
+            updated["status"] = target
+        return self._workspace_summary(updated, current=False)
+
+    def workspace_storage_state(self, workspace_id: str) -> dict:
+        with self.connect() as db:
+            row = db.execute("""
+                SELECT workspace.id,workspace.root_name,workspace.status
+                FROM workspaces workspace
+                JOIN organizations organization ON organization.id=workspace.organization_id
+                WHERE workspace.id=? AND organization.kind='team'
+            """, (workspace_id,)).fetchone()
+        if row is None:
+            raise FileNotFoundError(workspace_id)
+        return dict(row)
+
+    def workspace_storage_states(self) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute("""
+                SELECT workspace.id,workspace.root_name,workspace.status
+                FROM workspaces workspace
+                JOIN organizations organization ON organization.id=workspace.organization_id
+                WHERE organization.kind='team'
+                ORDER BY workspace.created_at,workspace.id
+            """).fetchall()
+        return [dict(row) for row in rows]
+
+    def leave_workspace(
+        self, context: SessionContext | AccountSessionContext, workspace_id: str,
+    ) -> dict:
+        stamp = now_iso()
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = self._workspace_access_row(db, context.user_id, workspace_id)
+            if (
+                row is None
+                or row["user_status"] != "active"
+                or row["organization_status"] != "active"
+                or row["workspace_member_status"] != "active"
+                or row["organization_member_status"] != "active"
+                or row["status"] not in {"active", "suspended"}
+            ):
+                raise FileNotFoundError(workspace_id)
+            if row["organization_kind"] != "team":
+                raise ValueError("personal workspaces cannot be left")
+            if row["workspace_role"] == "owner":
+                raise ValueError("transfer workspace ownership before leaving")
+            db.execute("""
+                UPDATE workspace_members SET status='suspended',is_default=0,updated_at=?
+                WHERE workspace_id=? AND user_id=? AND status='active'
+            """, (stamp, workspace_id, context.user_id))
+            remaining = db.execute("""
+                SELECT 1 FROM workspace_members
+                WHERE organization_id=? AND user_id=? AND status='active' LIMIT 1
+            """, (row["organization_id"], context.user_id)).fetchone()
+            if remaining is None:
+                db.execute("""
+                    UPDATE organization_members SET status='suspended',updated_at=?
+                    WHERE organization_id=? AND user_id=?
+                """, (stamp, row["organization_id"], context.user_id))
+            affected_sessions = db.execute(
+                "UPDATE sessions SET current_workspace_id=NULL WHERE user_id=? AND current_workspace_id=?",
+                (context.user_id, workspace_id),
+            ).rowcount
+            db.execute(
+                "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
+                (uuid.uuid4().hex, context.user_id, "workspace.member_leave", "workspace", workspace_id,
+                 json.dumps({"role": row["workspace_role"], "affected_session_count": affected_sessions}), stamp),
+            )
+            owners = db.execute("""
+                SELECT user_id FROM workspace_members
+                WHERE workspace_id=? AND role='owner' AND status='active'
+            """, (workspace_id,)).fetchall()
+            for owner in owners:
+                self._notify(
+                    db, owner["user_id"], "workspace_member_left", "workspace", workspace_id,
+                    "成员已退出团队空间", row["display_name"],
+                )
+            db.commit()
+        return {"workspace_id": workspace_id, "status": "left"}
 
     @staticmethod
     def _platform_payload_hash(data: dict) -> str:
@@ -1310,13 +1527,42 @@ class PlatformStore:
                 raise FileNotFoundError(user_id)
         self.audit(actor_id, "user.role", "user", user_id, {"role": role})
 
-    def delete_account(self, context: SessionContext, password: str) -> dict:
+    @staticmethod
+    def _account_workspace_ids(db: sqlite3.Connection, user_id: str) -> set[str]:
+        rows = db.execute("""
+                SELECT DISTINCT workspace.id
+                FROM workspaces workspace
+                JOIN organizations organization ON organization.id=workspace.organization_id
+                LEFT JOIN workspace_members member
+                  ON member.workspace_id=workspace.id AND member.user_id=?
+                WHERE member.user_id IS NOT NULL
+                   OR workspace.owner_id=?
+                   OR organization.personal_owner_id=?
+            """, (user_id, user_id, user_id)).fetchall()
+        return {row["id"] for row in rows}
+
+    def account_workspace_ids(self, user_id: str) -> list[str]:
+        with self._lock, self.connect() as db:
+            workspace_ids = self._account_workspace_ids(db, user_id)
+        return sorted(workspace_ids)
+
+    def delete_account(
+        self,
+        context: SessionContext | AccountSessionContext,
+        password: str,
+        *,
+        expected_workspace_ids: set[str] | None = None,
+    ) -> dict:
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             user = db.execute("SELECT * FROM users WHERE id=? AND status='active'", (context.user_id,)).fetchone()
             if user is None or not verify_password(password, user["password_hash"]):
                 db.rollback()
                 raise ValueError("password is invalid")
+            actual_workspace_ids = self._account_workspace_ids(db, context.user_id)
+            if expected_workspace_ids is not None and not actual_workspace_ids.issubset(expected_workspace_ids):
+                db.rollback()
+                raise AccountWorkspaceSetChanged(actual_workspace_ids)
             now = now_iso()
             shared_personal = db.execute("""
                 SELECT workspace.id FROM workspaces workspace
@@ -1338,7 +1584,8 @@ class PlatformStore:
                 SELECT DISTINCT w.id,w.organization_id,w.owner_id FROM workspaces w
                 JOIN organizations o ON o.id=w.organization_id AND o.kind='team'
                 LEFT JOIN workspace_members own ON own.workspace_id=w.id AND own.user_id=?
-                WHERE w.owner_id=? OR (own.role='owner' AND own.status='active')
+                WHERE (w.owner_id=? OR (own.role='owner' AND own.status='active'))
+                  AND w.status IN ('active','suspended') AND o.status<>'deleted'
             """, (context.user_id, context.user_id)).fetchall()
             workspace_transfers = []
             for workspace in team_workspaces:
@@ -1364,6 +1611,12 @@ class PlatformStore:
                 JOIN organization_members own ON own.organization_id=organization.id
                 WHERE organization.kind='team' AND own.user_id=?
                   AND own.role='owner' AND own.status='active'
+                  AND organization.status<>'deleted'
+                  AND EXISTS (
+                    SELECT 1 FROM workspaces live
+                    WHERE live.organization_id=organization.id
+                      AND live.status IN ('active','suspended')
+                  )
             """, (context.user_id,)).fetchall()
             organization_transfers = []
             for organization in team_organizations:

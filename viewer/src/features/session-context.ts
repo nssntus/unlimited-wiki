@@ -7,6 +7,7 @@ export type SessionValue = {
   loading: boolean
   signOut: () => Promise<void>
   switchWorkspace: (workspaceId: string) => Promise<void>
+  changeWorkspaceLifecycle: (workspaceId: string, action: "suspend" | "restore" | "delete" | "leave") => Promise<void>
   switchingWorkspace: boolean
   hasPermission: (permission: string) => boolean
 }

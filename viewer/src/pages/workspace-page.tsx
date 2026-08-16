@@ -1,6 +1,6 @@
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { CrownIcon, MailPlusIcon, MoreHorizontalIcon, PencilIcon, UserMinusIcon, UsersIcon } from "lucide-react"
+import { CrownIcon, LogOutIcon, MailPlusIcon, MoreHorizontalIcon, PauseCircleIcon, PencilIcon, UserMinusIcon, UsersIcon } from "lucide-react"
 import { toast } from "sonner"
 
 import { apiGet, apiPost, queryKeys, type WorkspaceInvitation, type WorkspaceMember } from "@/lib/api"
@@ -23,11 +23,11 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { useSession } from "@/features/session-context"
 
 type Role = "editor" | "viewer"
-type PendingAction = { kind: "remove" | "transfer"; member: WorkspaceMember } | null
+type PendingAction = { kind: "remove" | "transfer"; member: WorkspaceMember } | { kind: "suspend" | "leave" } | null
 
 export function WorkspacePage() {
   const client = useQueryClient()
-  const { session } = useSession()
+  const { session, changeWorkspaceLifecycle } = useSession()
   const workspace = session?.workspace
   const canManage = workspace?.permissions.includes("workspace.manage") ?? false
   const [inviteOpen, setInviteOpen] = useState(false)
@@ -59,6 +59,10 @@ export function WorkspacePage() {
     mutationFn: () => apiPost("/api/workspace/rename", { display_name: renameValue }),
     onSuccess: async () => { await Promise.all([client.invalidateQueries({ queryKey: queryKeys.session }), client.invalidateQueries({ queryKey: queryKeys.workspaces })]); toast.success("空间名称已更新") },
   })
+  const lifecycle = useMutation({
+    mutationFn: (action: "suspend" | "leave") => changeWorkspaceLifecycle(workspace!.id, action),
+    onError: (error) => { setPendingAction(null); toast.error(error.message) },
+  })
 
   if (!workspace) return null
   if (canManage && members.isLoading) return <PageFrame><Skeleton className="h-[70svh] w-full" /></PageFrame>
@@ -67,20 +71,21 @@ export function WorkspacePage() {
   return <PageFrame><div className="mx-auto max-w-4xl">
     <PageTitle eyebrow={workspace.kind === "team" ? "团队空间" : "个人空间"} title={workspace.display_name} description={workspace.kind === "team" ? "成员只在当前空间内获得权限；平台管理员不会因此获得私有正文访问权。" : "个人空间仅属于你，不能邀请成员或转移 Owner。"} actions={workspace.kind === "team" && canManage ? <Button onClick={() => setInviteOpen(true)}><MailPlusIcon data-icon="inline-start" />邀请成员</Button> : undefined} />
 
-    {workspace.kind === "personal" ? <Alert><UsersIcon /><AlertTitle>个人空间不可共享</AlertTitle><AlertDescription>需要多人协作时，请从侧栏空间切换器创建团队空间。</AlertDescription></Alert> : !canManage ? <Alert><UsersIcon /><AlertTitle>团队成员</AlertTitle><AlertDescription>你可以在当前空间协作，但只有 Owner 可以查看成员账号并管理角色。</AlertDescription></Alert> : <div className="flex flex-col gap-10">
+    {workspace.kind === "personal" ? <Alert><UsersIcon /><AlertTitle>个人空间不可共享</AlertTitle><AlertDescription>需要多人协作时，请从侧栏空间切换器创建团队空间。</AlertDescription></Alert> : !canManage ? <div className="space-y-8"><Alert><UsersIcon /><AlertTitle>团队成员</AlertTitle><AlertDescription>你可以在当前空间协作，但只有 Owner 可以查看成员账号并管理角色。</AlertDescription></Alert><section aria-labelledby="leave-heading"><h2 id="leave-heading" className="text-xl font-semibold">退出团队</h2><p className="mt-1 text-sm text-muted-foreground">退出后需要 Owner 重新邀请才能再次访问。</p><Button className="mt-4 w-full sm:w-auto" variant="outline" onClick={() => setPendingAction({ kind: "leave" })}><LogOutIcon data-icon="inline-start" />退出团队空间</Button></section></div> : <div className="flex flex-col gap-10">
       {canManage && <FieldSet><FieldLegend>空间资料</FieldLegend><FieldGroup><Field orientation="responsive"><div><FieldLabel htmlFor="workspace-display-name">名称</FieldLabel></div><div className="flex w-full max-w-md gap-2"><Input id="workspace-display-name" value={renameValue} maxLength={80} onChange={(event) => setRenameValue(event.target.value)} /><Button variant="outline" disabled={!renameValue.trim() || renameValue === workspace.display_name || rename.isPending} onClick={() => rename.mutate()}>{rename.isPending ? <Spinner /> : <PencilIcon />}<span className="sr-only">保存名称</span></Button></div></Field></FieldGroup></FieldSet>}
 
       <section aria-labelledby="members-heading"><div className="mb-4 flex items-end justify-between"><div><h2 id="members-heading" className="text-xl font-semibold">成员</h2><p className="mt-1 text-sm text-muted-foreground">角色变更和移除会在下一次请求立即生效。</p></div><Badge variant="secondary">{members.data?.length ?? 0} 人</Badge></div>
         <div className="hidden md:block"><Table><TableHeader><TableRow><TableHead>成员</TableHead><TableHead>角色</TableHead><TableHead className="w-12"><span className="sr-only">操作</span></TableHead></TableRow></TableHeader><TableBody>{(members.data ?? []).map((member) => <MemberRow key={member.user_id} member={member} canManage={canManage} onRole={(nextRole) => changeRole.mutate({ userId: member.user_id, nextRole })} onRemove={() => setPendingAction({ kind: "remove", member })} onTransfer={() => setPendingAction({ kind: "transfer", member })} />)}</TableBody></Table></div>
         <div className="divide-y md:hidden">{(members.data ?? []).map((member) => <div key={member.user_id} className="flex min-w-0 items-center gap-3 py-4"><div className="min-w-0 flex-1"><div className="truncate font-medium">{member.nickname}{member.is_current_user ? "（你）" : ""}</div><div className="truncate text-sm text-muted-foreground">{member.email}</div></div><Badge variant="outline">{roleLabel(member.role)}</Badge>{canManage && member.role !== "owner" && <MemberMenu member={member} onRole={(nextRole) => changeRole.mutate({ userId: member.user_id, nextRole })} onRemove={() => setPendingAction({ kind: "remove", member })} onTransfer={() => setPendingAction({ kind: "transfer", member })} />}</div>)}</div>
       </section>
+      <section aria-labelledby="lifecycle-heading"><h2 id="lifecycle-heading" className="text-xl font-semibold">空间状态</h2><p className="mt-1 text-sm text-muted-foreground">停用会立即阻止所有成员访问，并暂停尚未完成的后台任务。</p><Button className="mt-4 w-full sm:w-auto" variant="outline" onClick={() => setPendingAction({ kind: "suspend" })}><PauseCircleIcon data-icon="inline-start" />停用团队空间</Button></section>
     </div>}
 
     {invitations.data?.length ? <section className="mt-10"><h2 className="text-xl font-semibold">待处理邀请</h2><div className="mt-3 divide-y">{invitations.data.map((item) => <div key={item.id} className="flex flex-col gap-3 py-4 sm:flex-row sm:items-center"><div className="min-w-0 flex-1"><div className="font-medium">{item.display_name}</div><div className="text-sm text-muted-foreground">{item.invited_by_nickname} 邀请你以 {roleLabel(item.role)} 身份加入</div></div><InvitationActions invitation={item} /></div>)}</div></section> : null}
 
     <Dialog open={inviteOpen} onOpenChange={setInviteOpen}><DialogContent><DialogHeader><DialogTitle>邀请已有账号</DialogTitle><DialogDescription>邀请只发送到应用内。对方接受前不会获得任何空间权限。</DialogDescription></DialogHeader><FieldGroup><Field><FieldLabel htmlFor="invite-email">账号邮箱</FieldLabel><Input id="invite-email" type="email" value={email} onChange={(event) => setEmail(event.target.value)} /></Field><Field><FieldLabel>角色</FieldLabel><Select value={role} onValueChange={(value) => value && setRole(value as Role)}><SelectTrigger className="w-full"><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="editor">Editor · 可读写内容</SelectItem><SelectItem value="viewer">Viewer · 只读</SelectItem></SelectGroup></SelectContent></Select></Field>{invite.isError && <FieldError>{invite.error.message}</FieldError>}</FieldGroup><DialogFooter><Button variant="outline" onClick={() => setInviteOpen(false)}>取消</Button><Button disabled={!email.trim() || invite.isPending} onClick={() => invite.mutate()}>{invite.isPending && <Spinner data-icon="inline-start" />}发送邀请</Button></DialogFooter></DialogContent></Dialog>
 
-    <AlertDialog open={Boolean(pendingAction)} onOpenChange={(open) => !open && setPendingAction(null)}><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>{pendingAction?.kind === "transfer" ? "转移 Owner" : "移除成员"}</AlertDialogTitle><AlertDialogDescription>{pendingAction?.kind === "transfer" ? `转移后，${pendingAction.member.nickname} 将拥有空间管理权，你将变为 Editor。` : `移除 ${pendingAction?.member.nickname ?? "该成员"} 后，其当前团队会话会立即失效。`}</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>取消</AlertDialogCancel><AlertDialogAction variant={pendingAction?.kind === "remove" ? "destructive" : "default"} onClick={() => pendingAction && (pendingAction.kind === "transfer" ? transfer.mutate(pendingAction.member.user_id) : remove.mutate(pendingAction.member.user_id))}>确认</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
+    <AlertDialog open={Boolean(pendingAction)} onOpenChange={(open) => !open && setPendingAction(null)}><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>{pendingAction?.kind === "transfer" ? "转移 Owner" : pendingAction?.kind === "remove" ? "移除成员" : pendingAction?.kind === "suspend" ? "停用团队空间" : "退出团队空间"}</AlertDialogTitle><AlertDialogDescription>{pendingAction?.kind === "transfer" ? `转移后，${pendingAction.member.nickname} 将拥有空间管理权，你将变为 Editor。` : pendingAction?.kind === "remove" ? `移除 ${pendingAction.member.nickname} 后，其当前团队会话会立即失效。` : pendingAction?.kind === "suspend" ? "所有成员将立即离开当前 Wiki，后台任务暂停。恢复后需要重新选择该空间。" : "退出后你将无法访问该空间，Owner 需要重新邀请才能恢复权限。"}</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>取消</AlertDialogCancel><AlertDialogAction variant={pendingAction?.kind === "remove" || pendingAction?.kind === "suspend" ? "destructive" : "default"} disabled={lifecycle.isPending || remove.isPending || transfer.isPending} onClick={() => { if (!pendingAction) return; if (pendingAction.kind === "transfer") transfer.mutate(pendingAction.member.user_id); else if (pendingAction.kind === "remove") remove.mutate(pendingAction.member.user_id); else lifecycle.mutate(pendingAction.kind) }}>{lifecycle.isPending && <Spinner />}确认</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
   </div></PageFrame>
 }
 
