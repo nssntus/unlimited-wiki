@@ -192,12 +192,14 @@ class WikiService:
         authorize_actor: Callable[[str], bool] | None = None,
         actor_guard: Callable[[str], object] | None = None,
         require_task_actor: bool = False,
+        path_remap_callback: Callable[[dict[str, str]], None] | None = None,
     ):
         self.root = project_root.resolve()
         (self.root / "wiki").mkdir(exist_ok=True)
         (self.root / "raw").mkdir(exist_ok=True)
         self.files = FileStore(self.root)
         self.state = StateStore(self.root)
+        self.path_remap_callback = path_remap_callback
         self._recover_path_projections()
         self._ensure_dynamic_registry()
         self.llm = llm_config or LLMConfig()
@@ -377,14 +379,25 @@ class WikiService:
                 continue
             if manifest.get("status") != "committed":
                 continue
+            recovered_paths: dict[str, str] = {}
+            article_id = manifest.get("metadata", {}).get("article_id")
             for old, new in manifest.get("metadata", {}).get("path_map", {}).items():
-                if not (self.root / "wiki" / new).is_file():
+                if not article_id and not (self.root / "wiki" / new).is_file():
                     continue
                 try:
-                    current = self.read_article(new)
-                except (FileNotFoundError, ValueError):
+                    resolved = self.resolve_article_id(article_id) if article_id else self.read_article(new)
+                    current = self.read_article(resolved["path"])
+                    if article_id and current.get("article_id") != article_id:
+                        continue
+                except (FileNotFoundError, RuntimeError, ValueError):
                     current = None
-                self.state.remap_article_path(old, new, base_revision=current["revision"] if current else None)
+                if current is None:
+                    continue
+                current_path = current["path"]
+                self.state.remap_article_path(old, current_path, base_revision=current["revision"])
+                recovered_paths[old] = current_path
+            if recovered_paths and self.path_remap_callback is not None:
+                self.path_remap_callback(recovered_paths)
 
     def _remap_committed_paths(self, operation_id: str, path_map: dict[str, str]) -> None:
         remapped: list[tuple[str, str]] = []
@@ -392,6 +405,8 @@ class WikiService:
             for old, new in path_map.items():
                 self.state.remap_article_path(old, new, base_revision=self.read_article(new)["revision"])
                 remapped.append((old, new))
+            if self.path_remap_callback is not None:
+                self.path_remap_callback(path_map)
         except BaseException:
             self.files.rollback(operation_id)
             for old, new in reversed(remapped):
@@ -401,6 +416,17 @@ class WikiService:
                     restored = None
                 self.state.remap_article_path(new, old, base_revision=restored["revision"] if restored else None)
             raise
+
+    def _available_operation_id(self, operation_base: str) -> str:
+        operation_id = operation_base
+        attempt = 1
+        while True:
+            try:
+                self.files.operation(operation_id)
+            except FileNotFoundError:
+                return operation_id
+            attempt += 1
+            operation_id = f"{operation_base}-attempt-{attempt}"
 
     def articles(self) -> list[dict]:
         rows = []
@@ -432,6 +458,12 @@ class WikiService:
         order = {item["category_id"]: index for index, item in enumerate(ordered_categories)}
         rows.sort(key=lambda row: (order.get(row["primary_category_id"], 999), row["title"].casefold()))
         return rows
+
+    def resolve_article_id(self, article_id: str) -> dict:
+        matches = [item for item in self.articles() if item.get("article_id") == article_id]
+        if len(matches) != 1:
+            raise RuntimeError("private imported article requires repair")
+        return matches[0]
 
     def _wiki_path(self, rel: str) -> Path:
         if rel in {"index.md", "log.md"}:
@@ -632,6 +664,10 @@ class WikiService:
         return {"created": True, "task": task, "classification_task": classification_task, "article": article, "operation_id": manifest["operation_id"], "preflight": preflight}
 
     def apply_meta(self, rel: str, *, category: str, status: str) -> dict:
+        with self._intent_lock:
+            return self._apply_meta_locked(rel, category=category, status=status)
+
+    def _apply_meta_locked(self, rel: str, *, category: str, status: str) -> dict:
         registry = dc.load_registry(self.root)
         category_item = next(
             (item for item in registry["categories"] if item["category_id"] == category or item["directory_name"] == category),
@@ -643,12 +679,16 @@ class WikiService:
             raise ValueError("invalid status")
         article = self.read_article(rel)
         old_rel = article["path"]
+        operation_identity = article["article_id"] or f"legacy:{revision(article['markdown'])}"
         category = category_item["directory_name"]
         md = cats.ensure_category_header(article["markdown"], category)
         md = dc.ensure_article_metadata(
             md, category_id=category_item["category_id"], status="confirmed",
             article_uuid=article["article_id"], article_tags=article["tags"],
         )
+        stable_article_id = dc.article_id(md)
+        if not stable_article_id:
+            raise RuntimeError("article metadata has no stable Article-ID")
         md = wiki_ops.ensure_status_header(md, status)
         target_rel = old_rel
         changes: dict[str, str | None] = {}
@@ -674,13 +714,29 @@ class WikiService:
                     changes[f"wiki/{page_rel}"] = updated
         else:
             changes[f"wiki/{old_rel}"] = md
-        operation_id = f"meta-{hashlib.sha256((old_rel + target_rel + revision(md)).encode()).hexdigest()[:20]}"
+        operation_seed = "|".join((operation_identity, old_rel, target_rel, category_item["category_id"], status))
+        operation_base = f"meta-{hashlib.sha256(operation_seed.encode()).hexdigest()[:20]}"
+        operation_id = self._available_operation_id(operation_base)
+        path_map = {old_rel: target_rel} if old_rel != target_rel else {}
         log_path = self.root / "wiki" / "log.md"
         changes["wiki/index.md"] = render_index(self.root, changes)
         changes["wiki/log.md"] = append_log_text(log_path.read_text(encoding="utf-8") if log_path.exists() else "", operation_id=operation_id, kind="govern", title=article["title"])
-        self.files.commit(changes, kind="meta", metadata={"source": old_rel, "target": target_rel}, operation_id=operation_id)
+        self.files.commit(
+            changes,
+            kind="meta",
+            metadata={
+                "source": old_rel,
+                "target": target_rel,
+                "path_map": path_map,
+                "article_id": stable_article_id,
+            },
+            operation_id=operation_id,
+        )
         updated = self.read_article(target_rel)
-        self.state.remap_article_path(old_rel, target_rel, base_revision=updated["revision"])
+        if path_map:
+            self._remap_committed_paths(operation_id, path_map)
+        else:
+            self.state.remap_article_path(old_rel, target_rel, base_revision=updated["revision"])
         return {"operation_id": operation_id, "article": updated}
 
     def save_article(self, rel: str, markdown: str, expected_revision: str, *, force: bool = False) -> dict:
@@ -709,6 +765,72 @@ class WikiService:
         }
         self.files.commit(changes, kind="edit", metadata={"path": rel}, operation_id=operation_id)
         return {"conflict": False, "operation_id": operation_id, "article": self.read_article(rel)}
+
+    def import_public_article(self, intent: dict) -> dict:
+        """Materialize one reserved public revision as an independent private draft."""
+        with self._intent_lock:
+            rel = str(intent["private_path"])
+            article_id = str(intent["private_article_id"])
+            entry_id = str(intent["public_entry_id"])
+            revision_id = str(intent["public_revision_id"])
+            operation_base = f"public-import-{intent['id']}"
+            operation_id = operation_base
+            target = self.root / "wiki" / rel
+            if target.is_file():
+                article = self.read_article(rel)
+                if article.get("article_id") != article_id:
+                    raise RuntimeError("public import target is occupied")
+                for manifest_path in sorted(self.files.history_root.glob(f"{operation_base}*/manifest.json")):
+                    try:
+                        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    metadata = manifest.get("metadata", {})
+                    if (
+                        manifest.get("status") == "committed"
+                        and metadata.get("public_entry_id") == entry_id
+                        and metadata.get("public_revision_id") == revision_id
+                    ):
+                        operation_id = str(manifest.get("operation_id") or operation_id)
+                        break
+                return {"operation_id": operation_id, "article": article, "replay": True}
+            operation_id = self._available_operation_id(operation_base)
+            snapshot = intent["snapshot"]
+            markdown = str(snapshot.get("markdown") or "")
+            if not kw.parse_title(markdown):
+                raise ValueError("public revision has no title")
+            markdown = dc.ensure_article_metadata(
+                markdown, category_id=None, status="pending", article_uuid=article_id,
+            )
+            markdown = replace_meta(markdown, "Category", "_inbox")
+            markdown = replace_meta(markdown, "Status", "草稿")
+            markdown = replace_meta(markdown, "Public-Entry", entry_id)
+            markdown = replace_meta(markdown, "Public-Revision", revision_id)
+            markdown = replace_meta(markdown, "Public-Attribution", str(snapshot.get("attribution") or "匿名用户")[:120])
+            markdown = replace_meta(
+                markdown, "Public-Reuse-Policy", str(intent["policy_version"]),
+            )
+            title = kw.parse_title(markdown) or "公开词条"
+            log_path = self.root / "wiki" / "log.md"
+            changes = {
+                f"wiki/{rel}": markdown,
+                "wiki/index.md": render_index(self.root, {f"wiki/{rel}": markdown}),
+                "wiki/log.md": append_log_text(
+                    log_path.read_text(encoding="utf-8") if log_path.exists() else "",
+                    operation_id=operation_id, kind="public-import", title=title,
+                ),
+            }
+            try:
+                self.files.commit(
+                    changes, kind="public-import", operation_id=operation_id,
+                    metadata={"public_entry_id": entry_id, "public_revision_id": revision_id},
+                    must_not_exist_paths={f"wiki/{rel}"},
+                )
+            except FileExistsError:
+                if target.is_file() and self.read_article(rel).get("article_id") == article_id:
+                    return {"operation_id": operation_id, "article": self.read_article(rel), "replay": True}
+                raise
+            return {"operation_id": operation_id, "article": self.read_article(rel), "replay": False}
 
     @staticmethod
     def _canonical_text_hash(text: str) -> str:

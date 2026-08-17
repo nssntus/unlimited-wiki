@@ -167,8 +167,6 @@ def _team_publication_world(tmp_path: Path, operation: str):
         store.ai_decide(submission["id"], "failed", {"summary": "temporary failure"})
     if operation == "withdraw":
         store.ai_decide(submission["id"], "pass", {"summary": "accepted"})
-        approved = store.admin_decide(owner_context, submission["id"], "approve", "approved")
-        public_entry_id = approved["public_entry_id"]
     return store, owner_context, member_context, snapshot, fingerprint, preview, submission, public_entry_id
 
 
@@ -301,7 +299,8 @@ def test_publication_write_and_final_authorization_are_one_linearized_transactio
             assert db.execute("SELECT status FROM submissions WHERE id=?", (submission["id"],)).fetchone()[0] == "ai_queued"
         else:
             assert db.execute("SELECT status FROM submissions WHERE id=?", (submission["id"],)).fetchone()[0] == "withdrawn"
-            assert db.execute("SELECT status FROM public_entries WHERE id=?", (public_entry_id,)).fetchone()[0] == "withdrawn_by_author"
+            assert public_entry_id is None
+            assert db.execute("SELECT COUNT(*) FROM public_entries").fetchone()[0] == 0
 
 
 def test_registration_creates_personal_organization_and_owner_membership(tmp_path: Path):
@@ -510,8 +509,8 @@ def test_submission_actions_follow_workspace_role_and_scope(membership_server):
     )[0] == 200
     assert author.request(
         "POST", f"/api/submissions/{approved_submission['id']}/withdraw", {}, key="editor-withdraw",
-    )[0] == 200
-    assert Client(base).request("GET", f"/api/public/entries/{approved['public_entry_id']}")[0] == 404
+    )[0] == 409
+    assert Client(base).request("GET", f"/api/public/entries/{approved['public_entry_id']}")[0] == 200
 
 
 def test_submissions_and_publication_state_do_not_cross_workspaces(membership_server):

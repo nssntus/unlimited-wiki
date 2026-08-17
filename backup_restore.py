@@ -96,6 +96,49 @@ PLATFORM_OPTIONAL_SCHEMA = {
         "id", "token_hash", "email", "status", "expires_at", "created_at", "used_at",
     },
     "rate_limits": {"scope_hash", "window_started", "request_count", "updated_at"},
+    "public_categories": {
+        "id", "slug", "name", "description", "status", "sort_order", "created_by", "created_at", "updated_at",
+    },
+    "public_tags": {"id", "slug", "name", "status", "created_at", "updated_at"},
+    "public_entry_tags": {"entry_id", "tag_id"},
+    "public_category_mappings": {"private_label", "category_id", "status", "mapped_by", "updated_at"},
+    "public_category_slug_redirects": {"slug", "category_id", "created_at"},
+    "public_reuse_permissions": {"entry_id", "permission", "granted_by", "granted_at", "revoked_at", "policy_version"},
+    "public_imports": {
+        "id", "user_id", "workspace_id", "public_entry_id", "public_revision_id", "private_article_id",
+        "private_path", "status", "imported_at", "created_at", "updated_at", "policy_version",
+    },
+    "public_subscriptions": {"user_id", "public_entry_id", "status", "created_at", "updated_at"},
+    "correction_suggestions": {
+        "id", "submitter_id", "entry_id", "revision_id", "kind", "detail", "evidence_url", "status",
+        "author_response", "resolved_at", "created_at", "updated_at",
+    },
+    "public_profiles": {"id", "user_id", "display_name", "bio", "status", "created_at", "updated_at"},
+    "public_collections": {
+        "id", "slug", "title", "description", "status", "curator_id", "published_at", "created_at", "updated_at",
+    },
+    "public_collection_items": {"collection_id", "entry_id", "sort_order", "curator_note"},
+    "curation_records": {
+        "id", "object_type", "object_id", "curator_id", "action", "reason", "sort_order", "created_at",
+    },
+    "public_search_documents": {
+        "entry_id", "revision_id", "title", "summary", "body_text", "public_category_id", "category_name",
+        "public_tags", "attribution", "first_published_at", "updated_at", "status",
+    },
+    "public_index_jobs": {"entry_id", "status", "attempts", "last_error", "not_before", "updated_at"},
+    "public_search_meta": {"id", "generation"},
+    "public_revision_sources": {"revision_id", "position", "label", "url", "kind"},
+    "public_revision_reviews": {
+        "revision_id", "ai_policy_version", "ai_model", "ai_rules_version", "ai_report_json",
+        "admin_reason", "reviewed_by", "reviewed_at",
+    },
+    "public_revision_taxonomy": {"revision_id", "category_id", "attribution", "change_summary"},
+    "public_revision_tags": {"revision_id", "tag_id"},
+    "submission_review_attempts": {
+        "submission_id", "attempt", "status", "policy_version", "provider", "model", "rules_version",
+        "report_json", "started_at", "completed_at",
+    },
+    "public_search_fts": {"entry_id", "title", "summary", "body_text", "category_name", "public_tags", "attribution"},
 }
 WORKSPACE_OPTIONAL_SCHEMA = {
     "classification_suggestions": {
@@ -147,6 +190,28 @@ PLATFORM_OPTIONAL_PRIMARY_KEYS = {
     "platform_idempotency": ("scope", "endpoint", "key"),
     "account_registration_invites": ("id",),
     "rate_limits": ("scope_hash",),
+    "public_categories": ("id",),
+    "public_tags": ("id",),
+    "public_entry_tags": ("entry_id", "tag_id"),
+    "public_category_mappings": ("private_label",),
+    "public_category_slug_redirects": ("slug",),
+    "public_reuse_permissions": ("entry_id",),
+    "public_imports": ("id",),
+    "public_subscriptions": ("user_id", "public_entry_id"),
+    "correction_suggestions": ("id",),
+    "public_profiles": ("id",),
+    "public_collections": ("id",),
+    "public_collection_items": ("collection_id", "entry_id"),
+    "curation_records": ("id",),
+    "public_search_documents": ("entry_id",),
+    "public_index_jobs": ("entry_id",),
+    "public_search_meta": ("id",),
+    "public_revision_sources": ("revision_id", "position"),
+    "public_revision_reviews": ("revision_id",),
+    "public_revision_taxonomy": ("revision_id",),
+    "public_revision_tags": ("revision_id", "tag_id"),
+    "submission_review_attempts": ("submission_id", "attempt"),
+    "public_search_fts": (),
 }
 WORKSPACE_OPTIONAL_PRIMARY_KEYS = {
     "classification_suggestions": ("article_id", "article_revision", "taxonomy_revision"),
@@ -158,6 +223,11 @@ WORKSPACE_OPTIONAL_PRIMARY_KEYS = {
 PLATFORM_OPTIONAL_UNIQUE_KEYS = {
     "organizations": {("personal_owner_id",)},
     "account_registration_invites": {("token_hash",)},
+    "public_categories": {("slug",)},
+    "public_tags": {("slug",)},
+    "public_imports": {("workspace_id", "public_revision_id")},
+    "public_profiles": {("user_id",)},
+    "public_collections": {("slug",)},
 }
 WORKSPACE_OPTIONAL_UNIQUE_KEYS = {"reconciliation_items": {("fingerprint",)}}
 LEGACY_PLATFORM_IDEMPOTENCY_COLUMNS = {
@@ -185,7 +255,31 @@ PLATFORM_TEXT_IDENTITY_COLUMNS = {
     "platform_idempotency": {"scope", "endpoint", "key"},
     "account_registration_invites": {"id", "token_hash", "email"},
     "rate_limits": {"scope_hash"},
+    "public_categories": {"id", "slug", "created_by"},
+    "public_tags": {"id", "slug"},
+    "public_entry_tags": {"entry_id", "tag_id"},
+    "public_category_mappings": {"private_label", "category_id", "mapped_by"},
+    "public_category_slug_redirects": {"slug", "category_id"},
+    "public_reuse_permissions": {"entry_id", "granted_by"},
+    "public_imports": {"id", "user_id", "workspace_id", "public_entry_id", "public_revision_id", "private_article_id"},
+    "public_subscriptions": {"user_id", "public_entry_id"},
+    "correction_suggestions": {"id", "submitter_id", "entry_id", "revision_id"},
+    "public_profiles": {"id", "user_id"},
+    "public_collections": {"id", "slug", "curator_id"},
+    "public_collection_items": {"collection_id", "entry_id"},
+    "curation_records": {"id", "object_id", "curator_id"},
+    "public_search_documents": {"entry_id", "revision_id", "public_category_id"},
+    "public_index_jobs": {"entry_id"},
+    "public_revision_sources": {"revision_id"},
+    "public_revision_reviews": {"revision_id", "reviewed_by"},
+    "public_revision_taxonomy": {"revision_id", "category_id"},
+    "public_revision_tags": {"revision_id", "tag_id"},
+    "submission_review_attempts": {"submission_id"},
 }
+EXPECTED_PUBLIC_SEARCH_FTS_SQL = """CREATE VIRTUAL TABLE public_search_fts USING fts5(
+    entry_id UNINDEXED,title,summary,body_text,category_name,public_tags,attribution,
+    tokenize='unicode61 remove_diacritics 2'
+)"""
 WORKSPACE_TEXT_IDENTITY_COLUMNS = {
     "idempotency": {"endpoint", "key"},
     "tasks": {"id", "active_key"},
@@ -441,7 +535,7 @@ def _check_platform_correctness_indexes(db: sqlite3.Connection) -> list[str]:
 
         table = str(expected["table"])
         schema_type = db.execute(
-            "SELECT type FROM sqlite_schema WHERE name=?", (table,),
+            "SELECT type,sql FROM sqlite_schema WHERE name=?", (table,),
         ).fetchone()
         if schema_type is None:
             continue
@@ -485,12 +579,17 @@ def _check_application_schema(db: sqlite3.Connection, path: Path) -> list[str]:
     tables.extend((table, columns, False) for table, columns in optional.items())
     for table, required_columns, required in tables:
         schema_type = db.execute(
-            "SELECT type FROM sqlite_schema WHERE name=?", (table,),
+            "SELECT type,sql FROM sqlite_schema WHERE name=?", (table,),
         ).fetchone()
         if schema_type is None and not required:
             continue
         if schema_type is None or schema_type[0] != "table":
             raise RuntimeError(f"{label} SQLite schema is unsupported: {table}")
+        if table == "public_search_fts" and (
+            not schema_type[1]
+            or _sql_tokens(str(schema_type[1])) != _sql_tokens(EXPECTED_PUBLIC_SEARCH_FTS_SQL)
+        ):
+            raise RuntimeError("platform SQLite schema has an invalid public search virtual table")
         table_info = list(db.execute(f'PRAGMA table_info("{table}")'))
         columns = {str(row[1]) for row in table_info}
         legacy_platform_idempotency = table == "platform_idempotency" and "scope" not in columns
@@ -527,6 +626,54 @@ def _check_application_schema(db: sqlite3.Connection, path: Path) -> list[str]:
         if not expected_unique_keys.issubset(actual_unique_keys):
             raise RuntimeError(f"{label} SQLite schema is missing a unique constraint: {table}")
     if anchors is PLATFORM_SCHEMA_ANCHORS:
+        meta_table = db.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='public_search_meta'",
+        ).fetchone()
+        if meta_table is not None:
+            meta = db.execute(
+                "SELECT id,generation,typeof(generation) value_type FROM public_search_meta WHERE id=1",
+            ).fetchone()
+            if (
+                meta is None or meta[0] != 1 or meta[2] != "integer" or int(meta[1]) < 0
+                or db.execute("SELECT COUNT(*) FROM public_search_meta").fetchone()[0] != 1
+            ):
+                raise RuntimeError("platform SQLite schema has invalid public search metadata")
+        taxonomy_tables = db.execute("""
+            SELECT COUNT(*) FROM sqlite_schema
+            WHERE type='table' AND name IN ('public_categories','public_category_slug_redirects')
+        """).fetchone()[0]
+        if taxonomy_tables == 2 and db.execute("""
+            SELECT 1 FROM public_categories category
+            JOIN public_category_slug_redirects redirect ON redirect.slug=category.slug
+            WHERE redirect.category_id<>category.id AND category.status<>'merged' LIMIT 1
+        """).fetchone() is not None:
+            raise RuntimeError("platform SQLite has a conflicting public category slug namespace")
+        jobs_table = db.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='public_index_jobs'",
+        ).fetchone()
+        if jobs_table is not None:
+            canonical_utc = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00")
+            for row in db.execute(
+                "SELECT status,attempts,typeof(attempts),not_before,updated_at FROM public_index_jobs",
+            ):
+                try:
+                    if row[0] not in {"pending", "running", "retry", "dead"}:
+                        raise ValueError
+                    if row[2] != "integer" or int(row[1]) < 0:
+                        raise ValueError
+                    if row[0] == "running" and (int(row[1]) < 1 or row[3] is not None):
+                        raise ValueError
+                    if row[3] is not None:
+                        not_before_text = str(row[3])
+                        not_before = datetime.fromisoformat(not_before_text)
+                        if not canonical_utc.fullmatch(not_before_text) or not_before.utcoffset() != timezone.utc.utcoffset(None):
+                            raise ValueError
+                    updated_at_text = str(row[4])
+                    updated_at = datetime.fromisoformat(updated_at_text)
+                    if not canonical_utc.fullmatch(updated_at_text) or updated_at.utcoffset() != timezone.utc.utcoffset(None):
+                        raise ValueError
+                except (TypeError, ValueError):
+                    raise RuntimeError("platform SQLite has invalid public index jobs") from None
         return _check_platform_correctness_indexes(db)
     return []
 

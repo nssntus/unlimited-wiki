@@ -270,6 +270,51 @@ def test_backup_verify_and_restore_round_trip(tmp_path: Path):
         assert db.execute("PRAGMA foreign_key_check").fetchone() is None
 
 
+def test_backup_accepts_normal_merged_public_category(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    _token, context = platform.create_session(user["id"])
+    first = platform.admin_upsert_category(context, None, "first", "First", "", "active", 0)
+    second = platform.admin_upsert_category(context, None, "second", "Second", "", "active", 1)
+    platform.admin_merge_category(context, first["id"], second["id"], "Duplicate taxonomy")
+    backup = tmp_path / "backup"
+    create_backup(source, backup)
+    assert verify_backup(backup)["schema_version"] == 2
+
+
+@pytest.mark.parametrize(
+    ("status", "attempts", "not_before"),
+    [
+        ("pending", "not-an-integer", None),
+        ("invalid", 0, None),
+        ("pending", -1, None),
+        ("retry", 1, "not-a-date"),
+        ("retry", 1, "2026-01-01T10:00:00+08:00"),
+        ("running", 0, None),
+        ("running", 1, "2026-01-01T00:00:00+00:00"),
+    ],
+)
+def test_backup_rejects_invalid_public_index_job_values(
+    tmp_path: Path, status: str, attempts: object, not_before: str | None,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    now = "2026-01-01T00:00:00+00:00"
+    entry_id = "f" * 32
+    with platform.connect() as db:
+        db.execute(
+            "INSERT INTO public_entries(id,author_id,status,created_at,updated_at) VALUES(?,?,?,?,?)",
+            (entry_id, user["id"], "published", now, now),
+        )
+        db.execute(
+            "INSERT INTO public_index_jobs(entry_id,status,attempts,last_error,not_before,updated_at) VALUES(?,?,?,?,?,?)",
+            (entry_id, status, attempts, None, not_before, now),
+        )
+    assert_backup_contract_rejects(source, tmp_path, "invalid public index jobs")
+
+
 def test_backup_restores_minimum_supported_legacy_schemas(tmp_path: Path):
     source = tmp_path / "source"
     source.mkdir()
@@ -1628,3 +1673,39 @@ def test_completed_restore_residue_is_safe_to_backup_and_ignored_by_git(tmp_path
         cwd=repository, text=True, capture_output=True, check=True,
     ).stdout.splitlines()
     assert ignored == [".restore/master.key", ".restore-complete-deadbeef/master.key"]
+
+
+def test_backup_rejects_ordinary_table_masquerading_as_public_search_fts(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, _user, _article, _raw = seed_instance(source)
+    with platform.connect() as db:
+        db.execute("DROP TABLE public_search_fts")
+        db.execute("""
+            CREATE TABLE public_search_fts(
+                entry_id,title,summary,body_text,category_name,public_tags,attribution
+            )
+        """)
+        db.commit()
+    assert_backup_contract_rejects(source, tmp_path, "public search virtual table")
+
+
+def test_backup_rejects_conflicting_public_category_slug_namespace(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, _user, _article, _raw = seed_instance(source)
+    with platform.connect() as db:
+        db.execute(
+            "INSERT INTO public_categories(id,slug,name,created_at,updated_at) VALUES(?,?,?,?,?)",
+            ("a" * 32, "reserved-slug", "Category A", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+        )
+        db.execute(
+            "INSERT INTO public_categories(id,slug,name,created_at,updated_at) VALUES(?,?,?,?,?)",
+            ("b" * 32, "category-b", "Category B", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+        )
+        db.execute(
+            "INSERT INTO public_category_slug_redirects(slug,category_id,created_at) VALUES(?,?,?)",
+            ("reserved-slug", "b" * 32, "2026-01-01T00:00:00+00:00"),
+        )
+        db.commit()
+    assert_backup_contract_rejects(source, tmp_path, "category slug namespace")

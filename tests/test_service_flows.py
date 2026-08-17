@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import dynamic_categories as dc
 from wiki_service import WikiService
 from wiki_service import LLMConfig, extract_markdown_article, model_message_text
 
@@ -28,6 +29,204 @@ def test_status_and_structure_are_independent(service: WikiService):
     assert article["completeness"] == "完整"
     assert service.read_article("concepts/base.md")["path"] == article["path"]
     assert len(service.articles()) == 2
+
+
+def test_apply_meta_notifies_platform_path_projection(service: WikiService):
+    remaps: list[dict[str, str]] = []
+    service.path_remap_callback = lambda value: remaps.append(value)
+    result = service.apply_meta("concepts/base.md", category="tools", status="词条")
+    assert result["article"]["path"] == "tools/base.md"
+    assert remaps == [{"concepts/base.md": "tools/base.md"}]
+
+
+def test_apply_meta_recovers_state_and_platform_path_projection_after_commit_crash(
+    kb_root: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    first = WikiService(kb_root, start_worker=False)
+    first.state.record_raw(
+        "raw/local/base.txt", "byte-hash", "text-hash", "imported",
+        "concepts/base.md", "seed-operation",
+    )
+    monkeypatch.setattr(
+        first,
+        "_remap_committed_paths",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(SystemExit("crash after commit")),
+    )
+    with pytest.raises(SystemExit, match="crash after commit"):
+        first.apply_meta("concepts/base.md", category="tools", status="词条")
+    committed = next(
+        manifest for path in first.files.history_root.glob("meta-*/manifest.json")
+        if (manifest := first.files.operation(path.parent.name))["status"] == "committed"
+    )
+    assert committed["metadata"]["path_map"] == {"concepts/base.md": "tools/base.md"}
+    assert first.state.raw_records()[0]["target_path"] == "concepts/base.md"
+    first.close()
+
+    remaps: list[dict[str, str]] = []
+    restarted = WikiService(kb_root, start_worker=False, path_remap_callback=remaps.append)
+    try:
+        assert restarted.state.raw_records()[0]["target_path"] == "tools/base.md"
+        assert remaps == [{"concepts/base.md": "tools/base.md"}]
+        assert restarted.read_article("tools/base.md")["title"] == "Base"
+    finally:
+        restarted.close()
+
+
+def test_apply_meta_recovery_resolves_reverse_ordered_move_chain_to_current_article(
+    kb_root: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    first = WikiService(kb_root, start_worker=False)
+    first.state.record_raw(
+        "raw/local/base.txt", "byte-hash", "text-hash", "imported",
+        "concepts/base.md", "seed-operation",
+    )
+    monkeypatch.setattr(
+        first,
+        "_remap_committed_paths",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(SystemExit("crash after commit")),
+    )
+    with pytest.raises(SystemExit):
+        first.apply_meta("concepts/base.md", category="tools", status="词条")
+    with pytest.raises(SystemExit):
+        first.apply_meta("tools/base.md", category="concepts", status="词条")
+    manifests = []
+    for path in first.files.history_root.glob("meta-*/manifest.json"):
+        manifest = first.files.operation(path.parent.name)
+        if manifest["status"] == "committed":
+            manifests.append((path.parent, manifest))
+    assert len(manifests) == 2
+    first_move = next(item for item in manifests if item[1]["metadata"]["source"] == "concepts/base.md")
+    second_move = next(item for item in manifests if item[1]["metadata"]["source"] == "tools/base.md")
+    first_move[0].rename(first.files.history_root / "z-first")
+    second_move[0].rename(first.files.history_root / "a-second")
+    current_path = second_move[1]["metadata"]["target"]
+    first.close()
+
+    platform_path = {"value": "concepts/base.md"}
+
+    def remap_platform(path_map: dict[str, str]) -> None:
+        if platform_path["value"] in path_map:
+            platform_path["value"] = path_map[platform_path["value"]]
+
+    restarted = WikiService(kb_root, start_worker=False, path_remap_callback=remap_platform)
+    try:
+        assert restarted.state.raw_records()[0]["target_path"] == current_path
+        assert platform_path["value"] == current_path
+        assert restarted.resolve_article_id(restarted.read_article(current_path)["article_id"])["path"] == current_path
+    finally:
+        restarted.close()
+
+
+def test_apply_meta_generated_article_id_recovers_and_duplicate_later_fails_closed(
+    kb_root: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    first = WikiService(kb_root, start_worker=False)
+    source = first.root / "wiki" / "concepts" / "base.md"
+    source.write_text(
+        "".join(line for line in source.read_text(encoding="utf-8").splitlines(keepends=True)
+                if not line.startswith("> Article-ID:")),
+        encoding="utf-8",
+    )
+    first.state.record_raw(
+        "raw/local/base.txt", "byte-hash", "text-hash", "imported",
+        "concepts/base.md", "seed-operation",
+    )
+    monkeypatch.setattr(
+        first,
+        "_remap_committed_paths",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(SystemExit("crash after commit")),
+    )
+    with pytest.raises(SystemExit):
+        first.apply_meta("concepts/base.md", category="tools", status="词条")
+    manifest = next(
+        first.files.operation(path.parent.name)
+        for path in first.files.history_root.glob("meta-*/manifest.json")
+    )
+    generated_id = manifest["metadata"]["article_id"]
+    assert generated_id == first.read_article("tools/base.md")["article_id"]
+    assert len(generated_id) == 32
+    int(generated_id, 16)
+    first.close()
+
+    remaps: list[dict[str, str]] = []
+    restarted = WikiService(kb_root, start_worker=False, path_remap_callback=remaps.append)
+    try:
+        assert restarted.state.raw_records()[0]["target_path"] == "tools/base.md"
+        assert remaps == [{"concepts/base.md": "tools/base.md"}]
+        restarted.state.remap_article_path("tools/base.md", "concepts/base.md")
+        duplicate = restarted.root / "wiki" / "tools" / "duplicate.md"
+        duplicate.write_bytes((restarted.root / "wiki" / "tools" / "base.md").read_bytes())
+    finally:
+        restarted.close()
+
+    remaps.clear()
+    ambiguous = WikiService(kb_root, start_worker=False, path_remap_callback=remaps.append)
+    try:
+        assert ambiguous.state.raw_records()[0]["target_path"] == "concepts/base.md"
+        assert remaps == []
+    finally:
+        ambiguous.close()
+
+
+def test_apply_meta_callback_failure_can_retry_with_a_new_operation(
+    service: WikiService,
+):
+    calls = 0
+
+    def fail_once(_path_map: dict[str, str]) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("projection unavailable")
+
+    service.path_remap_callback = fail_once
+    with pytest.raises(RuntimeError, match="projection unavailable"):
+        service.apply_meta("concepts/base.md", category="tools", status="词条")
+    assert service.read_article("concepts/base.md")["title"] == "Base"
+    assert not (service.root / "wiki" / "tools" / "base.md").exists()
+
+    retried = service.apply_meta("concepts/base.md", category="tools", status="词条")
+
+    assert retried["operation_id"].endswith("-attempt-2")
+    assert service.files.operation(retried["operation_id"])["status"] == "committed"
+    assert retried["article"]["path"] == "tools/base.md"
+    assert calls == 2
+
+
+def test_legacy_apply_meta_retry_keeps_operation_base_when_generated_id_changes(
+    service: WikiService, monkeypatch: pytest.MonkeyPatch,
+):
+    source = service.root / "wiki" / "concepts" / "base.md"
+    source.write_text(
+        "".join(line for line in source.read_text(encoding="utf-8").splitlines(keepends=True)
+                if not line.startswith("> Article-ID:")),
+        encoding="utf-8",
+    )
+    timestamps = iter(("2026-08-17T00:00:00+00:00", "2026-08-17T00:00:02+00:00"))
+    monkeypatch.setattr(dc, "now_iso", lambda: next(timestamps))
+    calls = 0
+
+    def fail_once(_path_map: dict[str, str]) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("projection unavailable")
+
+    service.path_remap_callback = fail_once
+    with pytest.raises(RuntimeError, match="projection unavailable"):
+        service.apply_meta("concepts/base.md", category="tools", status="词条")
+    rolled_back = next(
+        service.files.operation(path.parent.name)
+        for path in service.files.history_root.glob("meta-*/manifest.json")
+    )
+
+    retried = service.apply_meta("concepts/base.md", category="tools", status="词条")
+    committed = service.files.operation(retried["operation_id"])
+
+    assert rolled_back["status"] == "rolled_back"
+    assert retried["operation_id"] == f"{rolled_back['operation_id']}-attempt-2"
+    assert rolled_back["metadata"]["article_id"] != committed["metadata"]["article_id"]
+    assert committed["metadata"]["article_id"] == retried["article"]["article_id"]
 
 
 def test_model_markdown_extractor_accepts_preamble_and_fence():
