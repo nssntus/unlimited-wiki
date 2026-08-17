@@ -21,7 +21,7 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from publication import FINGERPRINT_VERSION, article_id_from_markdown, normalize_text, snapshot_fingerprint
+from publication import FINGERPRINT_VERSION, article_id_from_markdown, normalize_text, review_markdown, snapshot_fingerprint
 from square_v2 import (
     REPORT_REASONS,
     REUSE_PERMISSIONS,
@@ -2010,9 +2010,24 @@ class PlatformStore(SquareMixin):
         actor_id: str,
         now: str,
     ) -> tuple[str, list[str], dict]:
-        resolutions = decision.get("resolutions", {}) if isinstance(decision, dict) else {}
-        if not isinstance(resolutions, dict):
+        proposal_keys = {
+            item["key"]
+            for item in [taxonomy["category"], *taxonomy.get("tags", [])]
+            if item["kind"] == "proposal"
+        }
+        if decision is None and not proposal_keys:
+            resolutions = {}
+        elif (
+            isinstance(decision, dict)
+            and set(decision) == {"version", "resolutions"}
+            and decision.get("version") == 1
+            and isinstance(decision.get("resolutions"), dict)
+        ):
+            resolutions = decision["resolutions"]
+        else:
             raise ValueError("invalid taxonomy decision")
+        if set(resolutions) != proposal_keys:
+            raise ValueError("taxonomy decision must resolve every proposal exactly once")
 
         def resolve(item: dict, kind: str) -> tuple[str, dict]:
             table = "public_categories" if kind == "category" else "public_tags"
@@ -2027,6 +2042,8 @@ class PlatformStore(SquareMixin):
             if not isinstance(resolution, dict) or resolution.get("action") not in {"create", "map"}:
                 raise ValueError("all taxonomy proposals require an Admin decision")
             if resolution["action"] == "map":
+                if set(resolution) != {"action", "target_id"}:
+                    raise ValueError("invalid taxonomy mapping decision")
                 target_id = resolution.get("target_id")
                 row = db.execute(
                     f"SELECT id FROM {table} WHERE id=? AND status='active'", (target_id,),
@@ -2034,6 +2051,8 @@ class PlatformStore(SquareMixin):
                 if row is None:
                     raise FileNotFoundError(str(target_id))
                 return row["id"], {"kind": kind, "action": "map", "key": item["key"], "id": row["id"]}
+            if set(resolution) != {"action"}:
+                raise ValueError("invalid taxonomy create decision")
             existing = db.execute(
                 f"SELECT id,status FROM {table} WHERE normalized_name=?", (item["normalized_name"],),
             ).fetchone()
@@ -2045,7 +2064,13 @@ class PlatformStore(SquareMixin):
             slug_base = taxonomy_slug(item["name"], kind=kind)
             slug = slug_base
             suffix = 2
-            while db.execute(f"SELECT 1 FROM {table} WHERE slug=?", (slug,)).fetchone() is not None:
+            while (
+                db.execute(f"SELECT 1 FROM {table} WHERE slug=?", (slug,)).fetchone() is not None
+                or (
+                    kind == "category"
+                    and db.execute("SELECT 1 FROM public_category_slug_redirects WHERE slug=?", (slug,)).fetchone() is not None
+                )
+            ):
                 slug = f"{slug_base[:58]}-{suffix}"
                 suffix += 1
             if kind == "category":
@@ -2432,17 +2457,29 @@ class PlatformStore(SquareMixin):
         snapshot = json.loads(claimed["snapshot_json"])
         review_snapshot = {
             key: snapshot.get(key)
-            for key in ("title", "content_status", "markdown", "summary", "attribution", "source_summaries", "public_sources")
+            for key in ("title", "content_status", "summary", "attribution")
             if key in snapshot
         }
+        review_snapshot["markdown"] = review_markdown(str(snapshot.get("markdown") or ""))
+        public_sources = self._safe_public_sources(snapshot)
+        if public_sources:
+            review_snapshot["public_sources"] = public_sources
         candidates = self.duplicate_candidates(snapshot)
+        review_candidates = [
+            {
+                key: candidate[key]
+                for key in ("title", "summary", "attribution", "version")
+                if key in candidate
+            }
+            for candidate in candidates
+        ]
         with self.connect() as db:
             db.execute("UPDATE submissions SET duplicate_candidates_json=? WHERE id=? AND review_attempt=?", (
                 json.dumps(candidates, ensure_ascii=False), claimed["id"], claimed["review_attempt"],
             ))
         return {
-            "id": claimed["id"], "attempt": claimed["review_attempt"], "snapshot": snapshot,
-            "review_input": {"snapshot": review_snapshot, "duplicate_candidates": candidates},
+            "id": claimed["id"], "attempt": claimed["review_attempt"],
+            "review_input": {"snapshot": review_snapshot, "duplicate_candidates": review_candidates},
             "content_hash": claimed["content_hash"],
         }
 

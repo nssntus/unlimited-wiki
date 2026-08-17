@@ -41,9 +41,13 @@ export function GenerationDialog({ request, onOpenChange }: { request: Generatio
       category: category.kind === "existing" ? { kind: "existing", id: category.id } : category.kind === "inbox" ? { kind: "inbox" } : { kind: "create", name: category.name },
       tags: tags.map((tag) => tag.name),
     }),
-    onSuccess: (result) => {
-      void client.invalidateQueries({ queryKey: queryKeys.articles })
-      void client.invalidateQueries({ queryKey: queryKeys.tasks })
+    onSuccess: async (result) => {
+      await Promise.all([
+        client.invalidateQueries({ queryKey: queryKeys.articles }),
+        client.invalidateQueries({ queryKey: queryKeys.categories }),
+        client.invalidateQueries({ queryKey: queryKeys.taxonomy }),
+        client.invalidateQueries({ queryKey: queryKeys.tasks }),
+      ])
       toast.success(result.task ? "草稿已创建，补证任务已入队" : "本地词条已创建")
       onOpenChange(false)
       navigate(`/${result.article.path}`)

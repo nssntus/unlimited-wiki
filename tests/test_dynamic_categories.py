@@ -7,7 +7,7 @@ import pytest
 
 import dynamic_categories as dc
 import storage
-from state_store import StateStore
+from state_store import StateStore, now_iso
 from wiki_service import WikiService
 
 
@@ -123,6 +123,70 @@ def test_raw_preview_has_no_ai_classification_and_commit_is_atomic(service: Wiki
     assert result["article"]["tags"] == ["Evidence"]
 
 
+def test_seed_rejects_existing_article_without_taxonomy_side_effects(service: WikiService):
+    raw = service.root / "raw" / "local" / "existing-seed.md"
+    raw.write_text("# Base\n\nReplacement body.\n", encoding="utf-8")
+    original = (service.root / "wiki" / "concepts" / "base.md").read_bytes()
+    registry = (service.root / dc.REGISTRY_REL).read_bytes()
+    directories = sorted(path.name for path in (service.root / "wiki").iterdir() if path.is_dir())
+
+    with pytest.raises(ValueError, match="use supplement"):
+        service.ingest_commit(
+            "raw/local/existing-seed.md", "seed", title="Base",
+            category={"kind": "create", "name": "Should Not Exist"}, tags=["ignored"],
+        )
+
+    assert (service.root / "wiki" / "concepts" / "base.md").read_bytes() == original
+    assert (service.root / dc.REGISTRY_REL).read_bytes() == registry
+    assert sorted(path.name for path in (service.root / "wiki").iterdir() if path.is_dir()) == directories
+    assert not any(row["path"] == "raw/local/existing-seed.md" for row in service.state.raw_records())
+
+
+def test_ingest_file_failure_retries_with_next_operation_attempt(service: WikiService, monkeypatch: pytest.MonkeyPatch):
+    raw = service.root / "raw" / "local" / "retry-ingest.md"
+    raw.write_text("# Retry Ingest\n\nGrounded body.\n", encoding="utf-8")
+    original_write = storage.atomic_write
+    failed = False
+
+    def fail_once(path: Path, data: bytes):
+        nonlocal failed
+        if not failed and path.name == "log.md":
+            failed = True
+            raise OSError("injected ingest failure")
+        return original_write(path, data)
+
+    monkeypatch.setattr(storage, "atomic_write", fail_once)
+    with pytest.raises(OSError, match="injected ingest failure"):
+        service.ingest_commit(
+            "raw/local/retry-ingest.md", "new", title="Retry Ingest",
+            category={"kind": "create", "name": "Retry Category"}, tags=["retry"],
+        )
+    base = f"ingest-{service.ingest_preview('raw/local/retry-ingest.md')['raw']['byte_hash'][:20]}-new"
+    assert service.files.operation(base)["status"] == "rolled_back"
+    assert not (service.root / "wiki" / "Retry-Category").exists()
+    assert not any(row["path"] == "raw/local/retry-ingest.md" for row in service.state.raw_records())
+
+    result = service.ingest_commit(
+        "raw/local/retry-ingest.md", "new", title="Retry Ingest",
+        category={"kind": "create", "name": "Retry Category"}, tags=["retry"],
+    )
+    assert result["operation_id"] == f"{base}-attempt-2"
+    assert result["article"]["path"] == "Retry-Category/Retry-Ingest.md"
+
+
+def test_inline_create_does_not_adopt_unregistered_directory(service: WikiService):
+    external = service.root / "wiki" / "External-Knowledge"
+    external.mkdir()
+    (external / "note.md").write_text("# External Note\n\nPending reconciliation.\n", encoding="utf-8")
+    before = (service.root / dc.REGISTRY_REL).read_bytes()
+
+    with pytest.raises(ValueError, match="reconcile it first"):
+        service.generate("Managed Note", category={"kind": "create", "name": "External Knowledge"})
+
+    assert (service.root / dc.REGISTRY_REL).read_bytes() == before
+    assert any(item["kind"] == "new_directory" and item["payload"]["path"] == "External-Knowledge" for item in service.scan_reconciliation()["items"])
+
+
 def test_old_ai_classification_methods_are_absent(service: WikiService):
     for name in (
         "enqueue_classification",
@@ -133,17 +197,47 @@ def test_old_ai_classification_methods_are_absent(service: WikiService):
         assert not hasattr(service, name)
     with pytest.raises(ValueError, match="invalid category action"):
         service.category_preview("create", name="Hidden Create")
+    for name in (
+        "finalize_classification_success",
+        "finalize_raw_classification_success",
+        "save_classification_suggestion",
+        "save_raw_classification_plan",
+        "classification_suggestion",
+        "raw_classification_plan",
+        "classification_draft",
+        "save_classification_draft",
+        "clear_classification_draft",
+    ):
+        assert not hasattr(service.state, name)
 
 
 def test_old_classification_tasks_are_retired_without_worker_call(kb_root: Path):
     state = StateStore(kb_root)
-    task, _ = state.enqueue_task("article-classification", "legacy", {"path": "_inbox/legacy.md"})
+    created = now_iso()
+    task_id = "f" * 32
+    with state.connect() as db:
+        db.execute(
+            """INSERT INTO tasks(id,kind,subject,active_key,status,payload_json,attempts,next_run_at,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (task_id, "article-classification", "legacy", "article-classification:legacy", "queued", '{"path":"_inbox/legacy.md"}', 0, created, created, created),
+        )
     reopened = StateStore(kb_root)
     try:
-        retired = reopened.get_task(task["id"])
+        retired = reopened.get_task(task_id)
         assert retired["status"] == "failed"
         assert retired["error_type"] == "feature_removed"
         assert reopened.claim_task({"article-classification", "raw-classification-plan"}) is None
+        with pytest.raises(ValueError, match="no longer supported"):
+            reopened.retry_task(task_id)
+        with pytest.raises(ValueError, match="no longer supported"):
+            reopened.enqueue_task("raw-classification-plan", "legacy", {})
+        service = WikiService(kb_root, start_worker=False)
+        try:
+            with pytest.raises(ValueError, match="no longer supported"):
+                service.retry_task(task_id)
+            assert service.state.get_task(task_id)["status"] == "failed"
+        finally:
+            service.close()
     finally:
         pass
 

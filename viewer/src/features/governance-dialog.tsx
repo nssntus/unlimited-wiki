@@ -20,7 +20,7 @@ export function GovernanceDialog({ article, open, onOpenChange }: { article: Art
   const [status, setStatus] = useState(article.content_status)
   const client = useQueryClient()
   const navigate = useNavigate()
-  const taxonomy = useQuery({ queryKey: queryKeys.categories, queryFn: () => apiGet<PrivateTaxonomy>("/api/taxonomy") })
+  const taxonomy = useQuery({ queryKey: queryKeys.taxonomy, queryFn: () => apiGet<PrivateTaxonomy>("/api/taxonomy") })
   const save = useMutation({
     mutationFn: () => apiPost<{ article: Article }>("/api/article/taxonomy", {
       path: article.path,
@@ -29,9 +29,13 @@ export function GovernanceDialog({ article, open, onOpenChange }: { article: Art
       tags: tags.map((tag) => tag.name),
       status,
     }),
-    onSuccess: ({ article: updated }) => {
-      void client.invalidateQueries({ queryKey: queryKeys.articles })
-      void client.invalidateQueries({ queryKey: queryKeys.article(article.path) })
+    onSuccess: async ({ article: updated }) => {
+      await Promise.all([
+        client.invalidateQueries({ queryKey: queryKeys.articles }),
+        client.invalidateQueries({ queryKey: queryKeys.categories }),
+        client.invalidateQueries({ queryKey: queryKeys.taxonomy }),
+        client.invalidateQueries({ queryKey: queryKeys.article(article.path) }),
+      ])
       toast.success("治理信息已保存")
       onOpenChange(false)
       navigate(`/${updated.path}`)

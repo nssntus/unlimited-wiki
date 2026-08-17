@@ -383,6 +383,8 @@ class WikiService:
             else:
                 category_item = dc.new_category(name, sort_order=len(registry["categories"]))
                 dc.assert_unique(registry, category_item)
+                if (self.root / "wiki" / category_item["directory_name"]).exists():
+                    raise ValueError("category directory already exists outside the registry; reconcile it first")
                 registry["categories"].append(category_item)
                 registry["revision"] += 1
                 created_category = True
@@ -1188,7 +1190,8 @@ class WikiService:
         if item["status"] in {"ingested", "duplicate"} and disposition not in {"seed", "duplicate", "defer"}:
             raise ValueError("Raw content has already been recorded")
         raw = self.read_raw(raw_path)
-        operation_id = f"ingest-{item['byte_hash'][:20]}-{disposition}"
+        operation_base = f"ingest-{item['byte_hash'][:20]}-{disposition}"
+        operation_id = operation_base
         changes: dict[str, str] = {}
         result_target = target_path
         registry = dc.load_registry(self.root)
@@ -1201,7 +1204,9 @@ class WikiService:
             directory = category_item["directory_name"] if category_item else "_inbox"
         if disposition == "seed":
             existing_target = target_path or item.get("linked_target") or aliases.resolve(self.root, title)
-            result_target = self.read_article(existing_target)["path"] if existing_target else f"{directory}/{slugify(title)}.md"
+            if existing_target:
+                raise ValueError("canonical article already exists; use supplement")
+            result_target = f"{directory}/{slugify(title)}.md"
             raw_link = source_link(result_target, raw_path, raw["title"])
             seed_md = self._seed_markdown(raw["markdown"], category=directory, raw_link=raw_link)
             changes[f"wiki/{result_target}"] = dc.ensure_article_metadata(
@@ -1238,6 +1243,7 @@ class WikiService:
         if disposition in {"duplicate", "defer"}:
             self.state.record_raw(raw_path, item["byte_hash"], item["text_hash"], disposition, result_target, operation_id)
             return {"operation_id": operation_id, "disposition": disposition, "target_path": result_target, "article": None}
+        operation_id = self._available_operation_id(operation_base)
         log_path = self.root / "wiki" / "log.md"
         if created_category:
             changes[dc.REGISTRY_REL] = dc.dump_registry(registry)
@@ -1360,6 +1366,8 @@ class WikiService:
     def retry_task(self, task_id: str) -> dict:
         with self._intent_lock:
             task = self.state.get_task(task_id)
+            if task["kind"] not in self.remote_task_kinds or task.get("error_type") == "feature_removed":
+                raise ValueError("task kind is no longer supported")
             payload = dict(task["payload"])
             if payload.get("path"):
                 payload["base_revision"] = self.read_article(str(payload["path"]))["revision"]
@@ -1698,20 +1706,6 @@ class WikiService:
                     or current_task["attempts"] != task["attempts"]
                 ):
                     return current_task
-                derived_status = "queued" if current_task["status"] == "queued" else "failed"
-                payload = task["payload"]
-                if task["kind"] == "article-classification":
-                    self.state.save_classification_suggestion(
-                        payload["article_id"], payload["article_revision"], payload["taxonomy_revision"],
-                        derived_status, task_id=task["id"], error_type=error_type,
-                        error_message=error_message,
-                    )
-                elif task["kind"] == "raw-classification-plan":
-                    self.state.save_raw_classification_plan(
-                        payload["raw_path"], payload["raw_revision"], payload["taxonomy_revision"],
-                        derived_status, task_id=task["id"], error_type=error_type,
-                        error_message=error_message,
-                    )
                 return current_task
 
     def _finalize_remote_result(self, task: dict, result: dict) -> dict:
@@ -1732,41 +1726,8 @@ class WikiService:
                 task["id"], "auth_revoked", "The task initiator no longer has write access.",
                 retry=False, expected_attempt=task["attempts"],
             )
-            if current_task["status"] == "failed" and current_task["attempts"] == task["attempts"]:
-                if task["kind"] == "article-classification":
-                    self.state.save_classification_suggestion(
-                        task["payload"]["article_id"], task["payload"]["article_revision"],
-                        task["payload"]["taxonomy_revision"], "failed", task_id=task["id"],
-                        error_type="auth_revoked", error_message="The task initiator no longer has write access.",
-                    )
-                elif task["kind"] == "raw-classification-plan":
-                    self.state.save_raw_classification_plan(
-                        task["payload"]["raw_path"], task["payload"]["raw_revision"],
-                        task["payload"]["taxonomy_revision"], "failed", task_id=task["id"],
-                        error_type="auth_revoked", error_message="The task initiator no longer has write access.",
-                    )
             return current_task
-        payload = task["payload"]
         stale = bool(result.get("stale"))
-        if not stale and task["kind"] == "article-classification":
-            try:
-                article = self.read_article(payload["path"])
-                registry = dc.load_registry(self.root)
-                stale = (
-                    article["article_id"] != payload["article_id"]
-                    or article["revision"] != payload["article_revision"]
-                    or article["classification_status"] != "pending"
-                    or registry["revision"] != payload["taxonomy_revision"]
-                )
-            except (FileNotFoundError, ValueError):
-                stale = True
-        elif not stale and task["kind"] == "raw-classification-plan":
-            try:
-                raw = self.read_raw(payload["raw_path"])
-                registry = dc.load_registry(self.root)
-                stale = raw["revision"] != payload["raw_revision"] or registry["revision"] != payload["taxonomy_revision"]
-            except (FileNotFoundError, ValueError):
-                stale = True
         if stale:
             message = "The source or category system changed while the task was running."
             current_task = self.state.fail_task(
@@ -1774,31 +1735,9 @@ class WikiService:
             )
             if current_task["status"] != "failed" or current_task["attempts"] != task["attempts"]:
                 return current_task
-            if task["kind"] == "article-classification":
-                self.state.save_classification_suggestion(
-                    payload["article_id"], payload["article_revision"], payload["taxonomy_revision"], "failed",
-                    task_id=task["id"], error_type="stale_revision", error_message=message,
-                )
-            elif task["kind"] == "raw-classification-plan":
-                self.state.save_raw_classification_plan(
-                    payload["raw_path"], payload["raw_revision"], payload["taxonomy_revision"], "failed",
-                    task_id=task["id"], error_type="stale_revision", error_message=message,
-                )
             return current_task
         if result.get("cancelled"):
             return self.state.cancel_task(task["id"])
-        if task["kind"] == "article-classification":
-            return self.state.finalize_classification_success(
-                task["id"], task["attempts"], result,
-                article_id=payload["article_id"], article_revision=payload["article_revision"],
-                taxonomy_revision=payload["taxonomy_revision"], suggestion=result["suggestion"],
-            )
-        if task["kind"] == "raw-classification-plan":
-            return self.state.finalize_raw_classification_success(
-                task["id"], task["attempts"], result,
-                raw_path=payload["raw_path"], raw_revision=payload["raw_revision"],
-                taxonomy_revision=payload["taxonomy_revision"], plan=result["plan"],
-            )
         return self.state.complete_task(task["id"], result, expected_attempt=task["attempts"])
 
     def _run_remote_task(self, task: dict) -> dict:

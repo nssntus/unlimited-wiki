@@ -228,6 +228,12 @@ def test_dynamic_category_article_and_reconciliation_ids_are_tenant_scoped(multi
         ("/api/admin/public-tags", {"name": "Bypass tag"}),
         ("/api/admin/public-category-mappings", {"private_name": "Private"}),
         (f"/api/admin/public-entries/{'f' * 32}/taxonomy", {"category_id": "f" * 32}),
+        (f"/api/admin/public-categories/{'f' * 32}/update", {
+            "slug": "cannot-create", "name": "Cannot Create", "description": "", "status": "active", "sort_order": 0,
+        }),
+        (f"/api/admin/public-tags/{'f' * 32}/update", {
+            "slug": "cannot-create", "name": "Cannot Create", "status": "active",
+        }),
     ):
         assert alice.request("POST", path, payload, key=f"removed-{path}")[0] == 404
 

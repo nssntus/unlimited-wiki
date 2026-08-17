@@ -44,6 +44,15 @@ def _slug(value: str) -> str:
     return result
 
 
+def taxonomy_normalized_key(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("taxonomy name must be a string")
+    name = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", value)).strip()
+    if not name:
+        raise ValueError("invalid taxonomy name")
+    return name.casefold()
+
+
 def normalize_taxonomy_name(value: str, *, kind: str) -> tuple[str, str]:
     if not isinstance(value, str):
         raise ValueError(f"{kind} name must be a string")
@@ -55,7 +64,7 @@ def normalize_taxonomy_name(value: str, *, kind: str) -> tuple[str, str]:
         raise ValueError(f"invalid public {kind} name")
     if not any(ch.isalnum() for ch in name):
         raise ValueError(f"invalid public {kind} name")
-    return name, name.casefold()
+    return name, taxonomy_normalized_key(name)
 
 
 def taxonomy_slug(name: str, *, kind: str) -> str:
@@ -448,7 +457,7 @@ def initialize_square_schema(db: sqlite3.Connection) -> None:
         rows = db.execute(f"SELECT id,name,normalized_name FROM {table}").fetchall()
         seen: dict[str, str] = {}
         for row in rows:
-            _name, normalized = normalize_taxonomy_name(row["name"], kind=kind)
+            normalized = taxonomy_normalized_key(row["name"])
             if normalized in seen and seen[normalized] != row["id"]:
                 raise RuntimeError(f"duplicate normalized public {kind} names: {seen[normalized]}, {row['id']}")
             seen[normalized] = row["id"]
@@ -1380,10 +1389,14 @@ class SquareMixin:
         if status not in {"active", "disabled"}:
             raise ValueError("invalid public category")
         clean_name, normalized_name = normalize_taxonomy_name(name, kind="category")
-        category_id, now, requested_slug = category_id or uuid.uuid4().hex, _now(), _slug(slug)
+        if not category_id:
+            raise FileNotFoundError("public category")
+        now, requested_slug = _now(), _slug(slug)
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE"); self._authorize_admin_in_transaction(db, context.user_id)
             old = db.execute("SELECT slug FROM public_categories WHERE id=?", (category_id,)).fetchone()
+            if old is None:
+                db.rollback(); raise FileNotFoundError(category_id)
             canonical_owner = db.execute(
                 "SELECT id FROM public_categories WHERE slug=? AND id<>?", (requested_slug, category_id),
             ).fetchone()
@@ -1395,13 +1408,10 @@ class SquareMixin:
             if alias_owner is not None:
                 db.execute("DELETE FROM public_category_slug_redirects WHERE slug=? AND category_id=?", (requested_slug, category_id))
             db.execute("""
-                INSERT INTO public_categories(
-                    id,slug,name,normalized_name,description,status,sort_order,created_by,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(id) DO UPDATE SET slug=excluded.slug,name=excluded.name,
-                  normalized_name=excluded.normalized_name,description=excluded.description,
-                  status=excluded.status,sort_order=excluded.sort_order,updated_at=excluded.updated_at
-            """, (category_id, requested_slug, clean_name, normalized_name, description.strip()[:1000], status, int(sort_order), context.user_id, now, now))
+                UPDATE public_categories
+                SET slug=?,name=?,normalized_name=?,description=?,status=?,sort_order=?,updated_at=?
+                WHERE id=?
+            """, (requested_slug, clean_name, normalized_name, description.strip()[:1000], status, int(sort_order), now, category_id))
             if old is not None and old["slug"] != requested_slug:
                 existing_alias = db.execute(
                     "SELECT category_id FROM public_category_slug_redirects WHERE slug=?", (old["slug"],),
@@ -1524,40 +1534,21 @@ class SquareMixin:
         if status not in {"active", "disabled"}:
             raise ValueError("invalid public tag")
         clean_name, normalized_name = normalize_taxonomy_name(name, kind="tag")
-        tag_id, now = tag_id or uuid.uuid4().hex, _now()
+        if not tag_id:
+            raise FileNotFoundError("public tag")
+        now = _now()
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE"); self._authorize_admin_in_transaction(db, context.user_id)
+            if db.execute("SELECT 1 FROM public_tags WHERE id=?", (tag_id,)).fetchone() is None:
+                db.rollback(); raise FileNotFoundError(tag_id)
             db.execute("""
-                INSERT INTO public_tags(id,slug,name,normalized_name,status,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?)
-                ON CONFLICT(id) DO UPDATE SET slug=excluded.slug,name=excluded.name,
-                  normalized_name=excluded.normalized_name,status=excluded.status,updated_at=excluded.updated_at
-            """, (tag_id, _slug(slug), clean_name, normalized_name, status, now, now))
+                UPDATE public_tags SET slug=?,name=?,normalized_name=?,status=?,updated_at=? WHERE id=?
+            """, (_slug(slug), clean_name, normalized_name, status, now, tag_id))
             for entry in db.execute("SELECT entry_id FROM public_entry_tags WHERE tag_id=?", (tag_id,)).fetchall():
                 self._refresh_square_entry(db, entry["entry_id"])
             self._audit(db, context.user_id, "public_tag.upsert", "public_tag", tag_id, {"status": status})
             db.commit()
         return {"id": tag_id, "slug": _slug(slug), "name": clean_name, "status": status}
-
-    def admin_set_entry_taxonomy(self, context: Any, entry_id: str, category_id: str | None, tag_ids: list[str]) -> dict:
-        if len(tag_ids) > 12 or any(not re.fullmatch(r"[a-f0-9]{32}", value) for value in tag_ids):
-            raise ValueError("invalid public tags")
-        with self._lock, self.connect() as db:
-            db.execute("BEGIN IMMEDIATE"); self._authorize_admin_in_transaction(db, context.user_id)
-            if category_id and db.execute("SELECT 1 FROM public_categories WHERE id=? AND status='active'", (category_id,)).fetchone() is None:
-                db.rollback(); raise FileNotFoundError(category_id)
-            if db.execute("SELECT 1 FROM public_entries WHERE id=?", (entry_id,)).fetchone() is None:
-                db.rollback(); raise FileNotFoundError(entry_id)
-            db.execute("UPDATE public_entries SET public_category_id=? WHERE id=?", (category_id, entry_id))
-            db.execute("DELETE FROM public_entry_tags WHERE entry_id=?", (entry_id,))
-            for tag_id in dict.fromkeys(tag_ids):
-                if db.execute("SELECT 1 FROM public_tags WHERE id=? AND status='active'", (tag_id,)).fetchone() is None:
-                    db.rollback(); raise FileNotFoundError(tag_id)
-                db.execute("INSERT INTO public_entry_tags VALUES(?,?)", (entry_id, tag_id))
-            self._refresh_square_entry(db, entry_id)
-            self._audit(db, context.user_id, "public_entry.taxonomy", "public_entry", entry_id, {"category_id": category_id, "tag_ids": tag_ids})
-            db.commit()
-        return {"id": entry_id, "public_category_id": category_id, "tag_ids": tag_ids}
 
     def admin_set_featured(self, context: Any, entry_id: str, featured: bool, reason: str, sort_order: int = 0) -> dict:
         if not reason.strip():

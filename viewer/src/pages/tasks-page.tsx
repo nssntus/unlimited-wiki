@@ -42,6 +42,8 @@ function taskHref(task: Task) {
   return typeof task.payload.path === "string" ? `/${task.payload.path}` : null
 }
 
+const actionableTaskKinds = new Set(["generate", "supplement", "governance"])
+
 export function TasksPage() {
   const { hasPermission } = useSession()
   const canWrite = hasPermission("wiki.write")
@@ -112,7 +114,7 @@ export function TasksPage() {
                     </p>
                   </div>
                   <div className="flex gap-2">
-                    {canWrite && ((["failed", "cancelled"].includes(task.status) ||
+                    {canWrite && actionableTaskKinds.has(task.kind) && task.error_type !== "feature_removed" && ((["failed", "cancelled"].includes(task.status) ||
                       task.result?.conflict === true) && (
                       <Button
                         size="sm"
@@ -123,7 +125,7 @@ export function TasksPage() {
                         基于当前正文重试
                       </Button>
                     ))}
-                    {canWrite && ["queued", "running"].includes(task.status) && (
+                    {canWrite && actionableTaskKinds.has(task.kind) && ["queued", "running"].includes(task.status) && (
                       <Button
                         size="sm"
                         variant="outline"

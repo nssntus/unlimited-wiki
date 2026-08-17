@@ -21,7 +21,7 @@ type SaveResponse = { conflict: boolean; article?: Article; disk?: Article; oper
 export function EditorPage() {
   const path = decodeURIComponent(useLocation().pathname.replace(/^\/edit\//, "")); const navigate = useNavigate(); const client = useQueryClient()
   const article = useQuery({ queryKey: queryKeys.article(path), queryFn: () => apiGet<Article>(`/api/article?path=${encodeURIComponent(path)}`) })
-  const taxonomy = useQuery({ queryKey: queryKeys.categories, queryFn: () => apiGet<PrivateTaxonomy>("/api/taxonomy") })
+  const taxonomy = useQuery({ queryKey: queryKeys.taxonomy, queryFn: () => apiGet<PrivateTaxonomy>("/api/taxonomy") })
   const [draft, setDraft] = useState<string | null>(null); const [conflict, setConflict] = useState<Article | null>(null)
   const [categoryChoice, setCategoryChoice] = useState<TaxonomySelection | null>(null)
   const [tagChoices, setTagChoices] = useState<TaxonomySelection[] | null>(null)

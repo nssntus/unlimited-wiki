@@ -1806,6 +1806,9 @@ def make_handler(app: WikiApp):
             if match:
                 self._require_role("admin")
                 _fields(data, {"decision", "reason", "public_category_id", "tag_ids", "duplicate_action", "taxonomy_decision"}, {"decision", "reason"})
+                taxonomy_decision = data.get("taxonomy_decision")
+                if taxonomy_decision is not None and not isinstance(taxonomy_decision, dict):
+                    raise ApiError(422, "taxonomy_decision must be an object")
                 tag_ids = data.get("tag_ids", [])
                 if not isinstance(tag_ids, list) or not all(isinstance(value, str) for value in tag_ids):
                     raise ApiError(422, "tag_ids must be an array of ids")
@@ -1814,7 +1817,7 @@ def make_handler(app: WikiApp):
                     public_category_id=_string(data, "public_category_id", maximum=32) or None,
                     tag_ids=tag_ids,
                     duplicate_action=_string(data, "duplicate_action", maximum=40) or "independent",
-                    taxonomy_decision=data.get("taxonomy_decision") if isinstance(data.get("taxonomy_decision"), dict) else None,
+                    taxonomy_decision=taxonomy_decision,
                 ))
                 return self._json(200, response)
             match = re.fullmatch(r"/api/admin/public-entries/([a-f0-9]{32})/remove", path)

@@ -21,7 +21,9 @@ from backup_restore import (
     verify_backup,
 )
 from platform_store import PlatformStore
+from publication import snapshot_fingerprint
 from state_store import StateStore
+from square_v2 import normalize_taxonomy_name
 
 
 LEGACY_PLATFORM_DDL = """
@@ -275,12 +277,97 @@ def test_backup_accepts_normal_merged_public_category(tmp_path: Path):
     source.mkdir()
     platform, user, _article, _raw = seed_instance(source)
     _token, context = platform.create_session(user["id"])
-    first = platform.admin_upsert_category(context, None, "first", "First", "", "active", 0)
-    second = platform.admin_upsert_category(context, None, "second", "Second", "", "active", 1)
+    now = "2026-01-01T00:00:00+00:00"
+    with platform.connect() as db:
+        for category_id, slug, name, sort_order in (("1" * 32, "first", "First", 0), ("2" * 32, "second", "Second", 1)):
+            clean, normalized = normalize_taxonomy_name(name, kind="category")
+            db.execute(
+                """INSERT INTO public_categories(id,slug,name,normalized_name,description,status,sort_order,created_by,created_at,updated_at)
+                VALUES(?,?,?,?,?,'active',?,?,?,?)""",
+                (category_id, slug, clean, normalized, "", sort_order, context.user_id, now, now),
+            )
+    first, second = {"id": "1" * 32}, {"id": "2" * 32}
     platform.admin_merge_category(context, first["id"], second["id"], "Duplicate taxonomy")
     backup = tmp_path / "backup"
     create_backup(source, backup)
     assert verify_backup(backup)["schema_version"] == 2
+
+
+@pytest.mark.parametrize("table", ["public_categories", "public_tags"])
+def test_backup_rejects_forged_normalized_taxonomy_names(tmp_path: Path, table: str):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    now = "2026-01-01T00:00:00+00:00"
+    with platform.connect() as db:
+        if table == "public_categories":
+            for item_id, slug, name, normalized in (
+                ("3" * 32, "cafe-a", "Ｃａｆé", "forged-a"),
+                ("4" * 32, "cafe-b", "Cafe\u0301", "forged-b"),
+            ):
+                db.execute(
+                    """INSERT INTO public_categories(id,slug,name,normalized_name,description,status,sort_order,created_by,created_at,updated_at)
+                    VALUES(?,?,?,?,?,'active',0,?,?,?)""",
+                    (item_id, slug, name, normalized, "", user["id"], now, now),
+                )
+        else:
+            for item_id, slug, name, normalized in (
+                ("3" * 32, "cafe-a", "Ｃａｆé", "forged-a"),
+                ("4" * 32, "cafe-b", "Cafe\u0301", "forged-b"),
+            ):
+                db.execute(
+                    "INSERT INTO public_tags(id,slug,name,normalized_name,status,created_at,updated_at) VALUES(?,?,?,?, 'active',?,?)",
+                    (item_id, slug, name, normalized, now, now),
+                )
+    assert_backup_contract_rejects(source, tmp_path, "normalized public taxonomy|duplicate normalized")
+
+
+def test_backup_rejects_malformed_taxonomy_proposal_json(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    now = "2026-01-01T00:00:00+00:00"
+    with platform.connect() as db:
+        db.execute(
+            """INSERT INTO share_previews(
+                id,owner_id,workspace_id,article_path,source_revision,content_hash,snapshot_json,
+                expires_at,created_at,taxonomy_proposal_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            ("5" * 32, user["id"], user["workspace_id"], "concepts/a.md", "r1", "h", "{}", now, now, "{"),
+        )
+    assert_backup_contract_rejects(source, tmp_path, "invalid taxonomy proposal data")
+
+
+def test_backup_rejects_malformed_taxonomy_decision_json(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    _token, context = platform.create_session(user["id"])
+    snapshot = {
+        "title": "Taxonomy decision",
+        "category": "",
+        "content_status": "draft",
+        "markdown": "# Taxonomy decision\n\nPublic body.\n",
+    }
+    preview = platform.create_preview(
+        context,
+        "_inbox/taxonomy-decision.md",
+        "r1",
+        "6" * 32,
+        snapshot_fingerprint(snapshot),
+        snapshot,
+        taxonomy_selection={
+            "category": {"kind": "proposal", "name": "Decision category"},
+            "tags": [],
+        },
+    )
+    submission = platform.submit_preview(context, preview["preview_id"])
+    with platform.connect() as db:
+        db.execute(
+            "UPDATE submissions SET taxonomy_decision_json=? WHERE id=?",
+            ("{", submission["id"]),
+        )
+    assert_backup_contract_rejects(source, tmp_path, "invalid taxonomy decision data")
 
 
 @pytest.mark.parametrize(

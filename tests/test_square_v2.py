@@ -2,6 +2,7 @@ import json
 import sqlite3
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -9,8 +10,40 @@ import pytest
 from platform_store import PlatformStore
 from publication import snapshot_fingerprint
 from serve import create_app
-from square_v2 import PublicIndexWorker, REUSE_POLICY_VERSION, canonical_public_url, safe_public_url
+from square_v2 import PublicIndexWorker, REUSE_POLICY_VERSION, canonical_public_url, normalize_taxonomy_name, safe_public_url
 from wiki_service import WikiService
+
+
+def _seed_category(store: PlatformStore, context, *, name: str, slug: str, sort_order: int = 0):
+    category_id = uuid.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    clean, normalized = normalize_taxonomy_name(name, kind="category")
+    with store.connect() as db:
+        db.execute(
+            """INSERT INTO public_categories(id,slug,name,normalized_name,description,status,sort_order,created_by,created_at,updated_at)
+            VALUES(?,?,?,?,?,'active',?,?,?,?)""",
+            (category_id, slug, clean, normalized, "", sort_order, context.user_id, now, now),
+        )
+    return {"id": category_id, "slug": slug, "name": clean}
+
+
+def _seed_tag(store: PlatformStore, *, name: str, slug: str):
+    tag_id = uuid.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    clean, normalized = normalize_taxonomy_name(name, kind="tag")
+    with store.connect() as db:
+        db.execute(
+            "INSERT INTO public_tags(id,slug,name,normalized_name,status,created_at,updated_at) VALUES(?,?,?,?,'active',?,?)",
+            (tag_id, slug, clean, normalized, now, now),
+        )
+    return {"id": tag_id, "slug": slug, "name": clean}
+
+
+def _seed_public_taxonomy(store: PlatformStore, context):
+    return (
+        _seed_category(store, context, name="知识系统", slug="knowledge-systems"),
+        _seed_tag(store, name="检索", slug="retrieval"),
+    )
 
 
 def _snapshot(title: str, body: str, *, category_id: str | None = None, tag_ids: list[str] | None = None,
@@ -78,12 +111,11 @@ def square(tmp_path):
     store = PlatformStore(tmp_path)
     user, _ = store.register("square-owner@example.com", "Square Owner", "correct-horse-123")
     _token, context = store.create_session(user["id"])
-    category = store.admin_upsert_category(context, None, "knowledge-systems", "知识系统", "公共分类", "active", 0)
-    tag = store.admin_upsert_tag(context, None, "retrieval", "检索", "active")
+    category, tag = _seed_public_taxonomy(store, context)
     return store, context, category, tag
 
 
-def test_taxonomy_proposals_are_isolated_from_public_navigation_and_ai(square):
+def test_taxonomy_proposals_are_isolated_from_public_navigation_and_ai(square, monkeypatch):
     store, context, _category, _tag = square
     before_categories = store.public_categories()
     before_tags = store.public_tags()
@@ -94,6 +126,26 @@ def test_taxonomy_proposals_are_isolated_from_public_navigation_and_ai(square):
         category_name="Private Proposal Name",
         tag_names=["Unapproved Tag"],
     )
+    with store.connect() as db:
+        snapshot = json.loads(db.execute("SELECT snapshot_json FROM submissions WHERE id=?", (submission["id"],)).fetchone()[0])
+        snapshot["markdown"] = (
+            "# Proposal\n\n"
+            "> Article-ID: " + "a1" * 16 + "\n"
+            "> Category-ID: " + "b2" * 16 + "\n"
+            "> Classification: confirmed\n"
+            "> Category: Private Taxonomy Canary\n"
+            "> Tags: Secret Tag Canary\n"
+            "> Raw: raw/private/canary.md\n\n"
+            "Public body.\n\n"
+            "> Category: this body quote remains public prose\n"
+        )
+        db.execute("UPDATE submissions SET snapshot_json=? WHERE id=?", (json.dumps(snapshot, ensure_ascii=False), submission["id"]))
+    monkeypatch.setattr(store, "duplicate_candidates", lambda _snapshot: [{
+        "id": "1" * 32, "revision_id": "2" * 32, "title": "Similar public title",
+        "summary": "Safe summary", "attribution": "Author", "version": 3,
+        "category": {"id": "3" * 32, "name": "Public category"},
+        "tags": [{"id": "4" * 32, "name": "Public tag"}], "content_hash": "5" * 64,
+    }])
 
     assert store.public_categories() == before_categories
     assert store.public_tags() == before_tags
@@ -103,12 +155,43 @@ def test_taxonomy_proposals_are_isolated_from_public_navigation_and_ai(square):
     assert "private-research" not in review_payload
     assert "Private Proposal Name" not in review_payload
     assert "Unapproved Tag" not in review_payload
+    assert "Private Taxonomy Canary" not in review_payload
+    assert "Secret Tag Canary" not in review_payload
+    assert "raw/private/canary.md" not in review_payload
+    assert "this body quote remains public prose" in review_payload
+    for forbidden in ("id", "revision_id", "category", "tags", "content_hash"):
+        assert f'"{forbidden}"' not in review_payload
+    assert "Similar public title" in review_payload
     store.ai_decide(
         submission["id"], "needs_revision", {"summary": "revise", "issues": []},
         expected_attempt=claimed["attempt"],
     )
     assert store.public_categories() == before_categories
     assert store.public_tags() == before_tags
+
+
+def test_public_taxonomy_governance_is_update_only(square):
+    store, context, _category, _tag = square
+    with store.connect() as db:
+        before = (
+            db.execute("SELECT COUNT(*) FROM public_categories").fetchone()[0],
+            db.execute("SELECT COUNT(*) FROM public_tags").fetchone()[0],
+            db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0],
+        )
+    with pytest.raises(FileNotFoundError):
+        store.admin_upsert_category(context, "f" * 32, "forged", "Forged", "", "active", 0)
+    with pytest.raises(FileNotFoundError):
+        store.admin_upsert_tag(context, "e" * 32, "forged", "Forged", "active")
+    with pytest.raises(FileNotFoundError):
+        store.admin_upsert_category(context, None, "forged", "Forged", "", "active", 0)
+    assert not hasattr(store, "admin_set_entry_taxonomy")
+    with store.connect() as db:
+        after = (
+            db.execute("SELECT COUNT(*) FROM public_categories").fetchone()[0],
+            db.execute("SELECT COUNT(*) FROM public_tags").fetchone()[0],
+            db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0],
+        )
+    assert after == before
 
 
 def test_proposal_approval_is_atomic_and_freezes_revision_taxonomy(square, monkeypatch):
@@ -125,6 +208,7 @@ def test_proposal_approval_is_atomic_and_freezes_revision_taxonomy(square, monke
     category_proposal = pending["taxonomy"]["category"]
     tag_proposal = pending["taxonomy"]["tags"][0]
     decision = {
+        "version": 1,
         "resolutions": {
             category_proposal["key"]: {"action": "create"},
             tag_proposal["key"]: {"action": "create"},
@@ -194,6 +278,7 @@ def test_normalized_proposals_reuse_one_public_taxonomy_object(square):
         pending = store.admin_get(context, submission["id"])
         proposal_items = [pending["taxonomy"]["category"], *pending["taxonomy"]["tags"]]
         decision = {
+            "version": 1,
             "resolutions": {
                 item["key"]: {"action": "create"}
                 for item in proposal_items
@@ -635,7 +720,6 @@ Visible body
     assert "square" not in public["snapshot"]
     assert "private/raw/path.md" not in json.dumps(public, ensure_ascii=False)
     store.admin_set_featured(context, entry_id, True, "Useful overview", 3)
-    store.admin_set_entry_taxonomy(context, entry_id, category["id"], [tag["id"]])
     with store.connect() as db:
         after = db.execute("SELECT snapshot_json,content_hash FROM public_revisions WHERE entry_id=?", (entry_id,)).fetchone()
     assert tuple(after) == tuple(before)
@@ -1072,7 +1156,7 @@ def test_stale_account_context_cannot_write_square_state(square):
 
 def test_category_slug_redirect_merge_mapping_and_revision_taxonomy(square):
     store, context, category, tag = square
-    other = store.admin_upsert_category(context, None, "retrieval-systems", "检索系统", "Target", "active", 2)
+    other = _seed_category(store, context, name="检索系统", slug="retrieval-systems", sort_order=2)
     published = _publish(
         store, context, _snapshot("Taxonomy history", "Body", category_id=category["id"], tag_ids=[tag["id"]]),
         article_id="2" * 32, source_revision="r1", category_id=category["id"], tag_ids=[tag["id"]],
@@ -1202,8 +1286,8 @@ def test_taxonomy_refreshes_search_and_historical_slugs_are_reserved(square):
     )
     store.admin_upsert_category(context, category["id"], "knowledge-new", "独特新分类词", "", "active", 0)
     assert store.search_public(query="独特新分类词")["items"][0]["id"] == published["public_entry_id"]
-    with pytest.raises(ValueError, match="reserved"):
-        store.admin_upsert_category(context, None, "knowledge-systems", "劫持", "", "active", 0)
+    with pytest.raises(FileNotFoundError):
+        store.admin_upsert_category(context, "f" * 32, "knowledge-systems", "劫持", "", "active", 0)
     assert store.resolve_public_category("knowledge-systems")["id"] == category["id"]
     store.admin_upsert_tag(context, tag["id"], "retrieval", "独特新标签词", "active")
     assert store.search_public(query="独特新标签词")["items"][0]["id"] == published["public_entry_id"]
