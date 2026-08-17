@@ -23,6 +23,7 @@ secrets*
 # Runtime and development artifacts
 .wiki-state/
 .platform/
+.runtime/
 spaces/
 viewer/node_modules/
 viewer/dist/

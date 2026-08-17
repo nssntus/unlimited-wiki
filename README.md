@@ -1,8 +1,8 @@
 # Unlimited Wiki
 
-Unlimited Wiki 是一个仅绑定本机回环地址的多用户 Markdown 知识库。每个账号拥有独立的私有空间，可整理正本与 Raw 原料、生成和治理词条，并通过不可变投稿快照、AI 预审和管理员审核将内容发布到公开广场。
+Unlimited Wiki 是一个多用户 Markdown 知识库。每个账号拥有独立的私有空间，可整理正本与 Raw 原料、生成和治理词条，并通过不可变投稿快照、AI 预审和管理员审核将内容发布到公开广场。
 
-当前项目面向本机使用和开发验证，不是可直接暴露到公网的部署版本。
+项目支持本机开发，也支持由同机 HTTPS 反向代理接入的公司内网单节点部署。Python 后端始终只绑定回环地址；不要将它直接暴露到局域网或公网。当前不支持多节点、高可用或共享网络文件系统。
 
 ## 核心能力
 
@@ -58,6 +58,85 @@ python3 serve.py
 团队 Owner 可先停用空间，再恢复或软删除。停用会立即阻止成员访问、撤销待处理邀请，并暂停尚未完成的空间任务；恢复后任务重新排队，但成员必须明确选择该空间才会重新进入。软删除是终态：空间不能访问或恢复，未完成任务以 `workspace_deleted` 结束，但磁盘正文、模型设置、投稿快照和已发布公开版本不会被物理删除。Editor 和 Viewer 可退出团队，活跃或停用空间的 Owner 必须先转移所有权；已经软删除的团队空间保留历史归属，不再阻止账号注销。
 
 当当前空间被停用、删除或成员主动退出时，账号会话仍保持登录，页面进入“选择 Wiki 空间”状态。系统不会自动切换到个人空间或另一个团队空间，避免原本针对旧空间的请求写入错误空间。
+
+## 公司内网部署
+
+唯一受支持的内网拓扑是“浏览器 -> HTTPS Caddy/nginx -> 同机 `127.0.0.1:8765` 后端”。反向代理必须保留外部 `Host`，设置 `X-Forwarded-Proto: https` 和标准 `X-Forwarded-For`。应用只信任 `WIKI_TRUSTED_PROXY_CIDRS` 中的代理地址，并从代理链右侧剥离受信跳点；不要配置整个公司网段。
+
+先完成依赖安装和前端构建，再创建专用系统用户以及仅该用户可写的 `.platform/`、`spaces/`、`.runtime/` 目录。生产环境变量至少包含：
+
+```bash
+WIKI_PUBLIC_ORIGIN=https://wiki.intra.example
+WIKI_TRUSTED_PROXY_CIDRS=127.0.0.1/32
+WIKI_REGISTRATION_MODE=bootstrap
+WIKI_MAX_CONCURRENT_REQUESTS=64
+WIKI_REQUEST_TIMEOUT_SECONDS=30
+WIKI_MIN_FREE_BYTES=536870912
+WIKI_PORT=8765
+```
+
+`WIKI_PUBLIC_ORIGIN` 必须是单一、规范的 HTTPS Origin，不能带路径、查询参数或凭据。LAN 模式会强制使用 `__Host-wiki_session`、`Secure`、`HttpOnly` 和 `SameSite=Strict` Cookie，并启用 HSTS；Host、Origin 或代理协议不匹配时请求会被拒绝。`WIKI_REGISTRATION_MODE=bootstrap` 只允许创建第一个管理员，成功后自动关闭注册。确认管理员可以登录后，将模式改为 `invite`；管理员在部署机生成绑定邮箱、限时且只能使用一次的邀请令牌：
+
+```bash
+python3 account_invites.py create --project-root . --email member@example.com --hours 72
+```
+
+通过受控渠道把令牌交给对应用户，用户在注册页输入相同邮箱和令牌。令牌只以 SHA-256 摘要保存，明文只在创建时输出一次。所有公司账号建立完成后可将模式设为 `closed`；当前没有企业 SSO 或邮件开户流程。账号创建后，团队 Owner 再发送 Workspace 邀请。
+
+仓库提供 `deploy/Caddyfile.example` 和 `deploy/systemd/` 模板。将域名替换为公司内网域名，确保所有客户端信任代理签发证书的内部 CA，然后安装并启动：
+
+```bash
+sudo useradd --system --home /opt/unlimited-wiki --shell /usr/sbin/nologin unlimited-wiki
+sudo install -d -m 700 -o unlimited-wiki -g unlimited-wiki \
+  /opt/unlimited-wiki/.platform /opt/unlimited-wiki/spaces /opt/unlimited-wiki/.runtime \
+  /var/backups/unlimited-wiki
+sudo cp deploy/systemd/unlimited-wiki.service /etc/systemd/system/
+sudo cp deploy/systemd/unlimited-wiki-backup.service /etc/systemd/system/
+sudo cp deploy/systemd/unlimited-wiki-backup.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now unlimited-wiki.service
+sudo systemctl enable --now unlimited-wiki-backup.timer
+```
+
+`GET /healthz` 是无认证存活探针；`GET /readyz` 只返回前端、存储、数据库、主密钥和磁盘余量的布尔检查，不会创建 Workspace service 或泄露路径。请求日志以 JSON Lines 输出到 stdout，包含 `request_id`、规范化路径、状态码、耗时、响应大小和经过受信代理解析的客户端 IP，可由 journald 收集：
+
+```bash
+curl http://127.0.0.1:8765/healthz
+curl http://127.0.0.1:8765/readyz
+sudo journalctl -u unlimited-wiki.service -f
+```
+
+应用使用有界并发以及 socket/body 读取时限，Caddy 模板另设 header、body、write 和 idle timeout；超过并发上限时返回 `503` 和 `Retry-After`。这些限制不是 Python 业务处理的强制总 deadline，远端模型调用仍使用各自的超时和持久任务恢复。登录、注册、恢复码和举报还使用平台 SQLite 中的持久限流，应用重启不会清空计数。上线前应在部署机执行容量检查并按 CPU、内存和磁盘实测调整并发上限：
+
+```bash
+python3 capacity_check.py https://wiki.intra.example/healthz --requests 1000 --concurrency 50
+```
+
+健康探针只验证入口。正式容量验收还应为测试账号设置临时 `WIKI_CAPACITY_COOKIE`，分别检查文章列表、搜索和读取端点；测试完成后立即 `unset WIKI_CAPACITY_COOKIE`。出现任何非 `200` 状态时工具返回非零退出码。
+
+### 备份与恢复
+
+完整实例数据包括 `.platform/` 和整个 `spaces/`。其中 `.platform/master.key` 用于解密 Workspace 模型凭据，丢失后无法恢复。由于平台 SQLite、各 Workspace SQLite 与 Markdown 文件之间没有全局快照事务，可靠备份必须停服执行，不能用运行中的裸文件复制代替。
+
+```bash
+sudo systemctl stop unlimited-wiki.service
+sudo -u unlimited-wiki python3 backup_restore.py backup --project-root . --output /var/backups/unlimited-wiki/wiki-20260817T033000Z
+sudo -u unlimited-wiki python3 backup_restore.py verify /var/backups/unlimited-wiki/wiki-20260817T033000Z
+sudo systemctl start unlimited-wiki.service
+```
+
+备份会先取得实例锁、checkpoint 并检查所有 SQLite 数据库，再生成逐文件 SHA-256 manifest，并以原子目录改名发布。备份目录应位于非 Web 根目录、权限为 `0700` 的加密磁盘；TLS 私钥和 `/etc/unlimited-wiki.env` 需通过公司的秘密备份流程另行保管。定时单元调用 `deploy/offline-backup.sh`，备份保留清理由运维平台完成，不会自动删除唯一副本。
+
+恢复必须在停服状态下进行，并且目标不能已有 `.platform/` 或 `spaces/`。先把旧数据目录移动到隔离位置，再执行：
+
+```bash
+python3 backup_restore.py verify /var/backups/unlimited-wiki/wiki-20260817T033000Z
+sudo python3 backup_restore.py restore /var/backups/unlimited-wiki/wiki-20260817T033000Z \
+  --project-root . --owner unlimited-wiki
+sudo -u unlimited-wiki WIKI_DISABLE_REMOTE_WORKER=1 python3 serve.py
+```
+
+备份、恢复和服务进程共用 `.runtime/instance.lock`。恢复会先复制到私有 staging，再校验 manifest、主密钥和 SQLite 完整性，撤销备份中的浏览器会话，并按 `--owner` 修复数据属主。安装期间会保留可恢复 journal；若进程或机器中断，服务会拒绝在半恢复状态启动，使用同一备份重复执行 restore 即可继续。完成只读冒烟检查后停止临时进程，再通过 systemd 正常启动。至少每季度在隔离目录进行一次恢复演练；没有经过恢复验证的备份不能视为可用。
 
 ## 前端开发
 
@@ -135,6 +214,12 @@ viewer/                             前端源码与构建配置
 | --- | --- | --- |
 | `WIKI_PORT` | 修改本机服务端口，仍只绑定回环地址 | `8765` |
 | `WIKI_DEV_ORIGINS` | 允许指定的 Vite 开发源访问后端 | 未设置 |
+| `WIKI_PUBLIC_ORIGIN` | 内网部署唯一 HTTPS Origin；设置后进入严格 LAN 模式 | 未设置 |
+| `WIKI_TRUSTED_PROXY_CIDRS` | 可提供真实客户端 IP 和 HTTPS 协议的同机代理 CIDR | 未设置 |
+| `WIKI_REGISTRATION_MODE` | `open`、`bootstrap`、`invite` 或 `closed` | 本机 `open`；LAN `bootstrap` |
+| `WIKI_MAX_CONCURRENT_REQUESTS` | 后端同时处理的请求上限 | `64` |
+| `WIKI_REQUEST_TIMEOUT_SECONDS` | 单连接 socket 超时 | `30` |
+| `WIKI_MIN_FREE_BYTES` | readiness 要求的数据盘最小剩余字节数 | `536870912` |
 | `WIKI_DISABLE_REMOTE_WORKER` | 设为 `1` 时不启动远端任务工作器 | `0` |
 | `WIKI_REMOTE_TASK_KINDS` | 限制远端工作器处理的任务类型，逗号分隔 | 全部支持类型 |
 | `WIKI_SECURE_COOKIES` | 设为 `1` 时为会话 Cookie 添加 `Secure` | `0` |
@@ -143,7 +228,7 @@ viewer/                             前端源码与构建配置
 
 ## 安全边界
 
-- 服务只允许绑定 `127.0.0.1`、`localhost` 或 `::1`，并校验 Host 和 Origin。
+- 后端只允许绑定 `127.0.0.1`、`localhost` 或 `::1`。LAN 模式精确校验外部 HTTPS Host、Origin 和受信代理协议，转发头仅在 socket peer 命中明确 CIDR 时使用。
 - 多用户写请求使用会话、CSRF 和幂等保护；团队管理操作按账号、会话或当前空间隔离幂等作用域，并与平台数据变更在同一事务提交。密码使用 scrypt 派生。
 - 私有 API 每次请求都从服务端会话重新验证当前空间成员关系；客户端提交的 Workspace、Owner 或角色字段不能形成授权。
 - 团队空间只允许 Owner 管理成员。Owner 可邀请 Editor 或 Viewer、调整角色、移除成员并把 Owner 转移给现有活跃成员；最后一个 Owner 不能被直接移除或降级。个人空间不能邀请成员或转移 Owner。
@@ -157,7 +242,7 @@ viewer/                             前端源码与构建配置
 - 个人组织和个人空间不可转移；个人空间仍有其他活跃成员时，必须先解除成员关系，账号注销会返回 `422` 且不产生任何变更。注销活跃或停用团队空间的 Owner 时，系统按现有 Owner、Editor、Viewer 的顺序稳定选择空间接任者，并按 Owner、Admin、Member 的顺序独立选择组织接任者；转移、审计和注销在同一事务内完成。任一仍可治理的组织或团队空间没有接任者时也返回 `422`，整次注销不产生变更。仅包含软删除空间的团队组织不再要求接任，终态空间的磁盘、模型、投稿和公开修订继续保留；仅未共享的个人空间会清理本地数据。
 - Markdown 经净化后渲染，并设置 CSP、`nosniff` 和严格 Referrer Policy。
 - 网页补证拒绝本地、私网、带凭据 URL 和 HTTPS 降级跳转。
-- 注册入口当前始终开启，首个注册账号即管理员；启动新实例时应控制首次注册时机。
+- 本机开发默认开放注册；LAN 模式禁止开放注册，只允许首位管理员 bootstrap、邮箱绑定的单次邀请或完全关闭。bootstrap 的首位用户判定、邀请令牌消费与账号创建都在 SQLite 写事务中完成。
 - 项目依赖 Unix 文件锁，当前不声明原生 Windows 支持。
 
 ## 验证

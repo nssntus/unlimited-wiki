@@ -1,0 +1,11 @@
+[Unit]
+Description=Offline backup for Unlimited Wiki
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/unlimited-wiki.env
+ExecStart=/opt/unlimited-wiki/deploy/offline-backup.sh
+UMask=0077
+Nice=10
+IOSchedulingClass=idle

@@ -13,6 +13,7 @@ import secrets
 import shutil
 import sqlite3
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -303,8 +304,16 @@ class PlatformStore:
                     code_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                     expires_at TEXT NOT NULL, used_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS account_registration_invites (
+                    id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, email TEXT NOT NULL,
+                    status TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL, used_at TEXT
+                );
                 CREATE TABLE IF NOT EXISTS login_attempts (
                     scope_hash TEXT PRIMARY KEY, failures INTEGER NOT NULL, blocked_until TEXT, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS rate_limits (
+                    scope_hash TEXT PRIMARY KEY, window_started INTEGER NOT NULL,
+                    request_count INTEGER NOT NULL, updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS model_settings (
                     workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -634,7 +643,15 @@ class PlatformStore:
             raise FileNotFoundError(notification_id)
         return dict(row)
 
-    def register(self, email: str, nickname: str, password: str) -> tuple[dict, str]:
+    def register(
+        self,
+        email: str,
+        nickname: str,
+        password: str,
+        *,
+        first_user_only: bool = False,
+        invite_token: str = "",
+    ) -> tuple[dict, str]:
         email = email.strip().casefold()
         nickname = nickname.strip()
         if not EMAIL_RE.fullmatch(email) or len(email) > 254:
@@ -649,7 +666,21 @@ class PlatformStore:
         created = now_iso()
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            role = "admin" if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0 else "user"
+            existing_users = int(db.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+            if first_user_only and existing_users != 0:
+                db.rollback()
+                raise PermissionError("registration is closed")
+            invite = None
+            if invite_token:
+                invite = db.execute(
+                    """SELECT * FROM account_registration_invites
+                       WHERE token_hash=? AND email=? AND status='pending' AND expires_at>?""",
+                    (hash_token(invite_token), email, now_iso()),
+                ).fetchone()
+                if invite is None:
+                    db.rollback()
+                    raise PermissionError("registration invitation is invalid or expired")
+            role = "admin" if existing_users == 0 else "user"
             try:
                 db.execute("INSERT INTO users VALUES(?,?,?,?,?,?,?)", (user_id, email, nickname, password_hash, role, "active", created))
                 db.execute("""
@@ -673,6 +704,14 @@ class PlatformStore:
                     VALUES(?,?,?,'owner','active',1,?,?,?)
                 """, (organization_id, workspace_id, user_id, user_id, created, created))
                 db.execute("INSERT INTO recovery_codes VALUES(?,?,?,NULL)", (hash_token(recovery), user_id, future_iso(hours=24)))
+                if invite is not None:
+                    changed = db.execute(
+                        """UPDATE account_registration_invites SET status='used',used_at=?
+                           WHERE id=? AND status='pending'""",
+                        (created, invite["id"]),
+                    ).rowcount
+                    if changed != 1:
+                        raise sqlite3.IntegrityError("registration invitation was already used")
                 db.commit()
             except sqlite3.IntegrityError as exc:
                 db.rollback()
@@ -682,6 +721,94 @@ class PlatformStore:
         (root / "raw").mkdir(parents=True, exist_ok=True)
         self.audit(user_id, "user.register", "user", user_id, {"role": role})
         return {"id": user_id, "workspace_id": workspace_id, "workspace_root_name": root_name, "role": role}, recovery
+
+    def create_registration_invite(self, email: str, *, hours: int = 72) -> tuple[dict, str]:
+        email = email.strip().casefold()
+        if not EMAIL_RE.fullmatch(email) or len(email) > 254:
+            raise ValueError("invalid email address")
+        if hours < 1 or hours > 24 * 30:
+            raise ValueError("invite lifetime must be between 1 hour and 30 days")
+        token = secrets.token_urlsafe(32)
+        invite_id = uuid.uuid4().hex
+        created = now_iso()
+        expires_at = future_iso(hours=hours)
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "UPDATE account_registration_invites SET status='expired' WHERE status='pending' AND expires_at<=?",
+                (created,),
+            )
+            if db.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone() is not None:
+                db.rollback()
+                raise ValueError("account already exists")
+            db.execute(
+                """INSERT INTO account_registration_invites
+                   (id,token_hash,email,status,expires_at,created_at,used_at)
+                   VALUES(?,?,?,'pending',?,?,NULL)""",
+                (invite_id, hash_token(token), email, expires_at, created),
+            )
+            db.execute(
+                "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
+                (uuid.uuid4().hex, None, "registration_invite.create", "registration_invite", invite_id, "{}", created),
+            )
+            db.commit()
+        return {
+            "id": invite_id,
+            "email": email,
+            "status": "pending",
+            "expires_at": expires_at,
+        }, token
+
+    def user_count(self) -> int:
+        with self.connect() as db:
+            return int(db.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+
+    def consume_rate_limit(
+        self,
+        scope: str,
+        *,
+        limit: int,
+        window_seconds: int,
+        now: int | None = None,
+        consume: bool = True,
+    ) -> int:
+        """Consume one request and return retry seconds, or zero when allowed."""
+        if limit < 1 or window_seconds < 1:
+            raise ValueError("rate limit and window must be positive")
+        timestamp = int(time.time()) if now is None else int(now)
+        scope_hash = hash_token(scope)
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT window_started,request_count FROM rate_limits WHERE scope_hash=?",
+                (scope_hash,),
+            ).fetchone()
+            if row is None or timestamp >= int(row["window_started"]) + window_seconds:
+                if not consume:
+                    db.commit()
+                    return 0
+                db.execute(
+                    """INSERT INTO rate_limits(scope_hash,window_started,request_count,updated_at)
+                       VALUES(?,?,1,?)
+                       ON CONFLICT(scope_hash) DO UPDATE SET
+                         window_started=excluded.window_started,request_count=1,updated_at=excluded.updated_at""",
+                    (scope_hash, timestamp, now_iso()),
+                )
+                db.commit()
+                return 0
+            if int(row["request_count"]) >= limit:
+                retry_after = max(1, int(row["window_started"]) + window_seconds - timestamp)
+                db.commit()
+                return retry_after
+            if not consume:
+                db.commit()
+                return 0
+            db.execute(
+                "UPDATE rate_limits SET request_count=request_count+1,updated_at=? WHERE scope_hash=?",
+                (now_iso(), scope_hash),
+            )
+            db.commit()
+            return 0
 
     def authenticate(self, email: str, password: str, *, remote: str = "local") -> dict | None:
         email = email.strip().casefold()

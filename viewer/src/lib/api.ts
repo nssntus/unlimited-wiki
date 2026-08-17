@@ -84,6 +84,7 @@ export type Session = {
   csrf_token?: string
   session_expires_at?: string
   registration_enabled: boolean
+  registration_mode?: "open" | "bootstrap" | "invite" | "closed"
 }
 
 export type WorkspaceSummary = {

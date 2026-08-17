@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily offline backup for Unlimited Wiki
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=15m
+Unit=unlimited-wiki-backup.service
+
+[Install]
+WantedBy=timers.target
