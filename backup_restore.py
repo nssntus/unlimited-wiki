@@ -226,6 +226,9 @@ PLATFORM_CORRECTNESS_INDEXES = {
         "WHERE source_workspace_id IS NOT NULL AND source_article_id IS NOT NULL",
     },
 }
+SQLITE_ASCII_CASE_TRANSLATION = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz",
+)
 
 
 def instance_lock_path(project_root: Path) -> Path:
@@ -331,6 +334,10 @@ def _is_sqlite_sidecar(root: Path, path: Path) -> bool:
     return False
 
 
+def _sqlite_ascii_fold(value: str) -> str:
+    return value.translate(SQLITE_ASCII_CASE_TRANSLATION)
+
+
 def _sql_tokens(sql: str) -> tuple[tuple[str, str], ...] | None:
     tokens = []
     index = 0
@@ -372,13 +379,13 @@ def _sql_tokens(sql: str) -> tuple[tuple[str, str], ...] | None:
                 index += 1
             else:
                 return None
-            tokens.append(("word", "".join(value).casefold()))
+            tokens.append(("word", _sqlite_ascii_fold("".join(value))))
             continue
         if character.isalpha() or character == "_":
             end = index + 1
             while end < len(sql) and (sql[end].isalnum() or sql[end] == "_"):
                 end += 1
-            tokens.append(("word", sql[index:end].casefold()))
+            tokens.append(("word", _sqlite_ascii_fold(sql[index:end])))
             index = end
             continue
         if character.isdigit():

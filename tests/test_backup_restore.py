@@ -457,6 +457,67 @@ def test_backup_rejects_correctness_index_token_bypasses(
     assert_backup_contract_rejects(source, tmp_path, "invalid correctness index")
 
 
+def test_sql_tokens_use_sqlite_ascii_identifier_folding():
+    assert backup_restore._sql_tokens(
+        'CREATE UNIQUE INDEX "IDX" ON "TABLE"("STATUS") WHERE "STATUS"=\'active\''
+    ) == backup_restore._sql_tokens(
+        "create unique index idx on table(status) where status='active'"
+    )
+    assert backup_restore._sql_tokens("WHERE ſtatus='active'") != backup_restore._sql_tokens(
+        "WHERE status='active'"
+    )
+    assert backup_restore._sql_tokens('WHERE "ſtatus"=1') != backup_restore._sql_tokens(
+        'WHERE "status"=1'
+    )
+    assert backup_restore._sql_tokens("WHERE Key=1") != backup_restore._sql_tokens("WHERE key=1")
+    assert backup_restore._sql_tokens("WHERE status='ACTIVE'") != backup_restore._sql_tokens(
+        "WHERE status='active'"
+    )
+
+
+def test_backup_rejects_unicode_identifier_fold_bypass(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    timestamp = "2026-01-01T00:00:00Z"
+    second_workspace = "b" * 32
+    with platform.connect() as db:
+        organization_id = db.execute(
+            "SELECT organization_id FROM workspaces WHERE id=?", (user["workspace_id"],),
+        ).fetchone()[0]
+        db.execute(
+            'ALTER TABLE workspace_members ADD COLUMN "ſtatus" TEXT NOT NULL DEFAULT \'inactive\''
+        )
+        db.execute("DROP INDEX idx_workspace_members_default")
+        db.execute(
+            "CREATE UNIQUE INDEX idx_workspace_members_default ON workspace_members(user_id) "
+            "WHERE is_default=1 AND ſtatus='active'"
+        )
+        db.execute(
+            "INSERT INTO workspaces "
+            "(id,owner_id,organization_id,root_name,display_name,status,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,'active',?,?)",
+            (
+                second_workspace, user["id"], organization_id, second_workspace,
+                "Second", timestamp, timestamp,
+            ),
+        )
+        db.execute(
+            "INSERT INTO workspace_members "
+            "(organization_id,workspace_id,user_id,role,status,is_default,added_by,created_at,updated_at) "
+            "VALUES(?,?,?,'owner','active',1,?,?,?)",
+            (organization_id, second_workspace, user["id"], user["id"], timestamp, timestamp),
+        )
+        assert db.execute(
+            "SELECT COUNT(*) FROM workspace_members "
+            "WHERE user_id=? AND status='active' AND is_default=1", (user["id"],),
+        ).fetchone()[0] == 2
+    workspace_root = source / "spaces" / second_workspace
+    (workspace_root / "wiki").mkdir(parents=True)
+    (workspace_root / "raw").mkdir()
+    assert_backup_contract_rejects(source, tmp_path, "invalid correctness index")
+
+
 def test_missing_correctness_indexes_are_migrated_when_data_is_valid(tmp_path: Path):
     source = tmp_path / "source"
     source.mkdir()
