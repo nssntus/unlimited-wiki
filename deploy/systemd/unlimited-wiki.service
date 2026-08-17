@@ -1,0 +1,24 @@
+[Unit]
+Description=Unlimited Wiki
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=unlimited-wiki
+Group=unlimited-wiki
+WorkingDirectory=/opt/unlimited-wiki
+EnvironmentFile=/etc/unlimited-wiki.env
+ExecStart=/opt/unlimited-wiki/.venv/bin/python /opt/unlimited-wiki/serve.py
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10min
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/unlimited-wiki/.platform /opt/unlimited-wiki/spaces /opt/unlimited-wiki/.runtime
+
+[Install]
+WantedBy=multi-user.target

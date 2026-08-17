@@ -1,0 +1,27 @@
+{
+	servers {
+		timeouts {
+			read_header 10s
+			read_body 60s
+			write 60s
+			idle 2m
+		}
+	}
+}
+
+{$WIKI_DOMAIN} {
+	tls internal
+	encode zstd gzip
+	log {
+		output stdout
+		format json
+	}
+
+	request_body {
+		max_size 64MB
+	}
+
+	reverse_proxy 127.0.0.1:8765 {
+		header_up X-Forwarded-Proto https
+	}
+}

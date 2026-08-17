@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+PROJECT_ROOT=${WIKI_PROJECT_ROOT:-/opt/unlimited-wiki}
+BACKUP_ROOT=${WIKI_BACKUP_ROOT:?WIKI_BACKUP_ROOT is required}
+SERVICE_USER=${WIKI_SERVICE_USER:-unlimited-wiki}
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+DESTINATION="$BACKUP_ROOT/wiki-$STAMP"
+
+install -d -m 700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$BACKUP_ROOT"
+
+was_active=0
+restart_service() {
+    status=$?
+    trap - EXIT
+    if [ "$was_active" -eq 1 ] && ! systemctl start unlimited-wiki.service; then
+        echo "failed to restart unlimited-wiki.service after backup" >&2
+        status=1
+    fi
+    exit "$status"
+}
+
+trap restart_service EXIT
+trap 'exit 130' INT TERM HUP
+if systemctl is-active --quiet unlimited-wiki.service; then
+    was_active=1
+    systemctl stop unlimited-wiki.service
+fi
+runuser -u "$SERVICE_USER" -- "$PROJECT_ROOT/.venv/bin/python" "$PROJECT_ROOT/backup_restore.py" backup \
+    --project-root "$PROJECT_ROOT" --output "$DESTINATION"
+runuser -u "$SERVICE_USER" -- "$PROJECT_ROOT/.venv/bin/python" "$PROJECT_ROOT/backup_restore.py" verify "$DESTINATION"

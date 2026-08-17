@@ -13,10 +13,13 @@ import json
 import mimetypes
 import os
 import re
+import signal
 import stat
 import shutil
+import socket
 import sys
 import threading
+import time
 import traceback
 import uuid
 import zipfile
@@ -30,7 +33,9 @@ import categories as cats
 import keywords as kw
 import websearch
 import wiki_ops
+from backup_restore import InstanceLock, instance_lock_path, restore_in_progress
 from document_ingest import MAX_INPUT_BYTES
+from deployment import DeploymentConfig, config_from_environment
 from model_settings import build_config, load_model_settings, public_model_settings, save_model_settings
 from legacy_migration import migrate_legacy_workspace
 from platform_store import (
@@ -129,6 +134,7 @@ class WikiApp:
     remote_search: object = None
     remote_task_kinds: set[str] | None = None
     platform_reviewer: object = None
+    deployment: DeploymentConfig = field(default_factory=DeploymentConfig)
 
     def __post_init__(self) -> None:
         self.project_root = self.project_root.resolve()
@@ -149,6 +155,54 @@ class WikiApp:
     @property
     def multi_user(self) -> bool:
         return self.platform is not None
+
+    @property
+    def registration_enabled(self) -> bool:
+        if self.platform is None:
+            return False
+        mode = self.deployment.registration_mode
+        return mode in {"open", "invite"} or (mode == "bootstrap" and self.platform.user_count() == 0)
+
+    def readiness(self) -> tuple[bool, dict]:
+        data_roots = [self.project_root / ".platform", self.project_root / "spaces"]
+
+        def writable(path: Path) -> bool:
+            probe = path / f".ready-{uuid.uuid4().hex}"
+            try:
+                path.mkdir(mode=0o700, parents=True, exist_ok=True)
+                descriptor = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.close(descriptor)
+                probe.unlink()
+                return True
+            except OSError:
+                with contextlib.suppress(OSError):
+                    probe.unlink()
+                return False
+
+        checks = {
+            "frontend": self.dist_dir.is_dir() and (self.dist_dir / "index.html").is_file(),
+            "storage": all(writable(path) for path in data_roots),
+            "database": True,
+            "vault": True,
+            "disk": all(
+                shutil.disk_usage(path).free >= self.deployment.min_free_bytes
+                for path in {item.resolve() for item in data_roots}
+            ),
+        }
+        if self.platform is not None:
+            try:
+                with self.platform.connect() as db:
+                    db.execute("PRAGMA busy_timeout=1000")
+                    db.execute("BEGIN IMMEDIATE")
+                    db.execute("UPDATE rate_limits SET updated_at=updated_at WHERE 0")
+                    db.rollback()
+            except Exception:
+                checks["database"] = False
+            try:
+                checks["vault"] = self.platform.vault.path.stat().st_size == 32
+            except OSError:
+                checks["vault"] = False
+        return all(checks.values()), {"status": "ready" if all(checks.values()) else "not_ready", "checks": checks}
 
     def workspace_service(self, context: SessionContext) -> WikiService:
         if self.platform is None:
@@ -403,6 +457,7 @@ def create_app(
     dev_origins: set[str] | None = None,
     multi_user: bool = False,
     platform_reviewer=None,
+    deployment_config: DeploymentConfig | None = None,
 ) -> WikiApp:
     root = Path(project_root).resolve()
     permissions_ok = load_dotenv(root) if load_environment else True
@@ -418,8 +473,17 @@ def create_app(
     )
     platform = PlatformStore(root) if multi_user else None
     return WikiApp(
-        root, Path(viewer_dir or root / "viewer"), service, permissions_ok, dev_origins or set(),
-        platform, start_worker, remote_search, remote_task_kinds, platform_reviewer,
+        project_root=root,
+        viewer_dir=Path(viewer_dir or root / "viewer"),
+        service=service,
+        env_permissions_ok=permissions_ok,
+        dev_origins=dev_origins or set(),
+        platform=platform,
+        start_worker=start_worker,
+        remote_search=remote_search,
+        remote_task_kinds=remote_task_kinds,
+        platform_reviewer=platform_reviewer,
+        deployment=deployment_config or DeploymentConfig(),
     )
 
 
@@ -507,9 +571,36 @@ def make_handler(app: WikiApp):
         _extra_headers: list[tuple[str, str]]
 
         def log_message(self, fmt: str, *args) -> None:
-            print(f"{self.client_address[0]} {self.command} {urlparse(self.path).path}")
+            return
+
+        def _begin_request(self) -> None:
+            self._request_started = time.monotonic()
+            self._request_id = uuid.uuid4().hex
+            self._response_status = 0
+            self._response_bytes = 0
+            self._extra_headers = []
+
+        def _finish_request(self) -> None:
+            path = urlparse(self.path).path
+            path = re.sub(r"/[a-f0-9]{32}(?=/|$)", "/{id}", path)
+            try:
+                client_ip = self._client_ip()
+            except ValueError:
+                client_ip = self.client_address[0]
+            print(json.dumps({
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "request_id": self._request_id,
+                "client_ip": client_ip,
+                "method": self.command,
+                "path": path,
+                "status": self._response_status or 500,
+                "duration_ms": round((time.monotonic() - self._request_started) * 1000, 2),
+                "response_bytes": self._response_bytes,
+            }, ensure_ascii=True), flush=True)
 
         def _headers(self, code: int, content_type: str, length: int, *, cache: str = "no-store") -> None:
+            self._response_status = code
+            self._response_bytes = length
             self.send_response(code)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(length))
@@ -520,6 +611,9 @@ def make_handler(app: WikiApp):
             self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
             self.send_header("Cross-Origin-Opener-Policy", "same-origin")
             self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+            self.send_header("X-Request-ID", self._request_id)
+            if app.deployment.lan_mode:
+                self.send_header("Strict-Transport-Security", "max-age=31536000")
             for key, value in getattr(self, "_extra_headers", []):
                 self.send_header(key, value)
             self.end_headers()
@@ -541,14 +635,14 @@ def make_handler(app: WikiApp):
                 cookie.load(self.headers.get("Cookie", ""))
             except Exception:
                 return ""
-            morsel = cookie.get("wiki_session")
+            morsel = cookie.get(app.deployment.cookie_name)
             return morsel.value if morsel else ""
 
         def _set_session_cookie(self, token: str, *, clear: bool = False) -> None:
             value = "" if clear else token
             age = 0 if clear else 12 * 60 * 60
-            cookie = f"wiki_session={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={age}"
-            if env("WIKI_SECURE_COOKIES").lower() in {"1", "true", "yes"}:
+            cookie = f"{app.deployment.cookie_name}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={age}"
+            if app.deployment.lan_mode or env("WIKI_SECURE_COOKIES").lower() in {"1", "true", "yes"}:
                 cookie += "; Secure"
             self._extra_headers.append(("Set-Cookie", cookie))
 
@@ -618,21 +712,44 @@ def make_handler(app: WikiApp):
             if action is not None:
                 action.__exit__(None, None, None)
 
+        def _client_ip(self) -> str:
+            return app.deployment.client_ip(
+                self.client_address[0], self.headers.get("X-Forwarded-For"),
+            )
+
         def _trusted_host(self) -> bool:
-            host = self.headers.get("Host", "")
-            port = self.server.server_address[1]
-            return host in {f"127.0.0.1:{port}", f"localhost:{port}"}
+            return app.deployment.trusted_host(
+                self.headers.get("Host", ""), self.server.server_address[1],
+            )
 
         def _validate_host(self) -> None:
+            try:
+                app.deployment.validate_forwarded_proto(
+                    self.client_address[0], self.headers.get("X-Forwarded-Proto"),
+                )
+                self._client_ip()
+            except ValueError as exc:
+                raise ApiError(400, str(exc)) from exc
             if not self._trusted_host():
                 raise ApiError(403, "untrusted Host header")
 
         def _validate_origin(self) -> None:
-            origin = self.headers.get("Origin")
-            port = self.server.server_address[1]
-            allowed = {f"http://127.0.0.1:{port}", f"http://localhost:{port}", *app.dev_origins}
-            if origin not in allowed:
+            if not app.deployment.trusted_origin(
+                self.headers.get("Origin"), self.server.server_address[1], app.dev_origins,
+            ):
                 raise ApiError(403, "untrusted or missing Origin header")
+
+        def _rate_limit(
+            self, scope: str, *, limit: int, window_seconds: int, consume: bool = True,
+        ) -> None:
+            if app.platform is None:
+                return
+            retry_after = app.platform.consume_rate_limit(
+                scope, limit=limit, window_seconds=window_seconds, consume=consume,
+            )
+            if retry_after:
+                self._extra_headers.append(("Retry-After", str(retry_after)))
+                raise ApiError(429, "too many requests; try again later")
 
         def _read_json(self, *, max_bytes: int | None = MAX_BODY) -> dict:
             if self.headers.get("Transfer-Encoding"):
@@ -651,7 +768,26 @@ def make_handler(app: WikiApp):
                 raise ApiError(415, "Content-Type must be application/json")
             if charset and charset.strip().lower() not in {"charset=utf-8", "charset=\"utf-8\""}:
                 raise ApiError(415, "JSON charset must be UTF-8")
-            raw = self.rfile.read(length)
+            deadline = time.monotonic() + app.deployment.request_timeout_seconds
+            chunks = []
+            received = 0
+            try:
+                while received < length:
+                    remaining_seconds = deadline - time.monotonic()
+                    if remaining_seconds <= 0:
+                        raise ApiError(408, "request body deadline exceeded")
+                    self.connection.settimeout(remaining_seconds)
+                    try:
+                        chunk = self.rfile.read1(min(64 * 1024, length - received))
+                    except socket.timeout as exc:
+                        raise ApiError(408, "request body deadline exceeded") from exc
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    received += len(chunk)
+            finally:
+                self.connection.settimeout(app.deployment.request_timeout_seconds)
+            raw = b"".join(chunks)
             if len(raw) != length:
                 raise ApiError(400, "request body was truncated")
             return _strict_json(raw)
@@ -720,13 +856,31 @@ def make_handler(app: WikiApp):
         def _dispatch_get(self) -> None:
             parsed = urlparse(self.path)
             path = unquote(parsed.path)
+            if path == "/healthz":
+                return self._json(200, {"status": "ok"})
+            if path == "/readyz":
+                ready, payload = app.readiness()
+                return self._json(200 if ready else 503, payload)
             if path == "/api/platform/config":
-                return self._json(200, {"registration_enabled": True, "public_square_enabled": True})
+                return self._json(200, {
+                    "registration_enabled": app.registration_enabled,
+                    "registration_mode": app.deployment.registration_mode,
+                    "public_square_enabled": True,
+                })
             if path == "/api/auth/session":
                 if self.account_context is None:
-                    return self._json(200, {"authenticated": False, "registration_enabled": True})
+                    return self._json(200, {
+                        "authenticated": False,
+                        "registration_enabled": app.registration_enabled,
+                        "registration_mode": app.deployment.registration_mode,
+                    })
                 public_context = self.context.public() if self.context is not None else self.account_context.public()
-                return self._json(200, {"authenticated": True, **public_context, "registration_enabled": True})
+                return self._json(200, {
+                    "authenticated": True,
+                    **public_context,
+                    "registration_enabled": app.registration_enabled,
+                    "registration_mode": app.deployment.registration_mode,
+                })
             if path == "/api/account/export":
                 if self.context is None:
                     raise ApiError(401, "authentication required")
@@ -863,11 +1017,22 @@ def make_handler(app: WikiApp):
             if path == "/api/auth/register":
                 if app.platform is None:
                     raise ApiError(404, "not found")
-                _fields(data, {"email", "nickname", "password"}, {"email", "nickname", "password"})
+                if app.deployment.registration_mode == "closed":
+                    raise ApiError(403, "registration is closed")
+                self._rate_limit(
+                    f"register:ip:{self._client_ip()}", limit=5, window_seconds=3600,
+                )
+                allowed = {"email", "nickname", "password", "invite_token"}
+                _fields(data, allowed, {"email", "nickname", "password"})
+                invite_token = _string(data, "invite_token", maximum=256)
+                if app.deployment.registration_mode == "invite" and not invite_token:
+                    raise ApiError(422, "invite_token is required")
                 user, recovery = app.platform.register(
                     _string(data, "email", maximum=254, required=True),
                     _string(data, "nickname", maximum=80, required=True),
                     _string(data, "password", maximum=1024, required=True),
+                    first_user_only=app.deployment.registration_mode == "bootstrap",
+                    invite_token=invite_token,
                 )
                 migration = migrate_legacy_workspace(app.platform, user["id"]) if user["role"] == "admin" else {"status": "not_needed"}
                 token, context = app.platform.create_session(user["id"])
@@ -878,15 +1043,22 @@ def make_handler(app: WikiApp):
                 if app.platform is None:
                     raise ApiError(404, "not found")
                 _fields(data, {"email", "password"}, {"email", "password"})
+                email = _string(data, "email", maximum=254, required=True).casefold()
+                client_ip = self._client_ip()
+                self._rate_limit(f"login:ip:{client_ip}", limit=30, window_seconds=900, consume=False)
+                self._rate_limit(f"login:account:{email}", limit=10, window_seconds=900, consume=False)
                 try:
                     user = app.platform.authenticate(
-                        _string(data, "email", maximum=254, required=True),
+                        email,
                         _string(data, "password", maximum=1024, required=True),
-                        remote=self.client_address[0],
+                        remote=client_ip,
                     )
                 except RuntimeError as exc:
+                    self._extra_headers.append(("Retry-After", "900"))
                     raise ApiError(429, "too many login attempts; try again later") from exc
                 if user is None:
+                    self._rate_limit(f"login:ip:{client_ip}", limit=30, window_seconds=900)
+                    self._rate_limit(f"login:account:{email}", limit=10, window_seconds=900)
                     raise ApiError(401, "email or password is invalid")
                 token, context = app.platform.create_session(user["id"])
                 self.context = context
@@ -896,8 +1068,11 @@ def make_handler(app: WikiApp):
                 if app.platform is None:
                     raise ApiError(404, "not found")
                 _fields(data, {"email", "recovery_code", "new_password"}, {"email", "recovery_code", "new_password"})
+                email = _string(data, "email", maximum=254, required=True).casefold()
+                self._rate_limit(f"recover:ip:{self._client_ip()}", limit=5, window_seconds=3600)
+                self._rate_limit(f"recover:account:{email}", limit=5, window_seconds=3600)
                 ok = app.platform.reset_password(
-                    _string(data, "email", maximum=254, required=True),
+                    email,
                     _string(data, "recovery_code", maximum=200, required=True),
                     _string(data, "new_password", maximum=1024, required=True),
                 )
@@ -908,6 +1083,7 @@ def make_handler(app: WikiApp):
             if match:
                 if app.platform is None:
                     raise ApiError(404, "not found")
+                self._rate_limit(f"report:ip:{self._client_ip()}", limit=30, window_seconds=3600)
                 _fields(data, {"reason_code", "detail"}, {"reason_code"})
                 response = app.platform.report_public(
                     match.group(1), self.account_context.user_id if self.account_context else None,
@@ -1286,9 +1462,12 @@ def make_handler(app: WikiApp):
             raise ApiError(404, "not found")
 
         def do_GET(self) -> None:
+            self._begin_request()
             try:
-                self._validate_host()
                 path = urlparse(self.path).path
+                if path in {"/healthz", "/readyz"}:
+                    return self._dispatch_get()
+                self._validate_host()
                 public = path in {"/api/platform/config", "/api/auth/session"} or path.startswith("/api/public/") or not path.startswith("/api/")
                 self._prepare_context(required=app.multi_user and not public)
                 self._dispatch_get()
@@ -1308,8 +1487,10 @@ def make_handler(app: WikiApp):
                 if self.service is not None:
                     self.service.set_request_actor(None)
                 self._release_workspace_action()
+                self._finish_request()
 
         def do_POST(self) -> None:
+            self._begin_request()
             try:
                 self._validate_host()
                 self._validate_origin()
@@ -1341,50 +1522,133 @@ def make_handler(app: WikiApp):
                 if self.service is not None:
                     self.service.set_request_actor(None)
                 self._release_workspace_action()
+                self._finish_request()
 
         def do_OPTIONS(self) -> None:
-            self._json(405, {"error": "method not allowed"})
+            self._begin_request()
+            try:
+                self._json(405, {"error": "method not allowed"})
+            finally:
+                self._finish_request()
 
     return Handler
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    def __init__(
+        self, server_address, handler, *, max_concurrent: int, request_timeout: int,
+        strict_transport_security: bool = False,
+    ):
+        self._capacity = threading.BoundedSemaphore(max_concurrent)
+        self._request_timeout = request_timeout
+        self._strict_transport_security = strict_transport_security
+        super().__init__(server_address, handler)
+
+    def get_request(self):
+        request, address = super().get_request()
+        request.settimeout(self._request_timeout)
+        return request, address
+
+    def process_request(self, request, client_address) -> None:
+        if not self._capacity.acquire(blocking=False):
+            request_id = uuid.uuid4().hex
+            try:
+                headers = (
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: 33\r\n"
+                    b"Retry-After: 1\r\n"
+                    + f"X-Request-ID: {request_id}\r\n".encode("ascii")
+                    + (b"Strict-Transport-Security: max-age=31536000\r\n" if self._strict_transport_security else b"")
+                    + b"Connection: close\r\n\r\n"
+                )
+                request.sendall(headers + b'{"error":"server is at capacity"}')
+                print(json.dumps({
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "request_id": request_id,
+                    "client_ip": client_address[0],
+                    "event": "capacity_rejected",
+                    "status": 503,
+                }, ensure_ascii=True), flush=True)
+            finally:
+                self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._capacity.release()
 
 
 def create_server(app: WikiApp, host: str = HOST, port: int = PORT) -> ThreadingHTTPServer:
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise ValueError("multi-user service remains loopback-only until the P0 deployment gate is verified")
-    server = ThreadingHTTPServer((host, port), make_handler(app))
-    server.daemon_threads = True
+    server = BoundedThreadingHTTPServer(
+        (host, port), make_handler(app),
+        max_concurrent=app.deployment.max_concurrent_requests,
+        request_timeout=app.deployment.request_timeout_seconds,
+        strict_transport_security=app.deployment.lan_mode,
+    )
+    server.daemon_threads = False
+    server.block_on_close = True
     return server
 
 
 def main() -> None:
+    load_dotenv(ROOT)
     dev_origins = {value.strip() for value in env("WIKI_DEV_ORIGINS").split(",") if value.strip()}
     remote_worker_enabled = env("WIKI_DISABLE_REMOTE_WORKER").lower() not in {"1", "true", "yes"}
     configured_kinds = {value.strip() for value in env("WIKI_REMOTE_TASK_KINDS").split(",") if value.strip()}
-    app = create_app(
-        load_environment=True,
-        dev_origins=dev_origins,
-        start_worker=remote_worker_enabled,
-        remote_task_kinds=configured_kinds or None,
-        multi_user=True,
-    )
     try:
-        port = int(env("WIKI_PORT", str(PORT)))
-    except ValueError:
-        raise SystemExit("WIKI_PORT must be an integer")
-    server = create_server(app, port=port)
-    print(f"Wiki workspace: http://{HOST}:{port}")
-    print("LLM: configured independently per private workspace")
-    if not remote_worker_enabled:
-        print("Remote worker: disabled; queued tasks will remain local")
-    elif configured_kinds:
-        print("Remote worker task kinds: " + ", ".join(sorted(configured_kinds)))
+        deployment = config_from_environment(env)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    instance_lock = InstanceLock(instance_lock_path(ROOT))
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        instance_lock.acquire()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    app = None
+    try:
+        if restore_in_progress(ROOT):
+            raise SystemExit("an unfinished restore exists; rerun backup_restore.py restore before starting")
+        app = create_app(
+            load_environment=True,
+            dev_origins=dev_origins,
+            start_worker=remote_worker_enabled,
+            remote_task_kinds=configured_kinds or None,
+            multi_user=True,
+            deployment_config=deployment,
+        )
+        try:
+            port = int(env("WIKI_PORT", str(PORT)))
+        except ValueError:
+            raise SystemExit("WIKI_PORT must be an integer")
+        server = create_server(app, port=port)
+        signal.signal(
+            signal.SIGTERM,
+            lambda _signum, _frame: threading.Thread(target=server.shutdown, daemon=True).start(),
+        )
+        print(f"Wiki backend: http://{HOST}:{port}")
+        if deployment.public_origin:
+            print(f"Wiki public origin: {deployment.public_origin}")
+        print("LLM: configured independently per private workspace")
+        if not remote_worker_enabled:
+            print("Remote worker: disabled; queued tasks will remain local")
+        elif configured_kinds:
+            print("Remote worker task kinds: " + ", ".join(sorted(configured_kinds)))
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.server_close()
     finally:
-        server.server_close()
-        app.close()
+        if app is not None:
+            app.close()
+        instance_lock.release()
 
 
 if __name__ == "__main__":
