@@ -13,6 +13,18 @@ export type Category = {
   revision: number
 }
 
+export type PrivateTaxonomy = {
+  categories: Category[]
+  archived_categories: Category[]
+  tags: string[]
+}
+
+export type SubmissionTaxonomySelection = {
+  version: 1
+  category: { kind: "existing"; id: string; name: string } | { kind: "proposal"; key: string; name: string; normalized_name: string }
+  tags: Array<{ kind: "existing"; id: string; name: string } | { kind: "proposal"; key: string; name: string; normalized_name: string }>
+}
+
 export type ArticleSummary = {
   path: string
   title: string
@@ -138,6 +150,8 @@ export type Submission = {
   updated_at: string
   proposed_public_category_id?: string | null
   proposed_tags?: string[]
+  taxonomy?: SubmissionTaxonomySelection | null
+  taxonomy_decision?: { version: 1; resolutions: Array<{ kind: string; action: string; id: string; key?: string }> } | null
   reuse_permission?: ReusePermission
   link_public_profile?: boolean
   duplicate_candidates?: PublicEntrySummary[]
@@ -251,7 +265,7 @@ export async function apiPost<T>(path: string, body: Record<string, unknown>, id
 export const queryKeys = {
   articles: ["articles"] as const,
   categories: ["categories"] as const,
-  classifications: ["classifications"] as const,
+  taxonomy: ["taxonomy"] as const,
   reconciliation: ["reconciliation"] as const,
   article: (path: string) => ["article", path] as const,
   raw: (path: string) => ["raw", path] as const,

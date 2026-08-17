@@ -145,7 +145,7 @@ def render_index(project_root: Path, overrides: dict[str, str | None] | None = N
         category_id = dc.meta_value(md, "Category-ID") or "_inbox"
         grouped.setdefault(category_id, []).append((wiki_rel, title, article_summary(md)))
     lines = ["# Knowledge Base Index", ""]
-    display_categories = [*categories, {"category_id": "_inbox", "name": "待归类", "description": "尚未确认主分类的词条"}]
+    display_categories = [*categories, {"category_id": "_inbox", "name": "未分类", "description": "尚未选择主分类的词条"}]
     for category in display_categories:
         rows = grouped.get(category["category_id"], [])
         if not rows:
@@ -204,7 +204,7 @@ class WikiService:
         self._ensure_dynamic_registry()
         self.llm = llm_config or LLMConfig()
         self.remote_search = remote_search or websearch.search_sources
-        self.remote_task_kinds = remote_task_kinds
+        self.remote_task_kinds = remote_task_kinds or {"generate", "supplement", "governance"}
         self.authorize_actor = authorize_actor
         self.actor_guard = actor_guard
         self.require_task_actor = require_task_actor
@@ -322,6 +322,84 @@ class WikiService:
             }
             for item in sorted(registry["categories"], key=lambda row: (row["sort_order"], row["name"].casefold()))
         ]
+
+    def taxonomy(self) -> dict:
+        categories = self.categories()
+        tags_by_key: dict[str, str] = {}
+        for article in self.articles():
+            for tag in article.get("tags", []):
+                try:
+                    clean = dc.validate_tag_name(tag)
+                except ValueError:
+                    continue
+                tags_by_key.setdefault(dc.normalized_key(clean), clean)
+        return {
+            "categories": [item for item in categories if item["status"] == "active"],
+            "archived_categories": [item for item in categories if item["status"] == "archived"],
+            "tags": [tags_by_key[key] for key in sorted(tags_by_key)],
+        }
+
+    def _plan_taxonomy(
+        self,
+        registry: dict,
+        category: dict | str | None,
+        tags: list[str] | None,
+        *,
+        fallback_tags: list[str] | None = None,
+    ) -> tuple[dict | None, list[str], bool]:
+        selection = {"kind": "existing", "id": category} if isinstance(category, str) else (category or {"kind": "inbox"})
+        if not isinstance(selection, dict) or set(selection) - {"kind", "id", "name"}:
+            raise ValueError("invalid category selection")
+        kind = selection.get("kind")
+        created_category = False
+        category_item = None
+        if kind == "inbox":
+            if selection.keys() != {"kind"}:
+                raise ValueError("invalid inbox selection")
+        elif kind == "existing":
+            category_id = selection.get("id")
+            if not isinstance(category_id, str) or not category_id:
+                raise ValueError("category selection requires id")
+            category_item = next(
+                (
+                    item
+                    for item in registry["categories"]
+                    if item["category_id"] == category_id or item["directory_name"] == category_id
+                ),
+                None,
+            )
+            if not category_item or category_item["status"] != "active":
+                raise ValueError("invalid category")
+        elif kind == "create":
+            name = dc.validate_name(selection.get("name"))
+            match = next(
+                (item for item in registry["categories"] if dc.normalized_key(item["name"]) == dc.normalized_key(name)),
+                None,
+            )
+            if match:
+                if match["status"] != "active":
+                    raise ValueError("matching category is archived")
+                category_item = match
+            else:
+                category_item = dc.new_category(name, sort_order=len(registry["categories"]))
+                dc.assert_unique(registry, category_item)
+                registry["categories"].append(category_item)
+                registry["revision"] += 1
+                created_category = True
+        else:
+            raise ValueError("invalid category selection")
+
+        selected_tags = dc.normalize_tags(tags if tags is not None else (fallback_tags or []))
+        known_tags: dict[str, str] = {}
+        for article in self.articles():
+            for value in article.get("tags", []):
+                try:
+                    clean = dc.validate_tag_name(value)
+                except ValueError:
+                    continue
+                known_tags.setdefault(dc.normalized_key(clean), clean)
+        selected_tags = [known_tags.get(dc.normalized_key(value), value) for value in selected_tags]
+        return category_item, selected_tags, created_category
 
     def _ensure_dynamic_registry(self) -> None:
         """Migrate existing first-level folders without moving user content."""
@@ -498,7 +576,7 @@ class WikiService:
             "title": kw.parse_title(md) or path.stem,
             "markdown": md,
             "category": category,
-            "category_label": category_item["name"] if category_item else "待归类",
+            "category_label": category_item["name"] if category_item else "未分类",
             "article_id": dc.article_id(md),
             "primary_category_id": category_id,
             "tags": dc.tags(md),
@@ -536,34 +614,14 @@ class WikiService:
         existing = aliases.resolve(self.root, term)
         excerpts = kw.excerpts_for(self.root, term, extra_needles=[heading] if heading else None)
         evidence = kw.coverage_evidence(excerpts, term)
-        expected = self._expected_classification(term, " ".join([heading, passage]))
         return {
             "keyword": term,
             "existing_path": existing,
-            "category": expected["directory_name"] if expected else "_inbox",
-            "category_label": expected["name"] if expected else "待归类",
-            "expected_classification": expected,
             "local_coverage": evidence,
             "context": {"from_path": from_path, "heading": heading, "passage": passage[:800]},
             "excerpts": excerpts,
             "plan": "open_existing" if existing else ("local_generate" if evidence["sufficient"] else "local_draft_then_remote_supplement"),
         }
-
-    def _expected_classification(self, title: str, body: str) -> dict | None:
-        registry = dc.load_registry(self.root)
-        blob = unicodedata.normalize("NFKC", f"{title} {body}").casefold()
-        ranked: list[tuple[int, dict]] = []
-        for item in registry["categories"]:
-            if item["status"] != "active":
-                continue
-            needles = [item["name"], item.get("description", ""), *item.get("aliases", [])]
-            score = sum(2 if dc.normalized_key(value) in dc.normalized_key(title) else 1 for value in needles if value and dc.normalized_key(value) in blob)
-            if score:
-                ranked.append((score, item))
-        if not ranked:
-            return None
-        score, item = max(ranked, key=lambda pair: (pair[0], -pair[1]["sort_order"]))
-        return {"category_id": item["category_id"], "name": item["name"], "directory_name": item["directory_name"], "confidence": min(0.95, 0.55 + score * 0.1), "reason": "标题或上下文与该分类的名称、说明相符", "preview_only": True}
 
     def _draft_markdown(self, term: str, excerpts: list[dict], rel: str, category: str, *, task_id: str | None, evidence_status: str) -> str:
         sources = [item for item in excerpts if not item["path"].startswith("raw/")]
@@ -589,17 +647,44 @@ class WikiService:
         lines.extend(f"- {source_link(rel, item['path'], item['title'])}" for item in sources)
         return "\n".join(lines).rstrip() + "\n"
 
-    def generate(self, keyword: str, *, from_path: str = "", heading: str = "", passage: str = "") -> dict:
+    def generate(
+        self,
+        keyword: str,
+        *,
+        from_path: str = "",
+        heading: str = "",
+        passage: str = "",
+        category: dict | None = None,
+        tags: list[str] | None = None,
+    ) -> dict:
         with self._intent_lock:
-            return self._generate_locked(keyword, from_path=from_path, heading=heading, passage=passage)
+            return self._generate_locked(
+                keyword,
+                from_path=from_path,
+                heading=heading,
+                passage=passage,
+                category=category,
+                tags=tags,
+            )
 
-    def _generate_locked(self, keyword: str, *, from_path: str = "", heading: str = "", passage: str = "") -> dict:
+    def _generate_locked(
+        self,
+        keyword: str,
+        *,
+        from_path: str = "",
+        heading: str = "",
+        passage: str = "",
+        category: dict | None = None,
+        tags: list[str] | None = None,
+    ) -> dict:
         preflight = self.preflight_generate(keyword, from_path=from_path, heading=heading, passage=passage)
         if preflight["existing_path"]:
             return {"created": False, "task": None, "article": self.read_article(preflight["existing_path"]), "preflight": preflight}
         term = preflight["keyword"]
-        category = "_inbox"
-        rel = f"_inbox/{slugify(term)}.md"
+        registry = dc.load_registry(self.root)
+        category_item, selected_tags, created_category = self._plan_taxonomy(registry, category, tags)
+        directory = category_item["directory_name"] if category_item else "_inbox"
+        rel = f"{directory}/{slugify(term)}.md"
         if (self.root / "wiki" / rel).exists():
             return {"created": False, "task": None, "article": self.read_article(rel), "preflight": preflight}
         needs_remote = not preflight["local_coverage"]["sufficient"]
@@ -609,7 +694,7 @@ class WikiService:
         task_payload = {
             "keyword": term,
             "path": rel,
-            "category": category,
+            "category": directory,
             "from_path": from_path,
             "heading": heading,
             "passage": passage[:800],
@@ -621,8 +706,13 @@ class WikiService:
                 task_kind, term, task_payload, staged=True, actor_user_id=self._request_actor(),
             )
         evidence_status = "待补证" if needs_remote else "本地已核验"
-        md = self._draft_markdown(term, preflight["excerpts"], rel, category, task_id=task["id"] if task else None, evidence_status=evidence_status)
-        md = dc.ensure_article_metadata(md, category_id=None, status="pending")
+        md = self._draft_markdown(term, preflight["excerpts"], rel, directory, task_id=task["id"] if task else None, evidence_status=evidence_status)
+        md = dc.ensure_article_metadata(
+            md,
+            category_id=category_item["category_id"] if category_item else None,
+            status="confirmed" if category_item else "pending",
+            article_tags=selected_tags,
+        )
         operation_id = f"generate-{hashlib.sha256((term + revision(md)).encode()).hexdigest()[:20]}"
         log_path = self.root / "wiki" / "log.md"
         log = log_path.read_text(encoding="utf-8") if log_path.exists() else "# Wiki Log\n"
@@ -638,6 +728,8 @@ class WikiService:
             if updated != page_md:
                 overrides[f"wiki/{page_rel}"] = updated
         changes = dict(overrides)
+        if created_category:
+            changes[dc.REGISTRY_REL] = dc.dump_registry(registry)
         changes.update(
             {
                 "wiki/index.md": render_index(self.root, overrides),
@@ -645,7 +737,13 @@ class WikiService:
             }
         )
         try:
-            manifest = self.files.commit(changes, kind="generate", metadata={"title": term, "path": rel}, operation_id=operation_id)
+            manifest = self.files.commit(
+                changes,
+                kind="generate",
+                metadata={"title": term, "path": rel},
+                operation_id=operation_id,
+                directories={f"wiki/{directory}": True},
+            )
         except BaseException:
             if task:
                 self.state.delete_staged_task(task["id"])
@@ -658,33 +756,66 @@ class WikiService:
             task = self.state.activate_task(task["id"])
             self._wake.set()
         article = self.read_article(rel)
-        classification_task = None
-        if not task:
-            classification_task = self.enqueue_classification(article)
-        return {"created": True, "task": task, "classification_task": classification_task, "article": article, "operation_id": manifest["operation_id"], "preflight": preflight}
+        return {"created": True, "task": task, "article": article, "operation_id": manifest["operation_id"], "preflight": preflight}
 
-    def apply_meta(self, rel: str, *, category: str, status: str) -> dict:
+    def apply_meta(
+        self,
+        rel: str,
+        *,
+        category: str | dict,
+        status: str,
+        tags: list[str] | None = None,
+        expected_revision: str | None = None,
+        markdown: str | None = None,
+    ) -> dict:
         with self._intent_lock:
-            return self._apply_meta_locked(rel, category=category, status=status)
+            return self._apply_meta_locked(
+                rel,
+                category=category,
+                status=status,
+                tags=tags,
+                expected_revision=expected_revision,
+                markdown=markdown,
+            )
 
-    def _apply_meta_locked(self, rel: str, *, category: str, status: str) -> dict:
+    def _apply_meta_locked(
+        self,
+        rel: str,
+        *,
+        category: str | dict,
+        status: str,
+        tags: list[str] | None = None,
+        expected_revision: str | None = None,
+        markdown: str | None = None,
+    ) -> dict:
         registry = dc.load_registry(self.root)
-        category_item = next(
-            (item for item in registry["categories"] if item["category_id"] == category or item["directory_name"] == category),
-            None,
-        )
-        if not category_item or category_item["status"] != "active":
-            raise ValueError("invalid category")
         if status not in STATUS_VALUES:
             raise ValueError("invalid status")
         article = self.read_article(rel)
+        if expected_revision is not None and article["revision"] != expected_revision:
+            return {"conflict": True, "disk": article}
+        source_markdown = article["markdown"] if markdown is None else markdown
+        if not kw.parse_title(source_markdown):
+            raise ValueError("article must contain one H1 title")
+        if dc.article_id(source_markdown) != article.get("article_id"):
+            raise ValueError("Article-ID is immutable")
+        selection = category if isinstance(category, dict) else {"kind": "existing", "id": category}
+        category_item, selected_tags, created_category = self._plan_taxonomy(
+            registry,
+            selection,
+            tags,
+            fallback_tags=article["tags"],
+        )
         old_rel = article["path"]
         operation_identity = article["article_id"] or f"legacy:{revision(article['markdown'])}"
-        category = category_item["directory_name"]
-        md = cats.ensure_category_header(article["markdown"], category)
+        directory = category_item["directory_name"] if category_item else "_inbox"
+        md = cats.ensure_category_header(source_markdown, directory)
         md = dc.ensure_article_metadata(
-            md, category_id=category_item["category_id"], status="confirmed",
-            article_uuid=article["article_id"], article_tags=article["tags"],
+            md,
+            category_id=category_item["category_id"] if category_item else None,
+            status="confirmed" if category_item else "pending",
+            article_uuid=article["article_id"],
+            article_tags=selected_tags,
         )
         stable_article_id = dc.article_id(md)
         if not stable_article_id:
@@ -692,11 +823,11 @@ class WikiService:
         md = wiki_ops.ensure_status_header(md, status)
         target_rel = old_rel
         changes: dict[str, str | None] = {}
-        if Path(old_rel).parent.as_posix() != category:
-            target_rel = f"{category}/{Path(old_rel).name}"
+        if Path(old_rel).parent.as_posix() != directory:
+            target_rel = f"{directory}/{Path(old_rel).name}"
             counter = 2
             while (self.root / "wiki" / target_rel).exists():
-                target_rel = f"{category}/{Path(old_rel).stem}-{counter}.md"
+                target_rel = f"{directory}/{Path(old_rel).stem}-{counter}.md"
                 counter += 1
             md = wiki_ops.rebase_wiki_hrefs(md, old_rel, target_rel)
             changes[f"wiki/{target_rel}"] = md
@@ -714,11 +845,22 @@ class WikiService:
                     changes[f"wiki/{page_rel}"] = updated
         else:
             changes[f"wiki/{old_rel}"] = md
-        operation_seed = "|".join((operation_identity, old_rel, target_rel, category_item["category_id"], status))
+        operation_seed = "|".join(
+            (
+                operation_identity,
+                old_rel,
+                target_rel,
+                category_item["category_id"] if category_item else "_inbox",
+                status,
+                ";".join(dc.normalized_key(value) for value in selected_tags),
+            )
+        )
         operation_base = f"meta-{hashlib.sha256(operation_seed.encode()).hexdigest()[:20]}"
         operation_id = self._available_operation_id(operation_base)
         path_map = {old_rel: target_rel} if old_rel != target_rel else {}
         log_path = self.root / "wiki" / "log.md"
+        if created_category:
+            changes[dc.REGISTRY_REL] = dc.dump_registry(registry)
         changes["wiki/index.md"] = render_index(self.root, changes)
         changes["wiki/log.md"] = append_log_text(log_path.read_text(encoding="utf-8") if log_path.exists() else "", operation_id=operation_id, kind="govern", title=article["title"])
         self.files.commit(
@@ -731,15 +873,45 @@ class WikiService:
                 "article_id": stable_article_id,
             },
             operation_id=operation_id,
+            directories={f"wiki/{directory}": True},
         )
         updated = self.read_article(target_rel)
         if path_map:
             self._remap_committed_paths(operation_id, path_map)
         else:
             self.state.remap_article_path(old_rel, target_rel, base_revision=updated["revision"])
-        return {"operation_id": operation_id, "article": updated}
+        return {
+            "conflict": False,
+            "operation_id": operation_id,
+            "article": updated,
+            "created_category": created_category,
+            "category": category_item,
+        }
 
-    def save_article(self, rel: str, markdown: str, expected_revision: str, *, force: bool = False) -> dict:
+    def save_article(
+        self,
+        rel: str,
+        markdown: str,
+        expected_revision: str,
+        *,
+        force: bool = False,
+        category: dict | None = None,
+        tags: list[str] | None = None,
+    ) -> dict:
+        if category is not None or tags is not None:
+            current = self.read_article(rel)
+            return self.apply_meta(
+                rel,
+                category=category or (
+                    {"kind": "existing", "id": current["primary_category_id"]}
+                    if current["primary_category_id"]
+                    else {"kind": "inbox"}
+                ),
+                status=wiki_ops.parse_status(markdown) or current["content_status"],
+                tags=tags,
+                expected_revision=None if force else expected_revision,
+                markdown=markdown,
+            )
         current = self.read_article(rel)
         if not force and current["revision"] != expected_revision:
             return {"conflict": True, "disk": current}
@@ -749,9 +921,9 @@ class WikiService:
         if dc.article_id(markdown) != current.get("article_id"):
             raise ValueError("Article-ID is immutable")
         if dc.meta_value(markdown, "Category-ID") != (current.get("primary_category_id") or ""):
-            raise ValueError("Category-ID can only be changed through classification")
+            raise ValueError("Category-ID can only be changed through the taxonomy selector")
         if dc.classification(markdown) != current.get("classification_status"):
-            raise ValueError("Classification can only be changed through classification")
+            raise ValueError("Classification is managed by the taxonomy workflow")
         category = cats.parse_category_line(markdown)
         status = wiki_ops.parse_status(markdown)
         if not category or status not in STATUS_VALUES:
@@ -886,27 +1058,7 @@ class WikiService:
             "extracted_chars": parsed.extracted_chars, "used_ocr": parsed.used_ocr,
             "status": "unlinked", "linked_target": None,
         }
-        plan_task = self.enqueue_raw_classification_plan(item) if self.llm.configured else None
-        return {"created": True, "operation_id": operation_id, "raw": item, "classification_plan_task": plan_task}
-
-    def enqueue_raw_classification_plan(self, item: dict) -> dict | None:
-        if not self.llm.configured:
-            return None
-        registry = dc.load_registry(self.root)
-        raw_path = item["path"]
-        raw_revision = item["byte_hash"]
-        existing = self.state.raw_classification_plan(raw_path, raw_revision, registry["revision"])
-        if existing and existing["status"] in {"queued", "running", "succeeded"}:
-            return self.state.get_task(existing["task_id"]) if existing.get("task_id") else None
-        task, _created = self.state.enqueue_task(
-            "raw-classification-plan",
-            f"{raw_path}:{raw_revision}:{registry['revision']}",
-            {"raw_path": raw_path, "raw_revision": raw_revision, "taxonomy_revision": registry["revision"]},
-            actor_user_id=self._request_actor(),
-        )
-        self.state.save_raw_classification_plan(raw_path, raw_revision, registry["revision"], "queued", task_id=task["id"])
-        self._wake.set()
-        return task
+        return {"created": True, "operation_id": operation_id, "raw": item}
 
     def raw_inbox(self) -> list[dict]:
         records = {row["path"]: row for row in self.state.raw_records()}
@@ -975,32 +1127,9 @@ class WikiService:
         raw = self.read_raw(raw_path)
         title = raw["title"]
         existing = aliases.resolve(self.root, title)
-        expected = self._expected_classification(title, raw["markdown"][:50000])
-        registry = dc.load_registry(self.root)
-        remote_plan = self.state.raw_classification_plan(raw_path, item["byte_hash"], registry["revision"])
-        if not remote_plan and self.llm.configured:
-            self.enqueue_raw_classification_plan(item)
-            remote_plan = self.state.raw_classification_plan(raw_path, item["byte_hash"], registry["revision"])
-        if remote_plan and remote_plan.get("task_id") and remote_plan["status"] in {"queued", "running"}:
-            try:
-                task_state = self.state.get_task(remote_plan["task_id"])
-                remote_plan["status"] = task_state["status"]
-                remote_plan["error_type"] = task_state.get("error_type")
-                remote_plan["error_message"] = task_state.get("error_message")
-            except FileNotFoundError:
-                pass
         suggestion = "duplicate" if item["status"] in {"duplicate", "ingested"} else ("supplement" if existing else ("seed" if not self.articles() else "new"))
         return {
             "raw": item, "markdown": raw["markdown"], "suggested_title": title,
-            "suggested_category": expected["category_id"] if expected else None,
-            "classification_plan": {
-                "status": remote_plan["status"] if remote_plan else "local_fallback",
-                "task_id": remote_plan.get("task_id") if remote_plan else None,
-                "error_type": remote_plan.get("error_type") if remote_plan else None,
-                "error_message": remote_plan.get("error_message") if remote_plan else None,
-                "candidates": (remote_plan.get("plan") or {}).get("candidates", []) if remote_plan else ([expected] if expected else []),
-                "notice": "预计分类仅供预览，不会创建目录；正文生成后会基于完整内容重新归类。",
-            },
             "suggested_disposition": suggestion, "suggested_target": existing or item.get("linked_target"),
             "preview_changes": ["Sources", "Raw", "index", "log"],
         }
@@ -1018,7 +1147,36 @@ class WikiService:
         md = replace_meta(md, "Evidence", "Raw 原文")
         return md.rstrip() + "\n"
 
-    def ingest_commit(self, raw_path: str, disposition: str, *, title: str, category: str = "", target_path: str | None = None) -> dict:
+    def ingest_commit(
+        self,
+        raw_path: str,
+        disposition: str,
+        *,
+        title: str,
+        category: dict | None = None,
+        tags: list[str] | None = None,
+        target_path: str | None = None,
+    ) -> dict:
+        with self._intent_lock:
+            return self._ingest_commit_locked(
+                raw_path,
+                disposition,
+                title=title,
+                category=category,
+                tags=tags,
+                target_path=target_path,
+            )
+
+    def _ingest_commit_locked(
+        self,
+        raw_path: str,
+        disposition: str,
+        *,
+        title: str,
+        category: dict | None,
+        tags: list[str] | None,
+        target_path: str | None,
+    ) -> dict:
         if disposition not in {"seed", "new", "supplement", "duplicate", "defer"}:
             raise ValueError("invalid disposition")
         preview = self.ingest_preview(raw_path)
@@ -1033,19 +1191,37 @@ class WikiService:
         operation_id = f"ingest-{item['byte_hash'][:20]}-{disposition}"
         changes: dict[str, str] = {}
         result_target = target_path
+        registry = dc.load_registry(self.root)
+        category_item = None
+        selected_tags: list[str] = []
+        created_category = False
+        directory = "_inbox"
+        if disposition in {"seed", "new"}:
+            category_item, selected_tags, created_category = self._plan_taxonomy(registry, category, tags)
+            directory = category_item["directory_name"] if category_item else "_inbox"
         if disposition == "seed":
             existing_target = target_path or item.get("linked_target") or aliases.resolve(self.root, title)
-            result_target = self.read_article(existing_target)["path"] if existing_target else f"_inbox/{slugify(title)}.md"
+            result_target = self.read_article(existing_target)["path"] if existing_target else f"{directory}/{slugify(title)}.md"
             raw_link = source_link(result_target, raw_path, raw["title"])
-            seed_md = self._seed_markdown(raw["markdown"], category="_inbox", raw_link=raw_link)
-            changes[f"wiki/{result_target}"] = dc.ensure_article_metadata(seed_md, category_id=None, status="pending")
+            seed_md = self._seed_markdown(raw["markdown"], category=directory, raw_link=raw_link)
+            changes[f"wiki/{result_target}"] = dc.ensure_article_metadata(
+                seed_md,
+                category_id=category_item["category_id"] if category_item else None,
+                status="confirmed" if category_item else "pending",
+                article_tags=selected_tags,
+            )
         elif disposition == "new":
-            result_target = f"_inbox/{slugify(title)}.md"
+            result_target = f"{directory}/{slugify(title)}.md"
             if aliases.resolve(self.root, title) or (self.root / "wiki" / result_target).exists():
                 raise ValueError("canonical article already exists; use supplement")
             excerpt = [{"title": raw["title"], "path": raw_path, "text": raw["markdown"][:900]}]
-            md = self._draft_markdown(title, excerpt, result_target, "_inbox", task_id=None, evidence_status="Raw 已核验")
-            changes[f"wiki/{result_target}"] = dc.ensure_article_metadata(md, category_id=None, status="pending")
+            md = self._draft_markdown(title, excerpt, result_target, directory, task_id=None, evidence_status="Raw 已核验")
+            changes[f"wiki/{result_target}"] = dc.ensure_article_metadata(
+                md,
+                category_id=category_item["category_id"] if category_item else None,
+                status="confirmed" if category_item else "pending",
+                article_tags=selected_tags,
+            )
         elif disposition == "supplement":
             if not target_path:
                 raise ValueError("supplement requires a target article")
@@ -1063,9 +1239,17 @@ class WikiService:
             self.state.record_raw(raw_path, item["byte_hash"], item["text_hash"], disposition, result_target, operation_id)
             return {"operation_id": operation_id, "disposition": disposition, "target_path": result_target, "article": None}
         log_path = self.root / "wiki" / "log.md"
+        if created_category:
+            changes[dc.REGISTRY_REL] = dc.dump_registry(registry)
         changes["wiki/index.md"] = render_index(self.root, changes)
         changes["wiki/log.md"] = append_log_text(log_path.read_text(encoding="utf-8") if log_path.exists() else "", operation_id=operation_id, kind="ingest", title=title)
-        manifest = self.files.commit(changes, kind="ingest", metadata={"raw": raw_path, "target": result_target, "disposition": disposition}, operation_id=operation_id)
+        manifest = self.files.commit(
+            changes,
+            kind="ingest",
+            metadata={"raw": raw_path, "target": result_target, "disposition": disposition},
+            operation_id=operation_id,
+            directories={f"wiki/{directory}": True} if disposition in {"seed", "new"} else None,
+        )
         self.state.record_raw(raw_path, item["byte_hash"], item["text_hash"], disposition, result_target, operation_id)
         article = self.read_article(result_target) if result_target else None
         task = None
@@ -1081,14 +1265,12 @@ class WikiService:
                 actor_user_id=self._request_actor(),
             )
             self._wake.set()
-        classification_task = self.enqueue_classification(article) if article and disposition in {"seed", "new"} else None
         return {
             "operation_id": manifest["operation_id"],
             "disposition": disposition,
             "target_path": article["path"] if article else result_target,
             "article": article,
             "task": task,
-            "classification_task": classification_task,
         }
 
     def merge_preview(self, source: str, target: str) -> dict:
@@ -1210,224 +1392,6 @@ class WikiService:
             self._wake.set()
         return {"queued": queued, "tasks": tasks}
 
-    def enqueue_classification(self, article: dict, *, actor_user_id: str | None = None) -> dict | None:
-        article_id = article.get("article_id")
-        if not article_id:
-            raise ValueError("article has no stable id")
-        registry = dc.load_registry(self.root)
-        if not self.llm.configured:
-            self.state.save_classification_suggestion(
-                article_id, article["revision"], registry["revision"], "failed",
-                error_type="not_configured", error_message="请先在设置中配置模型，或手动选择分类。",
-            )
-            return None
-        subject = f"{article_id}:{article['revision']}:{registry['revision']}"
-        task, _created = self.state.enqueue_task(
-            "article-classification",
-            subject,
-            {
-                "article_id": article_id,
-                "path": article["path"],
-                "article_revision": article["revision"],
-                "taxonomy_revision": registry["revision"],
-            },
-            actor_user_id=actor_user_id if actor_user_id is not None else self._request_actor(),
-        )
-        self.state.save_classification_suggestion(
-            article_id, article["revision"], registry["revision"], "queued", task_id=task["id"]
-        )
-        self._wake.set()
-        return task
-
-    def classification_workbench(self) -> dict:
-        registry = dc.load_registry(self.root)
-        items = []
-        counts = {"high_confidence": 0, "needs_confirmation": 0, "new_category": 0, "failed": 0}
-        for article in self.articles():
-            if article["classification_status"] != "pending":
-                continue
-            path = self._wiki_path(article["path"])
-            md = path.read_text(encoding="utf-8")
-            article_revision = revision(md)
-            record = self.state.classification_suggestion(article["article_id"], article_revision, registry["revision"])
-            if record and record.get("task_id") and record["status"] in {"queued", "running"}:
-                try:
-                    task_state = self.state.get_task(record["task_id"])
-                    record["status"] = task_state["status"]
-                    record["error_type"] = task_state.get("error_type")
-                    record["error_message"] = task_state.get("error_message")
-                except FileNotFoundError:
-                    pass
-            suggestion = record.get("suggestion") if record else None
-            if record and record["status"] == "failed":
-                group = "failed"
-            elif suggestion and suggestion.get("new_category"):
-                group = "new_category"
-            elif suggestion and suggestion.get("candidates") and suggestion["candidates"][0]["confidence"] >= 0.85:
-                group = "high_confidence"
-            else:
-                group = "needs_confirmation"
-            counts[group] += 1
-            items.append({"article": {**article, "revision": article_revision, "summary": article_summary(md)}, "suggestion": record, "group": group})
-        return {"counts": counts, "high_confidence_threshold": 0.85, "taxonomy_revision": registry["revision"], "draft": self.state.classification_draft(), "items": items}
-
-    def save_classification_draft(self, selections: list[dict], expected_revision: int) -> dict:
-        # Reuse preview validation for shape/tenant IDs without committing any file changes.
-        if selections:
-            checked = self.classification_preview(selections)
-            self.state.consume_preview(checked["preview_id"])
-        return self.state.save_classification_draft(selections, expected_revision)
-
-    def retry_classification(self, article_id: str) -> dict:
-        article = next((item for item in self.articles() if item.get("article_id") == article_id), None)
-        if not article:
-            raise FileNotFoundError(article_id)
-        full = self.read_article(article["path"])
-        task = self.enqueue_classification(full)
-        if not task:
-            raise ValueError("classification requires a configured model")
-        return task
-
-    def classification_preview(self, selections: list[dict]) -> dict:
-        if not isinstance(selections, list) or not selections or len(selections) > 500:
-            raise ValueError("selections must contain 1 to 500 items")
-        registry = dc.load_registry(self.root)
-        planned_categories = list(registry["categories"])
-        new_by_ref: dict[str, dict] = {}
-        moves = []
-        conflicts = []
-        seen_article_ids: set[str] = set()
-        seen_targets: dict[str, str] = {}
-        article_by_id = {item["article_id"]: item for item in self.articles() if item.get("article_id")}
-        for selection in selections:
-            if not isinstance(selection, dict) or set(selection) - {"article_id", "article_revision", "category_id", "new_category", "tags", "decision"}:
-                raise ValueError("invalid classification selection")
-            article_id = selection.get("article_id")
-            if not isinstance(article_id, str) or not article_id:
-                raise ValueError("classification selection requires article_id")
-            if article_id in seen_article_ids:
-                conflicts.append({"article_id": article_id, "kind": "duplicate_article_selection"})
-                continue
-            seen_article_ids.add(article_id)
-            if selection.get("decision") == "defer":
-                continue
-            article = article_by_id.get(article_id)
-            if not article:
-                raise FileNotFoundError(str(selection.get("article_id")))
-            full = self.read_article(article["path"])
-            if full["revision"] != selection.get("article_revision"):
-                conflicts.append({"article_id": article["article_id"], "kind": "article_changed"})
-                continue
-            category_id = selection.get("category_id")
-            new_spec = selection.get("new_category")
-            if new_spec:
-                if not isinstance(new_spec, dict) or set(new_spec) - {"client_ref", "name", "description"}:
-                    raise ValueError("invalid new category")
-                ref = str(new_spec.get("client_ref") or new_spec.get("name"))
-                category = new_by_ref.get(ref)
-                if not category:
-                    category = dc.new_category(str(new_spec.get("name", "")), description=str(new_spec.get("description", "")), sort_order=len(planned_categories))
-                    dc.assert_unique({"categories": planned_categories}, category)
-                    planned_categories.append(category)
-                    new_by_ref[ref] = category
-                category_id = category["category_id"]
-            try:
-                category = dc.category_by_id({"categories": planned_categories}, str(category_id), include_archived=False)
-            except FileNotFoundError:
-                raise ValueError("invalid active category")
-            target = f"{category['directory_name']}/{Path(article['path']).name}"
-            target_key = dc.normalized_key(target)
-            if target_key in seen_targets:
-                conflicts.append({
-                    "article_id": article["article_id"],
-                    "other_article_id": seen_targets[target_key],
-                    "kind": "duplicate_target_path",
-                    "path": target,
-                })
-            else:
-                seen_targets[target_key] = article["article_id"]
-            target_path = self.root / "wiki" / target
-            if target != article["path"] and target_path.exists():
-                conflicts.append({"article_id": article["article_id"], "kind": "target_exists", "path": target})
-            moves.append({
-                "article_id": article["article_id"], "article_revision": full["revision"],
-                "source_path": article["path"], "target_path": target, "category_id": category_id,
-                "tags": dc.tags(full["markdown"]) if selection.get("tags") is None else [str(tag)[:50] for tag in selection.get("tags", [])][:20],
-            })
-        payload = {"taxonomy_revision": registry["revision"], "moves": moves, "new_categories": list(new_by_ref.values())}
-        preview = self.state.create_preview("classification", payload)
-        return {"preview_id": preview["preview_id"], "expires_at": preview["expires_at"], "moves": moves, "creates": list(new_by_ref.values()), "conflicts": conflicts, "can_commit": bool(moves) and not conflicts}
-
-    def classification_commit(self, preview_id: str, *, clear_draft: bool = True) -> dict:
-        preview = self.state.get_preview(preview_id, "classification")
-        payload = preview["payload"]
-        with self._intent_lock:
-            registry = dc.load_registry(self.root)
-            if registry["revision"] != payload["taxonomy_revision"]:
-                raise RuntimeError("classification preview is stale")
-            article_ids = [item["article_id"] for item in payload["moves"]]
-            source_keys = [dc.normalized_key(item["source_path"]) for item in payload["moves"]]
-            target_keys = [dc.normalized_key(item["target_path"]) for item in payload["moves"]]
-            if len(article_ids) != len(set(article_ids)):
-                raise RuntimeError("classification contains duplicate article selections")
-            if len(source_keys) != len(set(source_keys)) or len(target_keys) != len(set(target_keys)):
-                raise RuntimeError("classification contains duplicate paths")
-            next_registry = json.loads(json.dumps(registry, ensure_ascii=False))
-            for item in payload["new_categories"]:
-                dc.assert_unique(next_registry, item)
-                next_registry["categories"].append(item)
-            taxonomy_changed = bool(payload["new_categories"])
-            changes: dict[str, str | None] = {}
-            if taxonomy_changed:
-                next_registry["revision"] += 1
-                changes[dc.REGISTRY_REL] = dc.dump_registry(next_registry)
-            directories = {f"wiki/{item['directory_name']}": True for item in payload["new_categories"]}
-            path_map: dict[str, str] = {}
-            article_by_id = {item["article_id"]: item for item in self.articles() if item.get("article_id")}
-            for move in payload["moves"]:
-                article = article_by_id.get(move["article_id"])
-                if not article:
-                    raise FileNotFoundError(move["article_id"])
-                current = self.read_article(article["path"])
-                if current["revision"] != move["article_revision"] or current["path"] != move["source_path"]:
-                    raise RuntimeError("article changed after preview")
-                target = move["target_path"]
-                if target != current["path"] and (self.root / "wiki" / target).exists():
-                    raise FileExistsError(target)
-                category = dc.category_by_id(next_registry, move["category_id"], include_archived=False)
-                md = dc.ensure_article_metadata(current["markdown"], category_id=category["category_id"], status="confirmed", article_uuid=current["article_id"], article_tags=move["tags"])
-                md = cats.ensure_category_header(md, category["directory_name"])
-                md = wiki_ops.rebase_wiki_hrefs(md, current["path"], target)
-                changes[f"wiki/{target}"] = md
-                if target != current["path"]:
-                    changes[f"wiki/{current['path']}"] = None
-                    path_map[current["path"]] = target
-            for path in kw.iter_articles(self.root):
-                rel = kw.rel_article(self.root, path)
-                if rel in path_map:
-                    continue
-                md = path.read_text(encoding="utf-8")
-                updated = md
-                for old, new in path_map.items():
-                    updated = wiki_ops.rewrite_wiki_hrefs(updated, rel, old, new)
-                if updated != md:
-                    changes[f"wiki/{rel}"] = updated
-            operation_id = f"classify-{uuid.uuid4().hex}"
-            log_path = self.root / "wiki" / "log.md"
-            changes["wiki/index.md"] = render_index(self.root, changes)
-            changes["wiki/log.md"] = append_log_text(log_path.read_text(encoding="utf-8") if log_path.exists() else "", operation_id=operation_id, kind="classify", title=f"{len(payload['moves'])} articles")
-            self.files.commit(changes, directories=directories, kind="classification", metadata={"path_map": path_map, "article_ids": [item["article_id"] for item in payload["moves"]]}, operation_id=operation_id)
-            self._remap_committed_paths(operation_id, path_map)
-            self.state.consume_preview(preview_id)
-            if clear_draft:
-                self.state.clear_classification_draft()
-            return {
-                "operation_id": operation_id,
-                "moved_articles": [self.read_article(move["target_path"]) for move in payload["moves"]],
-                "created_categories": payload["new_categories"],
-                "path_map": path_map,
-            }
-
     def category_preview(
         self,
         action: str,
@@ -1438,87 +1402,40 @@ class WikiService:
         description: str = "",
         sort_order: int | None = None,
     ) -> dict:
-        if action not in {"create", "rename", "archive", "restore", "delete", "reorder", "migrate"}:
+        if action not in {"rename", "archive", "restore", "delete", "reorder"}:
             raise ValueError("invalid category action")
         registry = dc.load_registry(self.root)
         conflicts = []
         before = None
         after = None
         affected: list[str] = []
-        if action == "create":
-            after = dc.new_category(name, description=description, sort_order=len(registry["categories"]))
-            dc.assert_unique(registry, after)
-        else:
-            before = dict(dc.category_by_id(registry, category_id))
-            after = dict(before)
-            folder = self.root / "wiki" / before["directory_name"]
-            affected = [item["path"] for item in self.articles() if item["primary_category_id"] == category_id]
-            if action == "migrate":
-                target_category = dc.category_by_id(registry, target_category_id, include_archived=False)
-                if target_category["category_id"] == before["category_id"]:
-                    conflicts.append({"kind": "same_category"})
-                if not affected:
-                    conflicts.append({"kind": "category_empty"})
-                nested = None
-                if not conflicts:
-                    selections = []
-                    for article in self.articles():
-                        if article["primary_category_id"] != before["category_id"]:
-                            continue
-                        full = self.read_article(article["path"])
-                        selections.append({
-                            "article_id": article["article_id"],
-                            "article_revision": full["revision"],
-                            "decision": "existing",
-                            "category_id": target_category["category_id"],
-                            "tags": article["tags"],
-                        })
-                    nested = self.classification_preview(selections)
-                    conflicts.extend(nested["conflicts"])
-                payload = {
-                    "taxonomy_revision": registry["revision"],
-                    "action": action,
-                    "category_id": category_id,
-                    "target_category_id": target_category_id,
-                    "before": before,
-                    "after": target_category,
-                    "classification_preview_id": nested["preview_id"] if nested else None,
-                }
-                stored = self.state.create_preview("category", payload)
-                return {
-                    "preview_id": stored["preview_id"],
-                    "expires_at": stored["expires_at"],
-                    "action": action,
-                    "before": before,
-                    "after": target_category,
-                    "affected_articles": affected,
-                    "moves": nested["moves"] if nested else [],
-                    "conflicts": conflicts,
-                    "can_commit": bool(nested) and not conflicts,
-                }
-            if action == "rename":
-                after.update(name=dc.validate_name(name), directory_name=dc.directory_name(name), description=description.strip()[:500] if description else before["description"], updated_at=dc.now_iso(), legacy_directory=False)
-                dc.assert_unique(registry, after, ignore_id=category_id)
-                target = self.root / "wiki" / after["directory_name"]
-                if target.exists() and target.resolve() != folder.resolve():
-                    conflicts.append({"kind": "target_exists", "path": after["directory_name"]})
-                unknown = [path.name for path in folder.iterdir() if not path.is_file() or path.suffix.lower() != ".md"] if folder.is_dir() else []
-                if unknown:
-                    conflicts.append({"kind": "unknown_files", "paths": unknown})
-            elif action == "archive":
-                after.update(status="archived", updated_at=dc.now_iso())
-            elif action == "restore":
-                after.update(status="active", updated_at=dc.now_iso())
-            elif action == "delete":
-                after = None
-                if affected:
-                    conflicts.append({"kind": "category_not_empty", "article_count": len(affected)})
-                if folder.is_dir() and any(folder.iterdir()):
-                    conflicts.append({"kind": "directory_not_empty"})
-            elif action == "reorder":
-                if sort_order is None or sort_order < 0:
-                    raise ValueError("invalid sort order")
-                after.update(sort_order=sort_order, updated_at=dc.now_iso())
+        before = dict(dc.category_by_id(registry, category_id))
+        after = dict(before)
+        folder = self.root / "wiki" / before["directory_name"]
+        affected = [item["path"] for item in self.articles() if item["primary_category_id"] == category_id]
+        if action == "rename":
+            after.update(name=dc.validate_name(name), directory_name=dc.directory_name(name), description=description.strip()[:500] if description else before["description"], updated_at=dc.now_iso(), legacy_directory=False)
+            dc.assert_unique(registry, after, ignore_id=category_id)
+            target = self.root / "wiki" / after["directory_name"]
+            if target.exists() and target.resolve() != folder.resolve():
+                conflicts.append({"kind": "target_exists", "path": after["directory_name"]})
+            unknown = [path.name for path in folder.iterdir() if not path.is_file() or path.suffix.lower() != ".md"] if folder.is_dir() else []
+            if unknown:
+                conflicts.append({"kind": "unknown_files", "paths": unknown})
+        elif action == "archive":
+            after.update(status="archived", updated_at=dc.now_iso())
+        elif action == "restore":
+            after.update(status="active", updated_at=dc.now_iso())
+        elif action == "delete":
+            after = None
+            if affected:
+                conflicts.append({"kind": "category_not_empty", "article_count": len(affected)})
+            if folder.is_dir() and any(folder.iterdir()):
+                conflicts.append({"kind": "directory_not_empty"})
+        elif action == "reorder":
+            if sort_order is None or sort_order < 0:
+                raise ValueError("invalid sort order")
+            after.update(sort_order=sort_order, updated_at=dc.now_iso())
         payload = {"taxonomy_revision": registry["revision"], "action": action, "category_id": category_id, "before": before, "after": after}
         stored = self.state.create_preview("category", payload)
         return {"preview_id": stored["preview_id"], "expires_at": stored["expires_at"], "action": action, "before": before, "after": after, "affected_articles": affected, "conflicts": conflicts, "can_commit": not conflicts}
@@ -1531,40 +1448,25 @@ class WikiService:
             if registry["revision"] != payload["taxonomy_revision"]:
                 raise RuntimeError("category preview is stale")
             action = payload["action"]
+            if action not in {"rename", "archive", "restore", "delete", "reorder"}:
+                raise ValueError("invalid category action")
             before, after = payload.get("before"), payload.get("after")
-            if action == "migrate":
-                source = dc.category_by_id(registry, payload["category_id"])
-                target = dc.category_by_id(registry, payload["target_category_id"], include_archived=False)
-                if source != before or target != after:
-                    raise RuntimeError("category changed after preview")
-                nested_preview_id = payload.get("classification_preview_id")
-                if not nested_preview_id:
-                    raise RuntimeError("migration preview is incomplete")
-                result = self.classification_commit(nested_preview_id, clear_draft=False)
-                self.state.consume_preview(preview_id)
-                return {**result, "category": target}
             next_registry = json.loads(json.dumps(registry, ensure_ascii=False))
-            if action == "create":
-                dc.assert_unique(next_registry, after)
-                next_registry["categories"].append(after)
+            current = dc.category_by_id(next_registry, payload["category_id"])
+            if before != current:
+                raise RuntimeError("category changed after preview")
+            if action == "delete":
+                if any(item["primary_category_id"] == current["category_id"] for item in self.articles()):
+                    raise RuntimeError("category is not empty")
+                next_registry["categories"] = [item for item in next_registry["categories"] if item["category_id"] != current["category_id"]]
             else:
-                current = dc.category_by_id(next_registry, payload["category_id"])
-                if before != current:
-                    raise RuntimeError("category changed after preview")
-                if action == "delete":
-                    if any(item["primary_category_id"] == current["category_id"] for item in self.articles()):
-                        raise RuntimeError("category is not empty")
-                    next_registry["categories"] = [item for item in next_registry["categories"] if item["category_id"] != current["category_id"]]
-                else:
-                    dc.assert_unique(next_registry, after, ignore_id=current["category_id"])
-                    next_registry["categories"] = [after if item["category_id"] == current["category_id"] else item for item in next_registry["categories"]]
+                dc.assert_unique(next_registry, after, ignore_id=current["category_id"])
+                next_registry["categories"] = [after if item["category_id"] == current["category_id"] else item for item in next_registry["categories"]]
             next_registry["revision"] += 1
             changes: dict[str, str | None] = {dc.REGISTRY_REL: dc.dump_registry(next_registry)}
             directories: dict[str, bool] = {}
             path_map: dict[str, str] = {}
-            if action == "create":
-                directories[f"wiki/{after['directory_name']}"] = True
-            elif action == "delete":
+            if action == "delete":
                 folder = self.root / "wiki" / before["directory_name"]
                 if not folder.is_dir() or any(folder.iterdir()):
                     raise RuntimeError("category directory is not empty")
@@ -1900,10 +1802,6 @@ class WikiService:
         return self.state.complete_task(task["id"], result, expected_attempt=task["attempts"])
 
     def _run_remote_task(self, task: dict) -> dict:
-        if task["kind"] == "raw-classification-plan":
-            return self._run_raw_classification_plan(task)
-        if task["kind"] == "article-classification":
-            return self._run_classification_task(task)
         if task["kind"] == "governance":
             return self._run_governance_task(task)
         payload = task["payload"]
@@ -2002,129 +1900,7 @@ class WikiService:
         if finalized["status"] != "succeeded" or finalized["attempts"] != task["attempts"]:
             self.files.rollback(operation_id)
             return {"superseded": True, "path": payload["path"]}
-        completed = self.read_article(payload["path"])
-        if completed.get("classification_status") == "pending":
-            self.enqueue_classification(completed, actor_user_id=task.get("actor_user_id"))
         return result
-
-    def _run_raw_classification_plan(self, task: dict) -> dict:
-        payload = task["payload"]
-        if self.state.get_task(task["id"])["status"] == "cancelled":
-            return {"cancelled": True, "raw_path": payload["raw_path"]}
-        raw = self.read_raw(payload["raw_path"])
-        registry = dc.load_registry(self.root)
-        if raw["revision"] != payload["raw_revision"] or registry["revision"] != payload["taxonomy_revision"]:
-            return {"stale": True, "raw_path": payload["raw_path"]}
-        plan = self._call_raw_plan_llm(raw, registry)
-        with self._intent_lock:
-            if self.state.get_task(task["id"])["status"] == "cancelled":
-                return {"cancelled": True, "raw_path": payload["raw_path"]}
-            latest_raw = self.read_raw(payload["raw_path"])
-            latest_registry = dc.load_registry(self.root)
-            if latest_raw["revision"] != payload["raw_revision"] or latest_registry["revision"] != payload["taxonomy_revision"]:
-                return {"stale": True, "raw_path": payload["raw_path"]}
-        return {"stale": False, "raw_path": payload["raw_path"], "plan": plan}
-
-    def _call_raw_plan_llm(self, raw: dict, registry: dict) -> dict:
-        try:
-            from openai import OpenAI
-        except ImportError as exc:
-            raise RemoteError("not_configured", "The OpenAI-compatible client is not installed.") from exc
-        active = [{"category_id": item["category_id"], "name": item["name"], "description": item["description"]} for item in registry["categories"] if item["status"] == "active"]
-        prompt = (
-            "阅读原料全文，给出预计分类方案。只输出 JSON object，含 candidates 数组（最多3项），每项包含 name、description、"
-            "existing_category_id(null或已有ID)、confidence(0到1)、reason、expected_articles(标题数组)、expected_count。"
-            "这只是预览，不得声称已创建分类。\n\n"
-            f"已有分类：{json.dumps(active, ensure_ascii=False)}\n\n原料：\n{raw['markdown'][:50000]}"
-        )
-        client = OpenAI(api_key=self.llm.api_key or "not-needed", base_url=self.llm.base_url, timeout=30, max_retries=0)
-        response = client.chat.completions.create(model=self.llm.model, messages=[{"role": "system", "content": "你是知识规划器，只返回严格 JSON。"}, {"role": "user", "content": prompt}], max_tokens=1800)
-        text = model_message_text(response.choices[0].message)
-        fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.S | re.I)
-        data = json.loads(fenced.group(1) if fenced else text)
-        candidates = data.get("candidates") if isinstance(data, dict) else None
-        valid_ids = {item["category_id"] for item in active}
-        if not isinstance(candidates, list) or len(candidates) > 3:
-            raise RemoteError("model_error", "原料分类方案结构无效。", retryable=True)
-        clean = []
-        for item in candidates:
-            if not isinstance(item, dict) or item.get("existing_category_id") not in valid_ids | {None}:
-                raise RemoteError("model_error", "原料分类候选无效。", retryable=True)
-            confidence = float(item.get("confidence", -1))
-            if not 0 <= confidence <= 1:
-                raise RemoteError("model_error", "原料分类置信度无效。", retryable=True)
-            clean.append({"name": dc.validate_name(str(item.get("name", ""))), "description": str(item.get("description", ""))[:500], "existing_category_id": item.get("existing_category_id"), "confidence": confidence, "reason": str(item.get("reason", ""))[:300], "expected_articles": [str(value)[:120] for value in item.get("expected_articles", []) if isinstance(value, str)][:20], "expected_count": max(0, min(1000, int(item.get("expected_count", 0))))})
-        return {"candidates": clean}
-
-    def _run_classification_task(self, task: dict) -> dict:
-        payload = task["payload"]
-        if self.state.get_task(task["id"])["status"] == "cancelled":
-            return {"cancelled": True, "article_id": payload["article_id"]}
-        article = self.read_article(payload["path"])
-        registry = dc.load_registry(self.root)
-        if article["article_id"] != payload["article_id"] or article["revision"] != payload["article_revision"] or registry["revision"] != payload["taxonomy_revision"] or article["classification_status"] != "pending":
-            return {"stale": True, "article_id": payload["article_id"]}
-        suggestion = self._call_classification_llm(article, registry)
-        with self._intent_lock:
-            if self.state.get_task(task["id"])["status"] == "cancelled":
-                return {"cancelled": True, "article_id": payload["article_id"]}
-            latest = self.read_article(payload["path"])
-            latest_registry = dc.load_registry(self.root)
-            if (
-                latest["article_id"] != payload["article_id"]
-                or latest["revision"] != payload["article_revision"]
-                or latest["classification_status"] != "pending"
-                or latest_registry["revision"] != payload["taxonomy_revision"]
-            ):
-                return {"stale": True, "article_id": payload["article_id"]}
-        return {"stale": False, "article_id": article["article_id"], "suggestion": suggestion}
-
-    def _call_classification_llm(self, article: dict, registry: dict) -> dict:
-        try:
-            from openai import OpenAI
-        except ImportError as exc:
-            raise RemoteError("not_configured", "The OpenAI-compatible client is not installed.") from exc
-        active = [
-            {key: item.get(key) for key in ("category_id", "name", "description", "aliases")}
-            for item in registry["categories"] if item["status"] == "active"
-        ]
-        prompt = (
-            "根据完整 Markdown 正文和用户已有分类给出归类建议。只输出 JSON object："
-            "candidates 数组最多3项，每项 category_id、confidence(0到1)、reason；tags 字符串数组；"
-            "new_category 可为 null 或包含 name、description、confidence、reason。不得发明 category_id。\n\n"
-            f"已有分类：{json.dumps(active, ensure_ascii=False)}\n\n正文：\n{article['markdown'][:50000]}"
-        )
-        client = OpenAI(api_key=self.llm.api_key or "not-needed", base_url=self.llm.base_url, timeout=30, max_retries=0)
-        response = client.chat.completions.create(
-            model=self.llm.model,
-            messages=[{"role": "system", "content": "你是知识归类器，只返回严格 JSON。"}, {"role": "user", "content": prompt}],
-            max_tokens=1600,
-        )
-        raw = model_message_text(response.choices[0].message)
-        fenced = re.search(r"```(?:json)?\s*(.*?)```", raw, re.S | re.I)
-        data = json.loads(fenced.group(1) if fenced else raw)
-        if not isinstance(data, dict) or set(data) - {"candidates", "tags", "new_category"}:
-            raise RemoteError("model_error", "分类模型返回了无效结构。", retryable=True)
-        valid_ids = {item["category_id"] for item in active}
-        candidates = data.get("candidates", [])
-        if not isinstance(candidates, list) or len(candidates) > 3:
-            raise RemoteError("model_error", "分类候选数量无效。", retryable=True)
-        clean_candidates = []
-        for item in candidates:
-            if not isinstance(item, dict) or item.get("category_id") not in valid_ids:
-                raise RemoteError("model_error", "分类候选不属于当前空间。", retryable=True)
-            confidence = float(item.get("confidence", -1))
-            if not 0 <= confidence <= 1:
-                raise RemoteError("model_error", "分类置信度无效。", retryable=True)
-            clean_candidates.append({"category_id": item["category_id"], "confidence": confidence, "reason": str(item.get("reason", ""))[:300]})
-        tags = dc.tags("> Tags: " + "; ".join(str(tag) for tag in data.get("tags", []) if isinstance(tag, str)))
-        new_category = data.get("new_category")
-        if new_category is not None:
-            if not isinstance(new_category, dict):
-                raise RemoteError("model_error", "新分类建议无效。", retryable=True)
-            name = dc.validate_name(str(new_category.get("name", "")))
-            new_category = {"name": name, "description": str(new_category.get("description", ""))[:500], "confidence": max(0.0, min(1.0, float(new_category.get("confidence", 0)))), "reason": str(new_category.get("reason", ""))[:300]}
-        return {"candidates": clean_candidates, "tags": tags, "new_category": new_category}
 
     def _normalize_ai_article(
         self,

@@ -122,7 +122,7 @@ class PlatformReviewWorker:
                 self._wake.clear()
                 continue
             if self.reviewer is not None:
-                result = self.reviewer(row["snapshot"])
+                result = self.reviewer(row["review_input"])
             else:
                 result = default_reviewer(row["review_input"], self.settings)
             result = {

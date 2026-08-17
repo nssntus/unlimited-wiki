@@ -319,6 +319,20 @@ PLATFORM_CORRECTNESS_INDEXES = {
         "ON public_entries(author_id,source_workspace_id,source_article_id) "
         "WHERE source_workspace_id IS NOT NULL AND source_article_id IS NOT NULL",
     },
+    "idx_public_categories_normalized_name": {
+        "table": "public_categories",
+        "columns": ("normalized_name",),
+        "predicate": None,
+        "sql": "CREATE UNIQUE INDEX idx_public_categories_normalized_name "
+        "ON public_categories(normalized_name)",
+    },
+    "idx_public_tags_normalized_name": {
+        "table": "public_tags",
+        "columns": ("normalized_name",),
+        "predicate": None,
+        "sql": "CREATE UNIQUE INDEX idx_public_tags_normalized_name "
+        "ON public_tags(normalized_name)",
+    },
 }
 SQLITE_ASCII_CASE_TRANSLATION = str.maketrans(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz",

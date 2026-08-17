@@ -236,20 +236,19 @@ def test_private_get_cannot_run_or_recache_after_suspend(lifecycle_server, monke
     assert team["id"] not in app._diagnostics
 
 
-def test_ingest_preview_task_records_current_actor(lifecycle_server):
+def test_ingest_preview_does_not_enqueue_classification(lifecycle_server):
     app, owner, _member, _team, _owner_personal, _member_personal = _team_world(lifecycle_server)
-    context = context_for(app, owner)
-    service = app.workspace_service(context)
+    service = app.workspace_service(context_for(app, owner))
     raw_path = service.root / "raw" / "local" / "actor-preview.md"
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     raw_path.write_text("# Actor Preview\n\nRaw body.\n", encoding="utf-8")
-    service.llm = LLMConfig(base_url="https://example.com/v1", api_key="test-key", model="test-model")
+    before_task_ids = {item["id"] for item in service.state.list_tasks()}
 
     response = owner.request("GET", "/api/ingest/preview?path=raw/local/actor-preview.md")
 
     assert response[0] == 200
-    task_id = response[1]["classification_plan"]["task_id"]
-    assert service.state.get_task(task_id)["actor_user_id"] == context.user_id
+    assert "classification_plan" not in response[1]
+    assert {item["id"] for item in service.state.list_tasks()} == before_task_ids
 
 
 def test_cross_workspace_service_creation_does_not_invert_platform_and_cache_locks(lifecycle_server, monkeypatch):
@@ -783,19 +782,11 @@ def test_suspend_serializes_worker_failure_finalization(lifecycle_server, monkey
     app, owner, _member, team, _owner_personal, _member_personal = _team_world(lifecycle_server)
     context = context_for(app, owner)
     service = app.workspace_service(context)
-    payload = {
-        "raw_path": "raw/local/failure.md",
-        "raw_revision": "raw-revision",
-        "taxonomy_revision": 1,
-    }
+    payload = {"path": "concepts/missing.md"}
     task, _ = service.state.enqueue_task(
-        "raw-classification-plan", "failure-plan", payload, actor_user_id=context.user_id,
+        "supplement", "failure-task", payload, actor_user_id=context.user_id,
     )
-    claimed = service.state.claim_task({"raw-classification-plan"})
-    service.state.save_raw_classification_plan(
-        payload["raw_path"], payload["raw_revision"], payload["taxonomy_revision"],
-        "running", task_id=task["id"],
-    )
+    claimed = service.state.claim_task({"supplement"})
     platform_committed = threading.Event()
     release_reconcile = threading.Event()
     original_reconcile = app._reconcile_workspace_storage
@@ -828,9 +819,6 @@ def test_suspend_serializes_worker_failure_finalization(lifecycle_server, monkey
     assert suspend_result["response"][0] == 200
     assert failure_done.is_set()
     assert service.state.get_task(task["id"])["status"] == "paused"
-    assert service.state.raw_classification_plan(
-        payload["raw_path"], payload["raw_revision"], payload["taxonomy_revision"],
-    )["status"] == "paused"
     assert owner.request("POST", f"/api/workspaces/{team['id']}/restore", {}, key=f"failure-{error_type}-restore")[0] == 200
     assert StateStore(service.root, recover_running=False).get_task(task["id"])["status"] == "queued"
 

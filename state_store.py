@@ -134,6 +134,17 @@ class StateStore:
                     "UPDATE tasks SET status='queued', next_run_at=?, updated_at=? WHERE status='running'",
                     (now_iso(), now_iso()),
                 )
+            db.execute(
+                """
+                UPDATE tasks
+                SET status='failed', error_type='feature_removed',
+                    error_message='AI classification was retired; choose taxonomy while saving.',
+                    next_run_at=NULL, paused_from_status=NULL, updated_at=?
+                WHERE kind IN ('article-classification','raw-classification-plan')
+                  AND status IN ('staged','queued','running','paused')
+                """,
+                (now_iso(),),
+            )
             db.execute("DELETE FROM idempotency WHERE status='pending'")
             staged = db.execute("SELECT id,payload_json FROM tasks WHERE status='staged'").fetchall()
             for row in staged:

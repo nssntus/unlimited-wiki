@@ -37,6 +37,34 @@ def validate_name(value: str) -> str:
     return name
 
 
+def validate_tag_name(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("tag name must be a string")
+    name = unicodedata.normalize("NFKC", value).strip()
+    if not name or len(name) > 50:
+        raise ValueError("invalid tag name")
+    if any(ch in name for ch in "/\\\0") or any(ord(ch) < 32 for ch in name):
+        raise ValueError("invalid tag name")
+    if not any(ch.isalnum() for ch in name):
+        raise ValueError("invalid tag name")
+    return name
+
+
+def normalize_tags(values: list[str], *, maximum: int = 20) -> list[str]:
+    if not isinstance(values, list) or len(values) > maximum:
+        raise ValueError(f"tags must contain at most {maximum} items")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        tag = validate_tag_name(value)
+        key = normalized_key(tag)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(tag)
+    return normalized
+
+
 def directory_name(value: str) -> str:
     name = validate_name(value)
     slug = re.sub(r"\s+", "-", name)
@@ -118,8 +146,8 @@ def tags(md: str) -> list[str]:
     values: list[str] = []
     seen: set[str] = set()
     for part in re.split(r"[;,，；]", raw):
-        tag = unicodedata.normalize("NFKC", part).strip()
-        key = tag.casefold()
+        tag = unicodedata.normalize("NFKC", part).strip()[:50]
+        key = normalized_key(tag)
         if tag and key not in seen:
             seen.add(key)
             values.append(tag[:50])

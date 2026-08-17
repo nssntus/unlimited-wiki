@@ -10,6 +10,7 @@ import json
 import re
 import sqlite3
 import threading
+import unicodedata
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -41,6 +42,28 @@ def _slug(value: str) -> str:
     if not result or len(result) > 64:
         raise ValueError("invalid public slug")
     return result
+
+
+def normalize_taxonomy_name(value: str, *, kind: str) -> tuple[str, str]:
+    if not isinstance(value, str):
+        raise ValueError(f"{kind} name must be a string")
+    name = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", value)).strip()
+    maximum = 80 if kind == "category" else 50
+    if not name or len(name) > maximum:
+        raise ValueError(f"invalid public {kind} name")
+    if any(ch in name for ch in "/\\\0") or any(ord(ch) < 32 for ch in name):
+        raise ValueError(f"invalid public {kind} name")
+    if not any(ch.isalnum() for ch in name):
+        raise ValueError(f"invalid public {kind} name")
+    return name, name.casefold()
+
+
+def taxonomy_slug(name: str, *, kind: str) -> str:
+    try:
+        return _slug(name)
+    except ValueError:
+        digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
+        return f"{kind}-{digest}"
 
 
 def _json(value: Any) -> str:
@@ -240,12 +263,14 @@ def initialize_square_schema(db: sqlite3.Connection) -> None:
     db.executescript("""
         CREATE TABLE IF NOT EXISTS public_categories (
             id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL,
             description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'active',
             sort_order INTEGER NOT NULL DEFAULT 0, created_by TEXT REFERENCES users(id),
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS public_tags (
             id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS public_entry_tags (
@@ -344,11 +369,11 @@ def initialize_square_schema(db: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS public_revision_taxonomy (
             revision_id TEXT PRIMARY KEY REFERENCES public_revisions(id) ON DELETE CASCADE,
             category_id TEXT REFERENCES public_categories(id), attribution TEXT NOT NULL,
-            change_summary TEXT NOT NULL
+            change_summary TEXT NOT NULL, category_name TEXT, category_slug TEXT
         );
         CREATE TABLE IF NOT EXISTS public_revision_tags (
             revision_id TEXT NOT NULL REFERENCES public_revisions(id) ON DELETE CASCADE,
-            tag_id TEXT NOT NULL REFERENCES public_tags(id),
+            tag_id TEXT NOT NULL REFERENCES public_tags(id), tag_name TEXT, tag_slug TEXT,
             PRIMARY KEY(revision_id,tag_id)
         );
         CREATE TABLE IF NOT EXISTS submission_review_attempts (
@@ -384,6 +409,25 @@ def initialize_square_schema(db: sqlite3.Connection) -> None:
             "ai_rules_version": "TEXT",
             "duplicate_candidates_json": "TEXT",
             "review_attempt": "INTEGER NOT NULL DEFAULT 0",
+            "taxonomy_proposal_json": "TEXT",
+            "taxonomy_decision_json": "TEXT",
+        },
+        "share_previews": {
+            "taxonomy_proposal_json": "TEXT",
+        },
+        "public_categories": {
+            "normalized_name": "TEXT",
+        },
+        "public_tags": {
+            "normalized_name": "TEXT",
+        },
+        "public_revision_taxonomy": {
+            "category_name": "TEXT",
+            "category_slug": "TEXT",
+        },
+        "public_revision_tags": {
+            "tag_name": "TEXT",
+            "tag_slug": "TEXT",
         },
         "reports": {
             "revision_id": "TEXT REFERENCES public_revisions(id)",
@@ -400,6 +444,30 @@ def initialize_square_schema(db: sqlite3.Connection) -> None:
         for name, declaration in columns.items():
             if name not in existing:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+    for table, kind in (("public_categories", "category"), ("public_tags", "tag")):
+        rows = db.execute(f"SELECT id,name,normalized_name FROM {table}").fetchall()
+        seen: dict[str, str] = {}
+        for row in rows:
+            _name, normalized = normalize_taxonomy_name(row["name"], kind=kind)
+            if normalized in seen and seen[normalized] != row["id"]:
+                raise RuntimeError(f"duplicate normalized public {kind} names: {seen[normalized]}, {row['id']}")
+            seen[normalized] = row["id"]
+            if row["normalized_name"] != normalized:
+                db.execute(f"UPDATE {table} SET normalized_name=? WHERE id=?", (normalized, row["id"]))
+    db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_public_categories_normalized_name ON public_categories(normalized_name)")
+    db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_public_tags_normalized_name ON public_tags(normalized_name)")
+    db.execute("""
+        UPDATE public_revision_taxonomy
+        SET category_name=(SELECT name FROM public_categories WHERE id=category_id),
+            category_slug=(SELECT slug FROM public_categories WHERE id=category_id)
+        WHERE category_id IS NOT NULL AND (category_name IS NULL OR category_slug IS NULL)
+    """)
+    db.execute("""
+        UPDATE public_revision_tags
+        SET tag_name=(SELECT name FROM public_tags WHERE id=tag_id),
+            tag_slug=(SELECT slug FROM public_tags WHERE id=tag_id)
+        WHERE tag_name IS NULL OR tag_slug IS NULL
+    """)
     try:
         db.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS public_search_fts USING fts5(
@@ -924,13 +992,12 @@ class SquareMixin:
             rows = db.execute("""
                 SELECT r.id,r.version,r.content_hash,r.published_at,
                        tx.attribution,tx.change_summary,rr.reviewed_at,
-                       c.id category_id,c.slug category_slug,c.name category_name,
-                       (SELECT json_group_array(json_object('id',t.id,'slug',t.slug,'name',t.name))
-                        FROM public_revision_tags rt JOIN public_tags t ON t.id=rt.tag_id
+                       tx.category_id,tx.category_slug,tx.category_name,
+                       (SELECT json_group_array(json_object('id',rt.tag_id,'slug',rt.tag_slug,'name',rt.tag_name))
+                        FROM public_revision_tags rt
                         WHERE rt.revision_id=r.id) tags_json
                 FROM public_revisions r
                 LEFT JOIN public_revision_taxonomy tx ON tx.revision_id=r.id
-                LEFT JOIN public_categories c ON c.id=tx.category_id
                 LEFT JOIN public_revision_reviews rr ON rr.revision_id=r.id
                 WHERE r.entry_id=? AND r.visibility='public' ORDER BY r.version DESC
             """, (entry_id,)).fetchall()
@@ -1310,8 +1377,9 @@ class SquareMixin:
         return {**dict(row), "items": [dict(item) for item in items]}
 
     def admin_upsert_category(self, context: Any, category_id: str | None, slug: str, name: str, description: str, status: str, sort_order: int) -> dict:
-        if status not in {"active", "disabled"} or not name.strip() or len(name) > 80:
+        if status not in {"active", "disabled"}:
             raise ValueError("invalid public category")
+        clean_name, normalized_name = normalize_taxonomy_name(name, kind="category")
         category_id, now, requested_slug = category_id or uuid.uuid4().hex, _now(), _slug(slug)
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE"); self._authorize_admin_in_transaction(db, context.user_id)
@@ -1327,9 +1395,13 @@ class SquareMixin:
             if alias_owner is not None:
                 db.execute("DELETE FROM public_category_slug_redirects WHERE slug=? AND category_id=?", (requested_slug, category_id))
             db.execute("""
-                INSERT INTO public_categories VALUES(?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(id) DO UPDATE SET slug=excluded.slug,name=excluded.name,description=excluded.description,status=excluded.status,sort_order=excluded.sort_order,updated_at=excluded.updated_at
-            """, (category_id, requested_slug, name.strip(), description.strip()[:1000], status, int(sort_order), context.user_id, now, now))
+                INSERT INTO public_categories(
+                    id,slug,name,normalized_name,description,status,sort_order,created_by,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET slug=excluded.slug,name=excluded.name,
+                  normalized_name=excluded.normalized_name,description=excluded.description,
+                  status=excluded.status,sort_order=excluded.sort_order,updated_at=excluded.updated_at
+            """, (category_id, requested_slug, clean_name, normalized_name, description.strip()[:1000], status, int(sort_order), context.user_id, now, now))
             if old is not None and old["slug"] != requested_slug:
                 existing_alias = db.execute(
                     "SELECT category_id FROM public_category_slug_redirects WHERE slug=?", (old["slug"],),
@@ -1344,7 +1416,7 @@ class SquareMixin:
                 self._refresh_square_entry(db, entry["id"])
             self._audit(db, context.user_id, "public_category.upsert", "public_category", category_id, {"status": status})
             db.commit()
-        return {"id": category_id, "slug": requested_slug, "name": name.strip(), "description": description.strip(), "status": status, "sort_order": int(sort_order)}
+        return {"id": category_id, "slug": requested_slug, "name": clean_name, "description": description.strip(), "status": status, "sort_order": int(sort_order)}
 
     def admin_map_category(self, context: Any, private_label: str, category_id: str) -> dict:
         label = private_label.strip()
@@ -1449,20 +1521,23 @@ class SquareMixin:
         } for row in rows]
 
     def admin_upsert_tag(self, context: Any, tag_id: str | None, slug: str, name: str, status: str) -> dict:
-        if status not in {"active", "disabled"} or not name.strip() or len(name) > 50:
+        if status not in {"active", "disabled"}:
             raise ValueError("invalid public tag")
+        clean_name, normalized_name = normalize_taxonomy_name(name, kind="tag")
         tag_id, now = tag_id or uuid.uuid4().hex, _now()
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE"); self._authorize_admin_in_transaction(db, context.user_id)
             db.execute("""
-                INSERT INTO public_tags VALUES(?,?,?,?,?,?)
-                ON CONFLICT(id) DO UPDATE SET slug=excluded.slug,name=excluded.name,status=excluded.status,updated_at=excluded.updated_at
-            """, (tag_id, _slug(slug), name.strip(), status, now, now))
+                INSERT INTO public_tags(id,slug,name,normalized_name,status,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET slug=excluded.slug,name=excluded.name,
+                  normalized_name=excluded.normalized_name,status=excluded.status,updated_at=excluded.updated_at
+            """, (tag_id, _slug(slug), clean_name, normalized_name, status, now, now))
             for entry in db.execute("SELECT entry_id FROM public_entry_tags WHERE tag_id=?", (tag_id,)).fetchall():
                 self._refresh_square_entry(db, entry["entry_id"])
             self._audit(db, context.user_id, "public_tag.upsert", "public_tag", tag_id, {"status": status})
             db.commit()
-        return {"id": tag_id, "slug": _slug(slug), "name": name.strip(), "status": status}
+        return {"id": tag_id, "slug": _slug(slug), "name": clean_name, "status": status}
 
     def admin_set_entry_taxonomy(self, context: Any, entry_id: str, category_id: str | None, tag_ids: list[str]) -> dict:
         if len(tag_ids) > 12 or any(not re.fullmatch(r"[a-f0-9]{32}", value) for value in tag_ids):

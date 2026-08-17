@@ -440,6 +440,14 @@ def test_backup_rejects_malformed_optional_application_tables(tmp_path: Path, da
             "CREATE UNIQUE INDEX idx_public_entries_source_article "
             "ON public_entries(author_id,source_article_id) WHERE source_article_id IS NOT NULL",
         ),
+        (
+            "idx_public_categories_normalized_name",
+            "CREATE UNIQUE INDEX idx_public_categories_normalized_name ON public_categories(name)",
+        ),
+        (
+            "idx_public_tags_normalized_name",
+            "CREATE INDEX idx_public_tags_normalized_name ON public_tags(normalized_name)",
+        ),
     ],
 )
 def test_backup_rejects_incorrect_named_correctness_indexes(
@@ -1696,12 +1704,12 @@ def test_backup_rejects_conflicting_public_category_slug_namespace(tmp_path: Pat
     platform, _user, _article, _raw = seed_instance(source)
     with platform.connect() as db:
         db.execute(
-            "INSERT INTO public_categories(id,slug,name,created_at,updated_at) VALUES(?,?,?,?,?)",
-            ("a" * 32, "reserved-slug", "Category A", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+            "INSERT INTO public_categories(id,slug,name,normalized_name,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            ("a" * 32, "reserved-slug", "Category A", "category a", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
         )
         db.execute(
-            "INSERT INTO public_categories(id,slug,name,created_at,updated_at) VALUES(?,?,?,?,?)",
-            ("b" * 32, "category-b", "Category B", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+            "INSERT INTO public_categories(id,slug,name,normalized_name,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            ("b" * 32, "category-b", "Category B", "category b", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
         )
         db.execute(
             "INSERT INTO public_category_slug_redirects(slug,category_id,created_at) VALUES(?,?,?)",

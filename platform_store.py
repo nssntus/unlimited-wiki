@@ -28,6 +28,8 @@ from square_v2 import (
     REUSE_POLICY_VERSION,
     SquareMixin,
     initialize_square_schema,
+    normalize_taxonomy_name,
+    taxonomy_slug,
 )
 
 
@@ -1957,6 +1959,118 @@ class PlatformStore(SquareMixin):
             "api_key": self.vault.decrypt(row["api_key_enc"], scope=scope), "model": row["model"],
         }
 
+    @staticmethod
+    def _canonicalize_taxonomy_selection(db: sqlite3.Connection, payload: dict) -> dict:
+        if not isinstance(payload, dict) or set(payload) - {"category", "tags"}:
+            raise ValueError("invalid public taxonomy selection")
+
+        def canonical(item: object, kind: str) -> dict:
+            if not isinstance(item, dict):
+                raise ValueError(f"invalid public {kind} selection")
+            selection_kind = item.get("kind")
+            table = "public_categories" if kind == "category" else "public_tags"
+            if selection_kind == "existing" and set(item) == {"kind", "id"}:
+                item_id = item.get("id")
+                row = db.execute(
+                    f"SELECT id,name FROM {table} WHERE id=? AND status='active'", (item_id,),
+                ).fetchone()
+                if row is None:
+                    raise FileNotFoundError(str(item_id))
+                return {"kind": "existing", "id": row["id"], "name": row["name"]}
+            if selection_kind == "proposal" and set(item) == {"kind", "name"}:
+                name, normalized = normalize_taxonomy_name(item.get("name"), kind=kind)
+                row = db.execute(
+                    f"SELECT id,name,status FROM {table} WHERE normalized_name=?", (normalized,),
+                ).fetchone()
+                if row is not None and row["status"] == "active":
+                    return {"kind": "existing", "id": row["id"], "name": row["name"]}
+                key = hashlib.sha256(f"{kind}:{normalized}".encode()).hexdigest()[:20]
+                return {"kind": "proposal", "key": key, "name": name, "normalized_name": normalized}
+            raise ValueError(f"invalid public {kind} selection")
+
+        category = canonical(payload.get("category"), "category")
+        raw_tags = payload.get("tags", [])
+        if not isinstance(raw_tags, list) or len(raw_tags) > 3:
+            raise ValueError("public tags must contain at most three items")
+        tags: list[dict] = []
+        seen: set[str] = set()
+        for item in raw_tags:
+            value = canonical(item, "tag")
+            identity = value.get("id") or value["normalized_name"]
+            if identity not in seen:
+                seen.add(identity)
+                tags.append(value)
+        return {"version": 1, "category": category, "tags": tags}
+
+    @staticmethod
+    def _resolve_taxonomy_decision(
+        db: sqlite3.Connection,
+        taxonomy: dict,
+        decision: dict | None,
+        actor_id: str,
+        now: str,
+    ) -> tuple[str, list[str], dict]:
+        resolutions = decision.get("resolutions", {}) if isinstance(decision, dict) else {}
+        if not isinstance(resolutions, dict):
+            raise ValueError("invalid taxonomy decision")
+
+        def resolve(item: dict, kind: str) -> tuple[str, dict]:
+            table = "public_categories" if kind == "category" else "public_tags"
+            if item["kind"] == "existing":
+                row = db.execute(
+                    f"SELECT id FROM {table} WHERE id=? AND status='active'", (item["id"],),
+                ).fetchone()
+                if row is None:
+                    raise FileNotFoundError(item["id"])
+                return row["id"], {"kind": kind, "action": "accept", "id": row["id"]}
+            resolution = resolutions.get(item["key"])
+            if not isinstance(resolution, dict) or resolution.get("action") not in {"create", "map"}:
+                raise ValueError("all taxonomy proposals require an Admin decision")
+            if resolution["action"] == "map":
+                target_id = resolution.get("target_id")
+                row = db.execute(
+                    f"SELECT id FROM {table} WHERE id=? AND status='active'", (target_id,),
+                ).fetchone()
+                if row is None:
+                    raise FileNotFoundError(str(target_id))
+                return row["id"], {"kind": kind, "action": "map", "key": item["key"], "id": row["id"]}
+            existing = db.execute(
+                f"SELECT id,status FROM {table} WHERE normalized_name=?", (item["normalized_name"],),
+            ).fetchone()
+            if existing is not None:
+                if existing["status"] != "active":
+                    raise ValueError(f"matching public {kind} is disabled; map or restore it first")
+                return existing["id"], {"kind": kind, "action": "reuse", "key": item["key"], "id": existing["id"]}
+            item_id = uuid.uuid4().hex
+            slug_base = taxonomy_slug(item["name"], kind=kind)
+            slug = slug_base
+            suffix = 2
+            while db.execute(f"SELECT 1 FROM {table} WHERE slug=?", (slug,)).fetchone() is not None:
+                slug = f"{slug_base[:58]}-{suffix}"
+                suffix += 1
+            if kind == "category":
+                db.execute("""
+                    INSERT INTO public_categories(
+                        id,slug,name,normalized_name,description,status,sort_order,created_by,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,'active',0,?,?,?)
+                """, (item_id, slug, item["name"], item["normalized_name"], "", actor_id, now, now))
+            else:
+                db.execute("""
+                    INSERT INTO public_tags(id,slug,name,normalized_name,status,created_at,updated_at)
+                    VALUES(?,?,?,?,'active',?,?)
+                """, (item_id, slug, item["name"], item["normalized_name"], now, now))
+            return item_id, {"kind": kind, "action": "create", "key": item["key"], "id": item_id}
+
+        category_id, category_decision = resolve(taxonomy["category"], "category")
+        tag_ids: list[str] = []
+        decisions = [category_decision]
+        for tag in taxonomy.get("tags", []):
+            tag_id, resolved = resolve(tag, "tag")
+            if tag_id not in tag_ids:
+                tag_ids.append(tag_id)
+                decisions.append(resolved)
+        return category_id, tag_ids, {"version": 1, "resolutions": decisions}
+
     def create_preview(
         self,
         context: SessionContext,
@@ -1965,6 +2079,7 @@ class PlatformStore(SquareMixin):
         article_id: str,
         publication_fingerprint: str,
         snapshot: dict,
+        taxonomy_selection: dict | None = None,
     ) -> dict:
         self.authorize_workspace(context.user_id, context.workspace_id, "wiki.write")
         if not re.fullmatch(r"[a-f0-9]{32}", article_id or ""):
@@ -1986,14 +2101,18 @@ class PlatformStore(SquareMixin):
             self._authorize_workspace_in_transaction(
                 db, context.user_id, context.workspace_id, "wiki.write",
             )
+            taxonomy = None
+            if taxonomy_selection is not None:
+                taxonomy = self._canonicalize_taxonomy_selection(db, taxonomy_selection)
             db.execute("""
                 INSERT INTO share_previews(
                     id,owner_id,workspace_id,article_path,source_revision,content_hash,snapshot_json,
-                    expires_at,created_at,article_id,publication_fingerprint
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    expires_at,created_at,article_id,publication_fingerprint,taxonomy_proposal_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 preview_id, context.user_id, context.workspace_id, article_path, source_revision,
                 content_hash, canonical, expires, now_iso(), article_id, publication_fingerprint,
+                json.dumps(taxonomy, ensure_ascii=False, sort_keys=True) if taxonomy is not None else None,
             ))
             db.commit()
         return {
@@ -2003,6 +2122,7 @@ class PlatformStore(SquareMixin):
             "content_hash": content_hash,
             "publication_fingerprint": publication_fingerprint,
             "snapshot": snapshot,
+            "taxonomy": taxonomy,
         }
 
     def submit_preview(self, context: SessionContext, preview_id: str) -> dict:
@@ -2024,12 +2144,13 @@ class PlatformStore(SquareMixin):
                 INSERT INTO submissions(
                     id,owner_id,workspace_id,status,snapshot_json,content_hash,ai_report_json,reason,
                     reviewer_id,public_entry_id,created_at,updated_at,article_id,article_path,
-                    source_revision,publication_fingerprint
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    source_revision,publication_fingerprint,taxonomy_proposal_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 submission_id, context.user_id, context.workspace_id, "ai_queued", row["snapshot_json"],
                 row["content_hash"], None, None, None, None, now, now, row["article_id"],
                 row["article_path"], row["source_revision"], row["publication_fingerprint"],
+                row["taxonomy_proposal_json"],
             ))
             preview_snapshot = json.loads(row["snapshot_json"])
             square = preview_snapshot.get("square") if isinstance(preview_snapshot.get("square"), dict) else {}
@@ -2064,6 +2185,8 @@ class PlatformStore(SquareMixin):
             "created_at": row["created_at"], "updated_at": row["updated_at"],
             "proposed_public_category_id": row["proposed_public_category_id"],
             "proposed_tags": json.loads(row["proposed_tags_json"] or "[]"),
+            "taxonomy": json.loads(row["taxonomy_proposal_json"]) if row["taxonomy_proposal_json"] else None,
+            "taxonomy_decision": json.loads(row["taxonomy_decision_json"]) if row["taxonomy_decision_json"] else None,
             "reuse_permission": row["reuse_permission"], "link_public_profile": bool(row["link_public_profile"]),
             "duplicate_candidates": json.loads(row["duplicate_candidates_json"] or "[]"),
         }
@@ -2307,6 +2430,11 @@ class PlatformStore(SquareMixin):
         if not changed:
             return None
         snapshot = json.loads(claimed["snapshot_json"])
+        review_snapshot = {
+            key: snapshot.get(key)
+            for key in ("title", "content_status", "markdown", "summary", "attribution", "source_summaries", "public_sources")
+            if key in snapshot
+        }
         candidates = self.duplicate_candidates(snapshot)
         with self.connect() as db:
             db.execute("UPDATE submissions SET duplicate_candidates_json=? WHERE id=? AND review_attempt=?", (
@@ -2314,7 +2442,7 @@ class PlatformStore(SquareMixin):
             ))
         return {
             "id": claimed["id"], "attempt": claimed["review_attempt"], "snapshot": snapshot,
-            "review_input": {"snapshot": snapshot, "duplicate_candidates": candidates},
+            "review_input": {"snapshot": review_snapshot, "duplicate_candidates": candidates},
             "content_hash": claimed["content_hash"],
         }
 
@@ -2389,6 +2517,7 @@ class PlatformStore(SquareMixin):
         self, context: SessionContext, submission_id: str, decision: str, reason: str,
         *, public_category_id: str | None = None, tag_ids: list[str] | None = None,
         duplicate_action: str = "independent",
+        taxonomy_decision: dict | None = None,
     ) -> dict:
         if context.role != "admin":
             raise PermissionError("admin role required")
@@ -2414,6 +2543,7 @@ class PlatformStore(SquareMixin):
             if owner is None or owner["status"] != "active":
                 db.rollback(); raise FileNotFoundError(submission_id)
             self_review = row["owner_id"] == context.user_id
+            resolved_decision = None
             if effective_decision == "approve":
                 entry_id = None
                 version = 1
@@ -2498,15 +2628,21 @@ class PlatformStore(SquareMixin):
                     INSERT INTO public_revision_reviews VALUES(?,?,?,?,?,?,?,?)
                 """, (revision_id, row["ai_policy_version"], row["ai_model"], row["ai_rules_version"],
                       row["ai_report_json"], reason.strip(), context.user_id, now))
-                effective_category = public_category_id or row["proposed_public_category_id"]
+                taxonomy = json.loads(row["taxonomy_proposal_json"]) if row["taxonomy_proposal_json"] else None
+                if taxonomy is not None:
+                    effective_category, effective_tags, resolved_decision = self._resolve_taxonomy_decision(
+                        db, taxonomy, taxonomy_decision, context.user_id, now,
+                    )
+                else:
+                    effective_category = public_category_id or row["proposed_public_category_id"]
+                    effective_tags = tag_ids if tag_ids is not None else json.loads(row["proposed_tags_json"] or "[]")
                 if effective_category and db.execute(
                     "SELECT 1 FROM public_categories WHERE id=? AND status='active'", (effective_category,),
                 ).fetchone() is None:
                     db.rollback(); raise FileNotFoundError(effective_category)
                 db.execute("UPDATE public_entries SET public_category_id=? WHERE id=?", (effective_category, entry_id))
                 db.execute("DELETE FROM public_entry_tags WHERE entry_id=?", (entry_id,))
-                effective_tags = tag_ids if tag_ids is not None else json.loads(row["proposed_tags_json"] or "[]")
-                if len(effective_tags) > 12:
+                if len(effective_tags) > 3:
                     db.rollback(); raise ValueError("too many public tags")
                 for tag_id in dict.fromkeys(effective_tags):
                     if db.execute("SELECT 1 FROM public_tags WHERE id=? AND status='active'", (tag_id,)).fetchone() is None:
@@ -2514,14 +2650,22 @@ class PlatformStore(SquareMixin):
                     db.execute("INSERT INTO public_entry_tags VALUES(?,?)", (entry_id, tag_id))
                 db.execute("""
                     INSERT INTO public_revision_taxonomy(
-                        revision_id,category_id,attribution,change_summary
-                    ) VALUES(?,?,?,?)
+                        revision_id,category_id,attribution,change_summary,category_name,category_slug
+                    ) SELECT ?,?,?,?,name,slug FROM public_categories WHERE id=?
                 """, (
                     revision_id, effective_category, str(snapshot.get("attribution") or "匿名用户")[:120],
-                    "首次发布" if version == 1 else "公开版本更新",
+                    "首次发布" if version == 1 else "公开版本更新", effective_category,
                 ))
                 for tag_id in dict.fromkeys(effective_tags):
-                    db.execute("INSERT INTO public_revision_tags VALUES(?,?)", (revision_id, tag_id))
+                    db.execute("""
+                        INSERT INTO public_revision_tags(revision_id,tag_id,tag_name,tag_slug)
+                        SELECT ?,id,name,slug FROM public_tags WHERE id=?
+                    """, (revision_id, tag_id))
+                if resolved_decision is not None:
+                    db.execute(
+                        "UPDATE submissions SET taxonomy_decision_json=? WHERE id=?",
+                        (json.dumps(resolved_decision, ensure_ascii=False, sort_keys=True), submission_id),
+                    )
                 if version == 1:
                     permission = row["reuse_permission"] if row["reuse_permission"] in REUSE_PERMISSIONS else "view_only"
                     db.execute("""
@@ -2547,6 +2691,7 @@ class PlatformStore(SquareMixin):
             self._audit(db, context.user_id, f"submission.{effective_decision}", "submission", submission_id, {
                 "reason": reason.strip(), "self_review": self_review, "duplicate_action": duplicate_action,
                 "requested_decision": decision,
+                "taxonomy": resolved_decision if effective_decision == "approve" else None,
             })
             db.commit()
         return {"id": submission_id, "status": status, "public_entry_id": entry_id}

@@ -1,23 +1,23 @@
-import { useEffect } from "react"
+import { useEffect, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useNavigate } from "react-router-dom"
 import { BookOpenCheckIcon, Globe2Icon, SparklesIcon } from "lucide-react"
 import { toast } from "sonner"
 
-import { apiPost, queryKeys } from "@/lib/api"
+import { apiGet, apiPost, queryKeys, type PrivateTaxonomy } from "@/lib/api"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
 import { StatusBadge } from "@/components/markdown-content"
+import { CategoryPicker, TagPicker, type TaxonomySelection } from "@/features/taxonomy-picker"
 
 export type GenerationRequest = { keyword: string; from_path?: string; heading?: string; passage?: string }
 
 type Preflight = {
   keyword: string
   existing_path: string | null
-  category_label: string
   local_coverage: { sufficient: boolean; reason: string; evidence_count: number; document_count: number; char_count: number }
   context: { from_path: string; heading: string; passage: string }
   excerpts: { title: string; path: string; text: string }[]
@@ -27,13 +27,20 @@ type Preflight = {
 export function GenerationDialog({ request, onOpenChange }: { request: GenerationRequest | null; onOpenChange: (open: boolean) => void }) {
   const navigate = useNavigate()
   const client = useQueryClient()
+  const [category, setCategory] = useState<TaxonomySelection>({ kind: "inbox", name: "暂不分类" })
+  const [tags, setTags] = useState<TaxonomySelection[]>([])
+  const taxonomy = useQuery({ queryKey: queryKeys.taxonomy, queryFn: () => apiGet<PrivateTaxonomy>("/api/taxonomy"), enabled: Boolean(request) })
   const preflight = useQuery({
     queryKey: ["generate-preflight", request],
     queryFn: () => apiPost<Preflight>("/api/generate/preflight", request as Record<string, unknown>, false),
     enabled: Boolean(request),
   })
   const generate = useMutation({
-    mutationFn: () => apiPost<{ article: { path: string }; task: { id: string } | null }>("/api/generate", request as Record<string, unknown>),
+    mutationFn: () => apiPost<{ article: { path: string }; task: { id: string } | null }>("/api/generate", {
+      ...(request as Record<string, unknown>),
+      category: category.kind === "existing" ? { kind: "existing", id: category.id } : category.kind === "inbox" ? { kind: "inbox" } : { kind: "create", name: category.name },
+      tags: tags.map((tag) => tag.name),
+    }),
     onSuccess: (result) => {
       void client.invalidateQueries({ queryKey: queryKeys.articles })
       void client.invalidateQueries({ queryKey: queryKeys.tasks })
@@ -65,8 +72,7 @@ export function GenerationDialog({ request, onOpenChange }: { request: Generatio
           <Alert variant="destructive"><AlertTitle>无法检查本地资料</AlertTitle><AlertDescription>{preflight.error.message}</AlertDescription></Alert>
         ) : data ? (
           <div className="flex flex-col gap-5">
-            <div className="grid gap-4 border-y py-4 sm:grid-cols-3">
-              <div><div className="text-xs text-muted-foreground">预计分类</div><div className="mt-1 text-sm font-medium">{data.category_label}</div><div className="mt-1 text-xs text-muted-foreground">仅预览，不创建目录</div></div>
+            <div className="grid gap-4 border-y py-4 sm:grid-cols-2">
               <div><div className="text-xs text-muted-foreground">本地证据</div><div className="mt-1"><StatusBadge value={data.local_coverage.sufficient ? "充分" : "不足"} kind={data.local_coverage.sufficient ? "good" : "warn"} /></div></div>
               <div><div className="text-xs text-muted-foreground">证据范围</div><div className="mt-1 text-sm font-medium">{data.local_coverage.document_count} 篇 / {data.local_coverage.char_count} 字</div></div>
             </div>
@@ -75,7 +81,11 @@ export function GenerationDialog({ request, onOpenChange }: { request: Generatio
               <AlertTitle>{data.local_coverage.sufficient ? "直接使用本地资料" : "先建本地草稿，再后台补证"}</AlertTitle>
               <AlertDescription>{data.local_coverage.sufficient ? "该路径不会发起网页请求。" : "阅读不会等待网络；超时、证书、无结果和模型错误会分别记录。"}</AlertDescription>
             </Alert>
-            <Alert><AlertTitle>生成后进入待归类</AlertTitle><AlertDescription>新正本会先保存到待归类目录，AI 基于完整正文给出最多三个候选；实际移动需要你在归类工作台确认。</AlertDescription></Alert>
+            <section className="flex flex-col gap-3">
+              <div><h3 className="text-sm font-medium">分类与标签</h3><p className="mt-1 text-sm text-muted-foreground">可以选择已有项或原地创建；暂不分类会保存到收件箱。</p></div>
+              <CategoryPicker options={(taxonomy.data?.categories ?? []).map((item) => ({ id: item.id, name: item.name }))} value={category} onChange={setCategory} allowInbox />
+              <TagPicker options={(taxonomy.data?.tags ?? []).map((name) => ({ id: name.normalize("NFKC").toLocaleLowerCase(), name }))} value={tags} onChange={setTags} />
+            </section>
             <section>
               <h3 className="mb-2 text-sm font-medium">采用上下文</h3>
               <div className="border-l-2 pl-4 text-sm leading-6 text-muted-foreground">

@@ -184,7 +184,6 @@ export function ArticlePage() {
   const taskState = taskPresentation(data.remote_task)
   const badges = [
     <StatusBadge key="category" value={data.category_label} />,
-    <StatusBadge key="classification" value={data.classification_status === "confirmed" ? "归类已确认" : data.classification_status === "sync_conflict" ? "分类冲突" : "待归类"} kind={data.classification_status === "confirmed" ? "good" : "warn"} />,
     <StatusBadge key="status" value={data.content_status} kind={data.content_status === "词条" ? "good" : data.content_status === "草稿" ? "warn" : "bad"} />,
     <StatusBadge key="complete" value={`结构 ${data.completeness}`} kind={data.completeness === "完整" ? "good" : "warn"} />,
     <StatusBadge key="evidence" value={data.evidence_status} kind={data.evidence_status.includes("待") ? "warn" : "neutral"} />,
@@ -201,7 +200,6 @@ export function ArticlePage() {
       <PageFrame aside={<MetadataPanel article={data} />}>
         <article className="mx-auto max-w-[760px]">
           {data.redirected_from && <Alert className="mb-6"><InfoIcon /><AlertTitle>已跳转到正本</AlertTitle><AlertDescription>旧路径 {data.redirected_from} 仍可访问，当前正本为 {data.path}。</AlertDescription></Alert>}
-          {data.classification_status !== "confirmed" && <Alert className="mb-6"><InfoIcon /><AlertTitle>{data.classification_status === "sync_conflict" ? "分类与磁盘状态存在冲突" : "这篇词条等待归类确认"}</AlertTitle><AlertDescription>正文可以正常阅读，未经确认不会移动文件。{canWrite && <Button className="mt-3" size="sm" variant="outline" render={<Link to={`/classification?article=${data.article_id}`} />}>打开归类工作台</Button>}</AlertDescription></Alert>}
           {data.remote_task && ["queued", "running"].includes(data.remote_task.status) && <Alert className="mb-6"><InfoIcon /><AlertTitle>词条正在生成</AlertTitle><AlertDescription>当前先展示本地草稿；后台任务完成后，本页会自动刷新为生成结果。</AlertDescription></Alert>}
           {data.remote_task?.status === "failed" && <Alert variant="destructive" className="mb-6"><InfoIcon /><AlertTitle>词条生成失败</AlertTitle><AlertDescription>{data.remote_task.error_type || "model_error"} · {data.remote_task.error_message || "请在任务中心重试。"}</AlertDescription></Alert>}
           {data.remote_task?.result?.conflict === true && <Alert className="mb-6"><InfoIcon /><AlertTitle>生成结果未覆盖当前正文</AlertTitle><AlertDescription>生成期间正文发生变化，结果已被冲突保护拦截；请在任务中心基于当前正文重试。</AlertDescription></Alert>}
@@ -229,7 +227,7 @@ export function ArticlePage() {
           <MarkdownContent markdown={content} fromPath={data.path} keywords={keywords.data} onMissingKeyword={canWrite ? (keyword) => setGeneration({ keyword, from_path: data.path }) : undefined} />
         </article>
       </PageFrame>
-      {canWrite && <GenerationDialog request={generation} onOpenChange={(open) => !open && setGeneration(null)} />}
+      {canWrite && <GenerationDialog key={generation ? JSON.stringify(generation) : "closed"} request={generation} onOpenChange={(open) => !open && setGeneration(null)} />}
       {canWrite && <GovernanceDialog key={data.revision} article={data} open={govern} onOpenChange={setGovern} />}
       {canWrite && data.publication.state === "update_available" && <PublicationUpdatePrompt key={updatePromptKey} article={data} />}
       <AlertDialog open={withdrawOpen} onOpenChange={(open) => { setWithdrawOpen(open); if (!open) setWithdrawReason("") }}>
