@@ -679,6 +679,7 @@ class WikiService:
             raise ValueError("invalid status")
         article = self.read_article(rel)
         old_rel = article["path"]
+        operation_identity = article["article_id"] or f"legacy:{revision(article['markdown'])}"
         category = category_item["directory_name"]
         md = cats.ensure_category_header(article["markdown"], category)
         md = dc.ensure_article_metadata(
@@ -713,7 +714,7 @@ class WikiService:
                     changes[f"wiki/{page_rel}"] = updated
         else:
             changes[f"wiki/{old_rel}"] = md
-        operation_seed = "|".join((stable_article_id, old_rel, target_rel, category_item["category_id"], status))
+        operation_seed = "|".join((operation_identity, old_rel, target_rel, category_item["category_id"], status))
         operation_base = f"meta-{hashlib.sha256(operation_seed.encode()).hexdigest()[:20]}"
         operation_id = self._available_operation_id(operation_base)
         path_map = {old_rel: target_rel} if old_rel != target_rel else {}

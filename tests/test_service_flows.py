@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import dynamic_categories as dc
 from wiki_service import WikiService
 from wiki_service import LLMConfig, extract_markdown_article, model_message_text
 
@@ -190,6 +191,42 @@ def test_apply_meta_callback_failure_can_retry_with_a_new_operation(
     assert service.files.operation(retried["operation_id"])["status"] == "committed"
     assert retried["article"]["path"] == "tools/base.md"
     assert calls == 2
+
+
+def test_legacy_apply_meta_retry_keeps_operation_base_when_generated_id_changes(
+    service: WikiService, monkeypatch: pytest.MonkeyPatch,
+):
+    source = service.root / "wiki" / "concepts" / "base.md"
+    source.write_text(
+        "".join(line for line in source.read_text(encoding="utf-8").splitlines(keepends=True)
+                if not line.startswith("> Article-ID:")),
+        encoding="utf-8",
+    )
+    timestamps = iter(("2026-08-17T00:00:00+00:00", "2026-08-17T00:00:02+00:00"))
+    monkeypatch.setattr(dc, "now_iso", lambda: next(timestamps))
+    calls = 0
+
+    def fail_once(_path_map: dict[str, str]) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("projection unavailable")
+
+    service.path_remap_callback = fail_once
+    with pytest.raises(RuntimeError, match="projection unavailable"):
+        service.apply_meta("concepts/base.md", category="tools", status="词条")
+    rolled_back = next(
+        service.files.operation(path.parent.name)
+        for path in service.files.history_root.glob("meta-*/manifest.json")
+    )
+
+    retried = service.apply_meta("concepts/base.md", category="tools", status="词条")
+    committed = service.files.operation(retried["operation_id"])
+
+    assert rolled_back["status"] == "rolled_back"
+    assert retried["operation_id"] == f"{rolled_back['operation_id']}-attempt-2"
+    assert rolled_back["metadata"]["article_id"] != committed["metadata"]["article_id"]
+    assert committed["metadata"]["article_id"] == retried["article"]["article_id"]
 
 
 def test_model_markdown_extractor_accepts_preamble_and_fence():
