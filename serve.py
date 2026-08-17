@@ -132,6 +132,7 @@ class WikiApp:
     dev_origins: set[str] = field(default_factory=set)
     platform: PlatformStore | None = None
     start_worker: bool = True
+    start_public_index_worker: bool | None = None
     remote_search: object = None
     remote_task_kinds: set[str] | None = None
     platform_reviewer: object = None
@@ -154,7 +155,8 @@ class WikiApp:
         self.review_worker = PlatformReviewWorker(
             self.platform, self.platform_reviewer, self.deployment.review_settings,
         ) if self.platform is not None and self.start_worker else None
-        self.public_index_worker = PublicIndexWorker(self.platform) if self.platform is not None and self.start_worker else None
+        start_public_index = self.start_worker if self.start_public_index_worker is None else self.start_public_index_worker
+        self.public_index_worker = PublicIndexWorker(self.platform) if self.platform is not None and start_public_index else None
 
     @property
     def multi_user(self) -> bool:
@@ -461,6 +463,7 @@ def create_app(
     llm_config: LLMConfig | None = None,
     remote_search=None,
     start_worker: bool = True,
+    start_public_index_worker: bool | None = None,
     remote_task_kinds: set[str] | None = None,
     load_environment: bool = False,
     dev_origins: set[str] | None = None,
@@ -489,6 +492,7 @@ def create_app(
         dev_origins=dev_origins or set(),
         platform=platform,
         start_worker=start_worker,
+        start_public_index_worker=start_public_index_worker,
         remote_search=remote_search,
         remote_task_kinds=remote_task_kinds,
         platform_reviewer=platform_reviewer,
@@ -1985,6 +1989,7 @@ def main() -> None:
             load_environment=True,
             dev_origins=dev_origins,
             start_worker=remote_worker_enabled,
+            start_public_index_worker=True,
             remote_task_kinds=configured_kinds or None,
             multi_user=True,
             deployment_config=deployment,

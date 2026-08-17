@@ -1,11 +1,13 @@
 import json
 import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from platform_store import PlatformStore
 from publication import snapshot_fingerprint
+from serve import create_app
 from square_v2 import PublicIndexWorker, REUSE_POLICY_VERSION, canonical_public_url, safe_public_url
 from wiki_service import WikiService
 
@@ -153,6 +155,164 @@ def test_public_index_worker_retries_pending_projection_without_restart(square, 
     finally:
         worker.close()
     assert store.search_public(query="Worker retry")["items"][0]["id"] == approved["public_entry_id"]
+
+
+def test_public_index_worker_can_run_when_remote_workers_are_disabled(tmp_path):
+    app = create_app(
+        tmp_path, tmp_path / "viewer", multi_user=True,
+        start_worker=False, start_public_index_worker=True,
+    )
+    try:
+        assert app.review_worker is None
+        assert app.public_index_worker is not None
+        assert app.public_index_worker._thread.is_alive()
+    finally:
+        app.close()
+
+
+def test_public_index_worker_dead_letters_dirty_job_and_keeps_running(square):
+    store, context, category, _tag = square
+    approved = _publish(
+        store, context, _snapshot("Dirty index job", "Runtime corruption", category_id=category["id"]),
+        article_id="9" * 32, source_revision="dirty-job", category_id=category["id"],
+    )
+    entry_id = approved["public_entry_id"]
+    with store.connect() as db:
+        db.execute("""
+            INSERT INTO public_index_jobs(entry_id,status,attempts,last_error,not_before,updated_at)
+            VALUES(?,'pending','not-an-integer',NULL,NULL,'2026-01-01T00:00:00+00:00')
+        """, (entry_id,))
+
+    worker = PublicIndexWorker(store)
+    try:
+        worker.wake()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            with store.connect() as db:
+                job = db.execute(
+                    "SELECT status,last_error FROM public_index_jobs WHERE entry_id=?", (entry_id,),
+                ).fetchone()
+            if job is not None and job["status"] == "dead":
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail("dirty public index job was not dead-lettered")
+        assert job["last_error"] == "invalid index job state"
+        assert worker._thread.is_alive()
+    finally:
+        worker.close()
+
+
+def test_public_index_claim_compares_non_utc_schedule_by_instant(square):
+    store, context, category, _tag = square
+    approved = _publish(
+        store, context, _snapshot("Offset schedule", "Timezone semantics", category_id=category["id"]),
+        article_id="8" * 32, source_revision="offset-job", category_id=category["id"],
+    )
+    entry_id = approved["public_entry_id"]
+    with store.connect() as db:
+        db.execute("""
+            INSERT INTO public_index_jobs(entry_id,status,attempts,last_error,not_before,updated_at)
+            VALUES(?,'retry',1,NULL,'2026-01-01T10:00:00+08:00','2026-01-01T00:00:00+00:00')
+        """, (entry_id,))
+
+    assert store.claim_public_index_job() == {"entry_id": entry_id, "attempt": 2}
+
+
+def test_public_index_claim_normalizes_future_offset_schedule_without_running_it(square):
+    store, context, category, _tag = square
+    approved = _publish(
+        store, context, _snapshot("Future schedule", "Timezone normalization", category_id=category["id"]),
+        article_id="3" * 32, source_revision="future-offset", category_id=category["id"],
+    )
+    entry_id = approved["public_entry_id"]
+    future = datetime.now(timezone(timedelta(hours=8))) + timedelta(days=1)
+    with store.connect() as db:
+        db.execute("""
+            INSERT INTO public_index_jobs(entry_id,status,attempts,last_error,not_before,updated_at)
+            VALUES(?,'retry',1,NULL,?,'2026-01-01T08:00:00+08:00')
+        """, (entry_id, future.isoformat(timespec="seconds")))
+
+    assert store.claim_public_index_job() is None
+    with store.connect() as db:
+        job = db.execute(
+            "SELECT status,not_before,updated_at FROM public_index_jobs WHERE entry_id=?", (entry_id,),
+        ).fetchone()
+    assert job["status"] == "retry"
+    assert job["not_before"].endswith("+00:00")
+    assert job["updated_at"] == "2026-01-01T00:00:00+00:00"
+
+
+def test_public_index_claim_recovers_offset_running_lease_and_dead_letters_bad_lease(square):
+    store, context, category, _tag = square
+    stale = _publish(
+        store, context, _snapshot("Stale lease", "Offset timestamp", category_id=category["id"]),
+        article_id="7" * 32, source_revision="stale-lease", category_id=category["id"],
+    )["public_entry_id"]
+    malformed = _publish(
+        store, context, _snapshot("Bad lease", "Malformed timestamp", category_id=category["id"]),
+        article_id="6" * 32, source_revision="bad-lease", category_id=category["id"],
+    )["public_entry_id"]
+    stale_at = datetime.now(timezone(timedelta(hours=8))) - timedelta(minutes=6)
+    with store.connect() as db:
+        db.executemany("""
+            INSERT INTO public_index_jobs(entry_id,status,attempts,last_error,not_before,updated_at)
+            VALUES(?,'running',1,NULL,NULL,?)
+        """, [(stale, stale_at.isoformat(timespec="seconds")), (malformed, "not-a-date")])
+
+    assert store.claim_public_index_job() == {"entry_id": stale, "attempt": 2}
+    with store.connect() as db:
+        bad = db.execute(
+            "SELECT status,last_error FROM public_index_jobs WHERE entry_id=?", (malformed,),
+        ).fetchone()
+    assert dict(bad) == {"status": "dead", "last_error": "invalid index job state"}
+
+
+def test_public_index_worker_survives_projection_runtime_error_and_processes_next_job(square, monkeypatch):
+    store, context, category, _tag = square
+    failed = _publish(
+        store, context, _snapshot("Runtime failure", "First job", category_id=category["id"]),
+        article_id="5" * 32, source_revision="runtime-failure", category_id=category["id"],
+    )["public_entry_id"]
+    following = _publish(
+        store, context, _snapshot("Following job", "Second job", category_id=category["id"]),
+        article_id="4" * 32, source_revision="following-job", category_id=category["id"],
+    )["public_entry_id"]
+    now = "2026-01-01T00:00:00+00:00"
+    with store.connect() as db:
+        db.executemany("""
+            INSERT INTO public_index_jobs(entry_id,status,attempts,last_error,not_before,updated_at)
+            VALUES(?,'pending',0,NULL,NULL,?)
+        """, [(failed, now), (following, now)])
+    original = store._sync_square_entry
+
+    def fail_one(db, entry_id):
+        if entry_id == failed:
+            raise RuntimeError("unexpected projection failure")
+        return original(db, entry_id)
+
+    monkeypatch.setattr(store, "_sync_square_entry", fail_one)
+    worker = PublicIndexWorker(store)
+    try:
+        worker.wake()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            with store.connect() as db:
+                first = db.execute(
+                    "SELECT status,last_error FROM public_index_jobs WHERE entry_id=?", (failed,),
+                ).fetchone()
+                second = db.execute(
+                    "SELECT 1 FROM public_index_jobs WHERE entry_id=?", (following,),
+                ).fetchone()
+            if first is not None and first["status"] == "retry" and second is None:
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail("worker did not isolate the failed job and process the next job")
+        assert "unexpected projection failure" in first["last_error"]
+        assert worker._thread.is_alive()
+    finally:
+        worker.close()
 
 
 def test_public_dto_does_not_leak_private_snapshot_fields_and_snapshot_is_immutable(square):

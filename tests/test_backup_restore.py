@@ -290,6 +290,7 @@ def test_backup_accepts_normal_merged_public_category(tmp_path: Path):
         ("invalid", 0, None),
         ("pending", -1, None),
         ("retry", 1, "not-a-date"),
+        ("retry", 1, "2026-01-01T10:00:00+08:00"),
     ],
 )
 def test_backup_rejects_invalid_public_index_job_values(

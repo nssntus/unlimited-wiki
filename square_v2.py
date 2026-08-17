@@ -526,19 +526,70 @@ class SquareMixin:
             return False
 
     def claim_public_index_job(self) -> dict | None:
-        now = _now()
-        stale = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(timespec="seconds")
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat(timespec="seconds")
+        stale = now_dt - timedelta(minutes=5)
+
+        def job_time(value: Any) -> datetime:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError
+            return parsed.astimezone(timezone.utc)
+
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            db.execute("""
-                UPDATE public_index_jobs SET status='retry',not_before=?,updated_at=?
-                WHERE status='running' AND updated_at<?
-            """, (now, now, stale))
-            row = db.execute("""
-                SELECT entry_id,attempts FROM public_index_jobs
-                WHERE status IN ('pending','retry') AND (not_before IS NULL OR not_before<=?)
-                ORDER BY updated_at,entry_id LIMIT 1
-            """, (now,)).fetchone()
+            for running in db.execute(
+                "SELECT entry_id,updated_at FROM public_index_jobs WHERE status='running'",
+            ):
+                try:
+                    updated_at = job_time(running["updated_at"])
+                    is_stale = updated_at < stale
+                except (OverflowError, TypeError, ValueError):
+                    db.execute("""
+                        UPDATE public_index_jobs
+                        SET status='dead',last_error=?,not_before=NULL,updated_at=? WHERE entry_id=?
+                    """, ("invalid index job state", now, running["entry_id"]))
+                    continue
+                if is_stale:
+                    db.execute("""
+                        UPDATE public_index_jobs SET status='retry',not_before=?,updated_at=? WHERE entry_id=?
+                    """, (now, now, running["entry_id"]))
+                elif str(running["updated_at"]) != updated_at.isoformat(timespec="seconds"):
+                    db.execute(
+                        "UPDATE public_index_jobs SET updated_at=? WHERE entry_id=?",
+                        (updated_at.isoformat(timespec="seconds"), running["entry_id"]),
+                    )
+            row = None
+            for candidate in db.execute("""
+                SELECT entry_id,attempts,typeof(attempts) attempt_type,not_before,updated_at
+                FROM public_index_jobs WHERE status IN ('pending','retry')
+                ORDER BY updated_at,entry_id
+            """):
+                try:
+                    attempts = int(candidate["attempts"])
+                    if candidate["attempt_type"] != "integer" or attempts < 0:
+                        raise ValueError
+                    updated_at = job_time(candidate["updated_at"])
+                    if candidate["not_before"] is not None:
+                        not_before = job_time(candidate["not_before"])
+                        if not_before > now_dt:
+                            db.execute("""
+                                UPDATE public_index_jobs SET not_before=?,updated_at=? WHERE entry_id=?
+                            """, (
+                                not_before.isoformat(timespec="seconds"),
+                                updated_at.isoformat(timespec="seconds"),
+                                candidate["entry_id"],
+                            ))
+                            continue
+                except (OverflowError, TypeError, ValueError):
+                    db.execute("""
+                        UPDATE public_index_jobs
+                        SET status='dead',attempts=0,last_error=?,not_before=NULL,updated_at=?
+                        WHERE entry_id=?
+                    """, ("invalid index job state", now, candidate["entry_id"]))
+                    continue
+                row = candidate
+                break
             if row is None:
                 db.commit(); return None
             attempt = int(row["attempts"]) + 1
@@ -563,7 +614,7 @@ class SquareMixin:
                 db.execute("DELETE FROM public_index_jobs WHERE entry_id=? AND attempts=?", (entry_id, attempt))
                 db.commit()
             return True
-        except (sqlite3.Error, ValueError, TypeError, json.JSONDecodeError) as exc:
+        except Exception as exc:
             status = "dead" if attempt >= 5 else "retry"
             next_time = None if status == "dead" else (
                 datetime.now(timezone.utc) + timedelta(seconds=min(300, 2 ** attempt))
@@ -1548,7 +1599,7 @@ class PublicIndexWorker:
         while not self._stop.is_set():
             try:
                 job = self.store.claim_public_index_job()
-            except sqlite3.Error:
+            except (sqlite3.Error, TypeError, ValueError):
                 self._wake.wait(1)
                 self._wake.clear()
                 continue
@@ -1556,4 +1607,8 @@ class PublicIndexWorker:
                 self._wake.wait(1)
                 self._wake.clear()
                 continue
-            self.store.process_public_index_job(job["entry_id"], job["attempt"])
+            try:
+                self.store.process_public_index_job(job["entry_id"], job["attempt"])
+            except Exception:
+                self._wake.wait(1)
+                self._wake.clear()

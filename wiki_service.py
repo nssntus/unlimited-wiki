@@ -380,15 +380,22 @@ class WikiService:
             if manifest.get("status") != "committed":
                 continue
             recovered_paths: dict[str, str] = {}
+            article_id = manifest.get("metadata", {}).get("article_id")
             for old, new in manifest.get("metadata", {}).get("path_map", {}).items():
-                if not (self.root / "wiki" / new).is_file():
+                if not article_id and not (self.root / "wiki" / new).is_file():
                     continue
                 try:
-                    current = self.read_article(new)
-                except (FileNotFoundError, ValueError):
+                    resolved = self.resolve_article_id(article_id) if article_id else self.read_article(new)
+                    current = self.read_article(resolved["path"])
+                    if article_id and current.get("article_id") != article_id:
+                        continue
+                except (FileNotFoundError, RuntimeError, ValueError):
                     current = None
-                self.state.remap_article_path(old, new, base_revision=current["revision"] if current else None)
-                recovered_paths[old] = new
+                if current is None:
+                    continue
+                current_path = current["path"]
+                self.state.remap_article_path(old, current_path, base_revision=current["revision"])
+                recovered_paths[old] = current_path
             if recovered_paths and self.path_remap_callback is not None:
                 self.path_remap_callback(recovered_paths)
 
@@ -409,6 +416,17 @@ class WikiService:
                     restored = None
                 self.state.remap_article_path(new, old, base_revision=restored["revision"] if restored else None)
             raise
+
+    def _available_operation_id(self, operation_base: str) -> str:
+        operation_id = operation_base
+        attempt = 1
+        while True:
+            try:
+                self.files.operation(operation_id)
+            except FileNotFoundError:
+                return operation_id
+            attempt += 1
+            operation_id = f"{operation_base}-attempt-{attempt}"
 
     def articles(self) -> list[dict]:
         rows = []
@@ -646,6 +664,10 @@ class WikiService:
         return {"created": True, "task": task, "classification_task": classification_task, "article": article, "operation_id": manifest["operation_id"], "preflight": preflight}
 
     def apply_meta(self, rel: str, *, category: str, status: str) -> dict:
+        with self._intent_lock:
+            return self._apply_meta_locked(rel, category=category, status=status)
+
+    def _apply_meta_locked(self, rel: str, *, category: str, status: str) -> dict:
         registry = dc.load_registry(self.root)
         category_item = next(
             (item for item in registry["categories"] if item["category_id"] == category or item["directory_name"] == category),
@@ -688,14 +710,26 @@ class WikiService:
                     changes[f"wiki/{page_rel}"] = updated
         else:
             changes[f"wiki/{old_rel}"] = md
-        operation_id = f"meta-{hashlib.sha256((old_rel + target_rel + revision(md)).encode()).hexdigest()[:20]}"
+        operation_base = f"meta-{hashlib.sha256((old_rel + target_rel + revision(md)).encode()).hexdigest()[:20]}"
+        operation_id = self._available_operation_id(operation_base)
+        path_map = {old_rel: target_rel} if old_rel != target_rel else {}
         log_path = self.root / "wiki" / "log.md"
         changes["wiki/index.md"] = render_index(self.root, changes)
         changes["wiki/log.md"] = append_log_text(log_path.read_text(encoding="utf-8") if log_path.exists() else "", operation_id=operation_id, kind="govern", title=article["title"])
-        self.files.commit(changes, kind="meta", metadata={"source": old_rel, "target": target_rel}, operation_id=operation_id)
+        self.files.commit(
+            changes,
+            kind="meta",
+            metadata={
+                "source": old_rel,
+                "target": target_rel,
+                "path_map": path_map,
+                "article_id": article["article_id"],
+            },
+            operation_id=operation_id,
+        )
         updated = self.read_article(target_rel)
-        if old_rel != target_rel:
-            self._remap_committed_paths(operation_id, {old_rel: target_rel})
+        if path_map:
+            self._remap_committed_paths(operation_id, path_map)
         else:
             self.state.remap_article_path(old_rel, target_rel, base_revision=updated["revision"])
         return {"operation_id": operation_id, "article": updated}
@@ -755,14 +789,7 @@ class WikiService:
                         operation_id = str(manifest.get("operation_id") or operation_id)
                         break
                 return {"operation_id": operation_id, "article": article, "replay": True}
-            attempt = 1
-            while True:
-                try:
-                    self.files.operation(operation_id)
-                except FileNotFoundError:
-                    break
-                attempt += 1
-                operation_id = f"{operation_base}-attempt-{attempt}"
+            operation_id = self._available_operation_id(operation_base)
             snapshot = intent["snapshot"]
             markdown = str(snapshot.get("markdown") or "")
             if not kw.parse_title(markdown):

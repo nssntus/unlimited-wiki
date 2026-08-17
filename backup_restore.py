@@ -652,6 +652,7 @@ def _check_application_schema(db: sqlite3.Connection, path: Path) -> list[str]:
             "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='public_index_jobs'",
         ).fetchone()
         if jobs_table is not None:
+            canonical_utc = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00")
             for row in db.execute(
                 "SELECT status,attempts,typeof(attempts),not_before,updated_at FROM public_index_jobs",
             ):
@@ -661,11 +662,13 @@ def _check_application_schema(db: sqlite3.Connection, path: Path) -> list[str]:
                     if row[2] != "integer" or int(row[1]) < 0:
                         raise ValueError
                     if row[3] is not None:
-                        not_before = datetime.fromisoformat(str(row[3]).replace("Z", "+00:00"))
-                        if not_before.tzinfo is None:
+                        not_before_text = str(row[3])
+                        not_before = datetime.fromisoformat(not_before_text)
+                        if not canonical_utc.fullmatch(not_before_text) or not_before.utcoffset() != timezone.utc.utcoffset(None):
                             raise ValueError
-                    updated_at = datetime.fromisoformat(str(row[4]).replace("Z", "+00:00"))
-                    if updated_at.tzinfo is None:
+                    updated_at_text = str(row[4])
+                    updated_at = datetime.fromisoformat(updated_at_text)
+                    if not canonical_utc.fullmatch(updated_at_text) or updated_at.utcoffset() != timezone.utc.utcoffset(None):
                         raise ValueError
                 except (TypeError, ValueError):
                     raise RuntimeError("platform SQLite has invalid public index jobs") from None
