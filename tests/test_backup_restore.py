@@ -211,6 +211,38 @@ def install_session_delete_blocker(database: Path, blocker: str) -> None:
     Path(f"{database}-shm").unlink(missing_ok=True)
 
 
+def assert_backup_contract_rejects(source: Path, tmp_path: Path, match: str) -> None:
+    with pytest.raises((RuntimeError, sqlite3.DatabaseError), match=match):
+        create_backup(source, tmp_path / "invalid-source-backup")
+
+    forged = tmp_path / "forged-backup"
+    forged.mkdir()
+    backup_restore._copy_source_data(source, forged)
+    write_manifest(forged)
+    with pytest.raises((RuntimeError, sqlite3.DatabaseError), match=match):
+        verify_backup(forged)
+    target = tmp_path / "target"
+    with pytest.raises((RuntimeError, sqlite3.DatabaseError), match=match):
+        restore_backup(forged, target)
+    assert not (target / ".platform").exists()
+    assert not (target / "spaces").exists()
+
+
+def assert_correctness_index(db: sqlite3.Connection, name: str) -> None:
+    expected = backup_restore.PLATFORM_CORRECTNESS_INDEXES[name]
+    row = db.execute(
+        "SELECT tbl_name,sql FROM sqlite_schema WHERE type='index' AND name=?", (name,),
+    ).fetchone()
+    assert row is not None
+    index = next(item for item in db.execute(f'PRAGMA index_list("{row[0]}")') if item[1] == name)
+    columns = tuple(item[2] for item in db.execute(f'PRAGMA index_info("{name}")'))
+    assert row[0] == expected["table"]
+    assert index[2] == 1
+    assert bool(index[4]) == (expected["predicate"] is not None)
+    assert columns == expected["columns"]
+    assert backup_restore._normalized_index_predicate(row[1]) == expected["predicate"]
+
+
 def test_backup_verify_and_restore_round_trip(tmp_path: Path):
     source = tmp_path / "source"
     source.mkdir()
@@ -338,6 +370,137 @@ def test_backup_rejects_malformed_optional_application_tables(tmp_path: Path, da
             db.execute("CREATE TABLE classification_suggestions(dummy TEXT)")
     with pytest.raises(RuntimeError, match="SQLite schema is unsupported"):
         create_backup(source, tmp_path / "invalid-backup")
+
+
+@pytest.mark.parametrize(
+    ("name", "replacement"),
+    [
+        (
+            "idx_workspace_members_default",
+            "CREATE UNIQUE INDEX idx_workspace_members_default "
+            "ON workspace_members(user_id) WHERE status='active'",
+        ),
+        (
+            "idx_workspace_invitation_pending",
+            "CREATE UNIQUE INDEX idx_workspace_invitation_pending "
+            "ON workspace_invitations(invitee_user_id) WHERE status='pending'",
+        ),
+        (
+            "idx_public_entries_source_article",
+            "CREATE UNIQUE INDEX idx_public_entries_source_article "
+            "ON public_entries(author_id,source_article_id) WHERE source_article_id IS NOT NULL",
+        ),
+    ],
+)
+def test_backup_rejects_incorrect_named_correctness_indexes(
+    tmp_path: Path, name: str, replacement: str,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, _user, _article, _raw = seed_instance(source)
+    with platform.connect() as db:
+        db.execute(f'DROP INDEX "{name}"')
+        db.execute(replacement)
+    assert_backup_contract_rejects(source, tmp_path, "invalid correctness index")
+
+
+def test_backup_rejects_incorrect_legacy_workspace_identity_index(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    seed_minimum_legacy_instance(source)
+    with sqlite3.connect(source / ".platform" / "platform.sqlite3") as db:
+        db.execute("ALTER TABLE workspaces ADD COLUMN organization_id TEXT")
+        db.execute("CREATE INDEX idx_workspaces_org_identity ON workspaces(display_name)")
+    assert_backup_contract_rejects(source, tmp_path, "invalid correctness index")
+
+
+def test_missing_correctness_indexes_are_migrated_when_data_is_valid(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, _user, _article, _raw = seed_instance(source)
+    with platform.connect() as db:
+        for name in backup_restore.PLATFORM_CORRECTNESS_INDEXES:
+            db.execute(f'DROP INDEX "{name}"')
+
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    verify_backup(backup)
+    target = tmp_path / "target"
+    restore_backup(backup, target)
+    restored = PlatformStore(target)
+    with restored.connect() as db:
+        for name in backup_restore.PLATFORM_CORRECTNESS_INDEXES:
+            assert_correctness_index(db, name)
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    ["workspace_default", "pending_invitation", "public_source_article"],
+)
+def test_backup_rejects_data_that_prevents_required_index_migration(
+    tmp_path: Path, conflict: str,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    timestamp = "2026-01-01T00:00:00Z"
+    with platform.connect() as db:
+        workspace = db.execute(
+            "SELECT organization_id FROM workspaces WHERE id=?", (user["workspace_id"],),
+        ).fetchone()
+        organization_id = workspace[0]
+        if conflict == "workspace_default":
+            db.execute("DROP INDEX idx_workspace_members_default")
+            second_workspace = "c" * 32
+            db.execute(
+                "INSERT INTO workspaces "
+                "(id,owner_id,organization_id,root_name,display_name,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'active',?,?)",
+                (
+                    second_workspace, user["id"], organization_id, second_workspace,
+                    "Second", timestamp, timestamp,
+                ),
+            )
+            db.execute(
+                "INSERT INTO workspace_members "
+                "(organization_id,workspace_id,user_id,role,status,is_default,added_by,created_at,updated_at) "
+                "VALUES(?,?,?,'owner','active',1,?,?,?)",
+                (organization_id, second_workspace, user["id"], user["id"], timestamp, timestamp),
+            )
+            workspace_root = source / "spaces" / second_workspace
+            (workspace_root / "wiki").mkdir(parents=True)
+            (workspace_root / "raw").mkdir()
+        elif conflict == "pending_invitation":
+            db.execute("DROP INDEX idx_workspace_invitation_pending")
+            invitee_id = "d" * 32
+            db.execute(
+                "INSERT INTO users(id,email,nickname,password_hash,role,status,created_at) "
+                "VALUES(?,?,?,'unused','user','active',?)",
+                (invitee_id, "invitee@example.com", "Invitee", timestamp),
+            )
+            for invitation_id in ("e" * 32, "f" * 32):
+                db.execute(
+                    "INSERT INTO workspace_invitations "
+                    "(id,organization_id,workspace_id,invitee_user_id,role,status,invited_by,expires_at,created_at,updated_at) "
+                    "VALUES(?,?,?,?,'viewer','pending',?,?,?,?)",
+                    (
+                        invitation_id, organization_id, user["workspace_id"], invitee_id,
+                        user["id"], "2027-01-01T00:00:00Z", timestamp, timestamp,
+                    ),
+                )
+        else:
+            db.execute("DROP INDEX idx_public_entries_source_article")
+            for entry_id in ("1" * 32, "2" * 32):
+                db.execute(
+                    "INSERT INTO public_entries "
+                    "(id,author_id,status,current_revision_id,created_at,updated_at,source_workspace_id,source_article_id) "
+                    "VALUES(?,?,'published',NULL,?,?,?,?)",
+                    (
+                        entry_id, user["id"], timestamp, timestamp,
+                        user["workspace_id"], "3" * 32,
+                    ),
+                )
+    assert_backup_contract_rejects(source, tmp_path, "cannot create required correctness indexes")
 
 
 def test_backup_restores_migratable_legacy_platform_idempotency_schema(tmp_path: Path):

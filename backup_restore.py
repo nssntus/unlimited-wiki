@@ -195,6 +195,37 @@ WORKSPACE_TEXT_IDENTITY_COLUMNS = {
     "classification_previews": {"id"},
     "reconciliation_items": {"id", "fingerprint"},
 }
+PLATFORM_CORRECTNESS_INDEXES = {
+    "idx_workspaces_org_identity": {
+        "table": "workspaces",
+        "columns": ("id", "organization_id"),
+        "predicate": None,
+        "sql": "CREATE UNIQUE INDEX idx_workspaces_org_identity "
+        "ON workspaces(id, organization_id)",
+    },
+    "idx_workspace_members_default": {
+        "table": "workspace_members",
+        "columns": ("user_id",),
+        "predicate": "is_default=1andstatus='active'",
+        "sql": "CREATE UNIQUE INDEX idx_workspace_members_default "
+        "ON workspace_members(user_id) WHERE is_default=1 AND status='active'",
+    },
+    "idx_workspace_invitation_pending": {
+        "table": "workspace_invitations",
+        "columns": ("workspace_id", "invitee_user_id"),
+        "predicate": "status='pending'",
+        "sql": "CREATE UNIQUE INDEX idx_workspace_invitation_pending "
+        "ON workspace_invitations(workspace_id,invitee_user_id) WHERE status='pending'",
+    },
+    "idx_public_entries_source_article": {
+        "table": "public_entries",
+        "columns": ("author_id", "source_workspace_id", "source_article_id"),
+        "predicate": "source_workspace_idisnotnullandsource_article_idisnotnull",
+        "sql": "CREATE UNIQUE INDEX idx_public_entries_source_article "
+        "ON public_entries(author_id,source_workspace_id,source_article_id) "
+        "WHERE source_workspace_id IS NOT NULL AND source_article_id IS NOT NULL",
+    },
+}
 
 
 def instance_lock_path(project_root: Path) -> Path:
@@ -300,7 +331,60 @@ def _is_sqlite_sidecar(root: Path, path: Path) -> bool:
     return False
 
 
-def _check_application_schema(db: sqlite3.Connection, path: Path) -> None:
+def _normalized_index_predicate(sql: str | None) -> str | None:
+    if not sql:
+        return None
+    match = re.search(r"\bWHERE\b(.+)$", sql, flags=re.IGNORECASE | re.DOTALL)
+    if match is None:
+        return None
+    predicate = re.sub(r'[\s"`\[\]();]', "", match.group(1))
+    return predicate.casefold()
+
+
+def _check_platform_correctness_indexes(db: sqlite3.Connection) -> list[str]:
+    missing = []
+    for name, expected in PLATFORM_CORRECTNESS_INDEXES.items():
+        row = db.execute(
+            "SELECT type,tbl_name,sql FROM sqlite_schema WHERE name=?", (name,),
+        ).fetchone()
+        if row is not None:
+            if row[0] != "index":
+                raise RuntimeError(f"platform SQLite schema has an invalid correctness index: {name}")
+            table = str(row[1])
+            index_rows = list(db.execute(f'PRAGMA index_list("{table}")'))
+            index = next((item for item in index_rows if str(item[1]) == name), None)
+            columns = tuple(
+                str(item[2]) for item in sorted(
+                    db.execute(f'PRAGMA index_info("{name}")'), key=lambda item: item[0],
+                )
+            )
+            expected_partial = expected["predicate"] is not None
+            if (
+                table != expected["table"]
+                or index is None
+                or not index[2]
+                or bool(index[4]) != expected_partial
+                or columns != expected["columns"]
+                or _normalized_index_predicate(row[2]) != expected["predicate"]
+            ):
+                raise RuntimeError(f"platform SQLite schema has an invalid correctness index: {name}")
+            continue
+
+        table = str(expected["table"])
+        schema_type = db.execute(
+            "SELECT type FROM sqlite_schema WHERE name=?", (table,),
+        ).fetchone()
+        if schema_type is None:
+            continue
+        columns = {str(item[1]) for item in db.execute(f'PRAGMA table_info("{table}")')}
+        if not set(expected["columns"]).issubset(columns):
+            continue
+        missing.append(expected["sql"])
+
+    return missing
+
+
+def _check_application_schema(db: sqlite3.Connection, path: Path) -> list[str]:
     anchors = PLATFORM_SCHEMA_ANCHORS if path.parent.name == ".platform" else WORKSPACE_SCHEMA_ANCHORS
     primary_keys = PLATFORM_PRIMARY_KEYS if anchors is PLATFORM_SCHEMA_ANCHORS else WORKSPACE_PRIMARY_KEYS
     unique_keys = PLATFORM_UNIQUE_KEYS if anchors is PLATFORM_SCHEMA_ANCHORS else {}
@@ -373,6 +457,9 @@ def _check_application_schema(db: sqlite3.Connection, path: Path) -> None:
         expected_unique_keys = unique_keys.get(table, optional_unique.get(table, set()))
         if not expected_unique_keys.issubset(actual_unique_keys):
             raise RuntimeError(f"{label} SQLite schema is missing a unique constraint: {table}")
+    if anchors is PLATFORM_SCHEMA_ANCHORS:
+        return _check_platform_correctness_indexes(db)
+    return []
 
 
 def _exercise_session_revocation(db: sqlite3.Connection, *, commit: bool) -> None:
@@ -426,10 +513,26 @@ def _check_sqlite(path: Path, *, checkpoint: bool) -> None:
         result = db.execute("PRAGMA integrity_check").fetchone()[0]
         if result != "ok":
             raise RuntimeError(f"SQLite integrity check failed: {path.name}")
-        if db.execute("PRAGMA foreign_key_check").fetchone() is not None:
-            raise RuntimeError(f"SQLite foreign key check failed: {path.name}")
-        _check_application_schema(db, path)
-        _check_platform_restore_actions(db, path)
+        missing_indexes = _check_application_schema(db, path)
+        checked_db = db
+        probe = None
+        if missing_indexes:
+            probe = sqlite3.connect(":memory:")
+            try:
+                db.backup(probe)
+                for statement in missing_indexes:
+                    probe.execute(statement)
+            except sqlite3.DatabaseError as exc:
+                probe.close()
+                raise RuntimeError("platform SQLite cannot create required correctness indexes") from exc
+            checked_db = probe
+        try:
+            if checked_db.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise RuntimeError(f"SQLite foreign key check failed: {path.name}")
+            _check_platform_restore_actions(checked_db, path)
+        finally:
+            if probe is not None:
+                probe.close()
     if checkpoint:
         wal = Path(f"{path}-wal")
         if wal.exists() and wal.stat().st_size:
@@ -827,6 +930,9 @@ def _prepare_restore_stage(
     verify_backup(stage)
     platform_db = stage / ".platform" / "platform.sqlite3"
     with sqlite3.connect(platform_db) as db:
+        for statement in _check_platform_correctness_indexes(db):
+            db.execute(statement)
+        db.commit()
         _exercise_session_revocation(db, commit=True)
     sqlite_paths = _sqlite_paths(stage)
     for path in sqlite_paths:
