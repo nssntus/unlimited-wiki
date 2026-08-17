@@ -539,16 +539,27 @@ class SquareMixin:
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             for running in db.execute(
-                "SELECT entry_id,updated_at FROM public_index_jobs WHERE status='running'",
+                """SELECT entry_id,attempts,typeof(attempts) attempt_type,not_before,updated_at
+                   FROM public_index_jobs WHERE status='running'""",
             ):
+                attempts_value = 0
                 try:
+                    attempts = int(running["attempts"])
+                    attempts_value = attempts if attempts >= 0 else 0
+                    if running["attempt_type"] != "integer" or attempts < 1:
+                        raise ValueError
+                    if running["not_before"] is not None:
+                        job_time(running["not_before"])
                     updated_at = job_time(running["updated_at"])
                     is_stale = updated_at < stale
                 except (OverflowError, TypeError, ValueError):
                     db.execute("""
                         UPDATE public_index_jobs
-                        SET status='dead',last_error=?,not_before=NULL,updated_at=? WHERE entry_id=?
-                    """, ("invalid index job state", now, running["entry_id"]))
+                        SET status='dead',attempts=?,last_error=?,not_before=NULL,updated_at=? WHERE entry_id=?
+                    """, (
+                        attempts_value,
+                        "invalid index job state", now, running["entry_id"],
+                    ))
                     continue
                 if is_stale:
                     db.execute("""
@@ -556,8 +567,13 @@ class SquareMixin:
                     """, (now, now, running["entry_id"]))
                 elif str(running["updated_at"]) != updated_at.isoformat(timespec="seconds"):
                     db.execute(
-                        "UPDATE public_index_jobs SET updated_at=? WHERE entry_id=?",
+                        "UPDATE public_index_jobs SET not_before=NULL,updated_at=? WHERE entry_id=?",
                         (updated_at.isoformat(timespec="seconds"), running["entry_id"]),
+                    )
+                elif running["not_before"] is not None:
+                    db.execute(
+                        "UPDATE public_index_jobs SET not_before=NULL WHERE entry_id=?",
+                        (running["entry_id"],),
                     )
             row = None
             for candidate in db.execute("""
@@ -594,7 +610,8 @@ class SquareMixin:
                 db.commit(); return None
             attempt = int(row["attempts"]) + 1
             db.execute(
-                "UPDATE public_index_jobs SET status='running',attempts=?,updated_at=? WHERE entry_id=?",
+                """UPDATE public_index_jobs
+                   SET status='running',attempts=?,not_before=NULL,updated_at=? WHERE entry_id=?""",
                 (attempt, now, row["entry_id"]),
             )
             db.commit()
@@ -1593,13 +1610,13 @@ class PublicIndexWorker:
     def close(self) -> None:
         self._stop.set()
         self._wake.set()
-        self._thread.join(timeout=3)
+        self._thread.join()
 
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
                 job = self.store.claim_public_index_job()
-            except (sqlite3.Error, TypeError, ValueError):
+            except Exception:
                 self._wake.wait(1)
                 self._wake.clear()
                 continue

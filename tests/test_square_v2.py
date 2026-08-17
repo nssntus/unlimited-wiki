@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -217,6 +218,13 @@ def test_public_index_claim_compares_non_utc_schedule_by_instant(square):
         """, (entry_id,))
 
     assert store.claim_public_index_job() == {"entry_id": entry_id, "attempt": 2}
+    with store.connect() as db:
+        claimed = db.execute(
+            "SELECT status,not_before,updated_at FROM public_index_jobs WHERE entry_id=?", (entry_id,),
+        ).fetchone()
+    assert claimed["status"] == "running"
+    assert claimed["not_before"] is None
+    assert claimed["updated_at"].endswith("+00:00")
 
 
 def test_public_index_claim_normalizes_future_offset_schedule_without_running_it(square):
@@ -268,6 +276,58 @@ def test_public_index_claim_recovers_offset_running_lease_and_dead_letters_bad_l
     assert dict(bad) == {"status": "dead", "last_error": "invalid index job state"}
 
 
+@pytest.mark.parametrize(("attempts", "not_before"), [("bad", None), (1, "not-a-date")])
+def test_public_index_claim_dead_letters_fresh_running_job_with_dirty_fields(
+    square, attempts, not_before,
+):
+    store, context, category, _tag = square
+    entry_id = _publish(
+        store, context, _snapshot("Dirty running", "Invalid lease fields", category_id=category["id"]),
+        article_id="2" * 32, source_revision=f"dirty-running-{attempts}", category_id=category["id"],
+    )["public_entry_id"]
+    with store.connect() as db:
+        db.execute("""
+            INSERT INTO public_index_jobs(entry_id,status,attempts,last_error,not_before,updated_at)
+            VALUES(?,'running',?,NULL,?,'2099-01-01T00:00:00+00:00')
+        """, (entry_id, attempts, not_before))
+
+    assert store.claim_public_index_job() is None
+    with store.connect() as db:
+        job = db.execute(
+            "SELECT status,last_error,not_before FROM public_index_jobs WHERE entry_id=?", (entry_id,),
+        ).fetchone()
+    assert dict(job) == {
+        "status": "dead", "last_error": "invalid index job state", "not_before": None,
+    }
+
+
+def test_dirty_running_job_does_not_block_valid_pending_job(square):
+    store, context, category, _tag = square
+    dirty = _publish(
+        store, context, _snapshot("Dirty lease", "Bad running row", category_id=category["id"]),
+        article_id="1" * 32, source_revision="dirty-lease", category_id=category["id"],
+    )["public_entry_id"]
+    valid = _publish(
+        store, context, _snapshot("Valid pending", "Good queued row", category_id=category["id"]),
+        article_id="0" * 32, source_revision="valid-pending", category_id=category["id"],
+    )["public_entry_id"]
+    with store.connect() as db:
+        db.executemany("""
+            INSERT INTO public_index_jobs(entry_id,status,attempts,last_error,not_before,updated_at)
+            VALUES(?,?,?,?,?,?)
+        """, [
+            (dirty, "running", 0, None, None, "2099-01-01T00:00:00+00:00"),
+            (valid, "pending", 0, None, None, "2026-01-01T00:00:00+00:00"),
+        ])
+
+    assert store.claim_public_index_job() == {"entry_id": valid, "attempt": 1}
+    with store.connect() as db:
+        dirty_job = db.execute(
+            "SELECT status,last_error FROM public_index_jobs WHERE entry_id=?", (dirty,),
+        ).fetchone()
+    assert dict(dirty_job) == {"status": "dead", "last_error": "invalid index job state"}
+
+
 def test_public_index_worker_survives_projection_runtime_error_and_processes_next_job(square, monkeypatch):
     store, context, category, _tag = square
     failed = _publish(
@@ -313,6 +373,59 @@ def test_public_index_worker_survives_projection_runtime_error_and_processes_nex
         assert worker._thread.is_alive()
     finally:
         worker.close()
+
+
+def test_public_index_worker_survives_claim_runtime_error():
+    class FlakyStore:
+        def __init__(self):
+            self.calls = 0
+
+        def claim_public_index_job(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("claim failed")
+            return None
+
+        def process_public_index_job(self, _entry_id, _attempt):
+            raise AssertionError("no job should be processed")
+
+    store = FlakyStore()
+    worker = PublicIndexWorker(store)
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and store.calls < 2:
+            worker.wake()
+            time.sleep(0.02)
+        assert store.calls >= 2
+        assert worker._thread.is_alive()
+    finally:
+        worker.close()
+
+
+def test_public_index_worker_close_waits_for_blocked_claim_to_exit():
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingStore:
+        def claim_public_index_job(self):
+            entered.set()
+            release.wait()
+            return None
+
+        def process_public_index_job(self, _entry_id, _attempt):
+            raise AssertionError("no job should be processed")
+
+    worker = PublicIndexWorker(BlockingStore())
+    assert entered.wait(timeout=1)
+    closed = threading.Event()
+    closer = threading.Thread(target=lambda: (worker.close(), closed.set()))
+    closer.start()
+    assert not closed.wait(timeout=0.05)
+    assert worker._thread.is_alive()
+    release.set()
+    closer.join(timeout=1)
+    assert closed.is_set()
+    assert not worker._thread.is_alive()
 
 
 def test_public_dto_does_not_leak_private_snapshot_fields_and_snapshot_is_immutable(square):

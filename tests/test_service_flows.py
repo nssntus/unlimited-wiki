@@ -116,6 +116,57 @@ def test_apply_meta_recovery_resolves_reverse_ordered_move_chain_to_current_arti
         restarted.close()
 
 
+def test_apply_meta_generated_article_id_recovers_and_duplicate_later_fails_closed(
+    kb_root: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    first = WikiService(kb_root, start_worker=False)
+    source = first.root / "wiki" / "concepts" / "base.md"
+    source.write_text(
+        "".join(line for line in source.read_text(encoding="utf-8").splitlines(keepends=True)
+                if not line.startswith("> Article-ID:")),
+        encoding="utf-8",
+    )
+    first.state.record_raw(
+        "raw/local/base.txt", "byte-hash", "text-hash", "imported",
+        "concepts/base.md", "seed-operation",
+    )
+    monkeypatch.setattr(
+        first,
+        "_remap_committed_paths",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(SystemExit("crash after commit")),
+    )
+    with pytest.raises(SystemExit):
+        first.apply_meta("concepts/base.md", category="tools", status="词条")
+    manifest = next(
+        first.files.operation(path.parent.name)
+        for path in first.files.history_root.glob("meta-*/manifest.json")
+    )
+    generated_id = manifest["metadata"]["article_id"]
+    assert generated_id == first.read_article("tools/base.md")["article_id"]
+    assert len(generated_id) == 32
+    int(generated_id, 16)
+    first.close()
+
+    remaps: list[dict[str, str]] = []
+    restarted = WikiService(kb_root, start_worker=False, path_remap_callback=remaps.append)
+    try:
+        assert restarted.state.raw_records()[0]["target_path"] == "tools/base.md"
+        assert remaps == [{"concepts/base.md": "tools/base.md"}]
+        restarted.state.remap_article_path("tools/base.md", "concepts/base.md")
+        duplicate = restarted.root / "wiki" / "tools" / "duplicate.md"
+        duplicate.write_bytes((restarted.root / "wiki" / "tools" / "base.md").read_bytes())
+    finally:
+        restarted.close()
+
+    remaps.clear()
+    ambiguous = WikiService(kb_root, start_worker=False, path_remap_callback=remaps.append)
+    try:
+        assert ambiguous.state.raw_records()[0]["target_path"] == "concepts/base.md"
+        assert remaps == []
+    finally:
+        ambiguous.close()
+
+
 def test_apply_meta_callback_failure_can_retry_with_a_new_operation(
     service: WikiService,
 ):

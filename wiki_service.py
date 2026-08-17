@@ -685,6 +685,9 @@ class WikiService:
             md, category_id=category_item["category_id"], status="confirmed",
             article_uuid=article["article_id"], article_tags=article["tags"],
         )
+        stable_article_id = dc.article_id(md)
+        if not stable_article_id:
+            raise RuntimeError("article metadata has no stable Article-ID")
         md = wiki_ops.ensure_status_header(md, status)
         target_rel = old_rel
         changes: dict[str, str | None] = {}
@@ -710,7 +713,8 @@ class WikiService:
                     changes[f"wiki/{page_rel}"] = updated
         else:
             changes[f"wiki/{old_rel}"] = md
-        operation_base = f"meta-{hashlib.sha256((old_rel + target_rel + revision(md)).encode()).hexdigest()[:20]}"
+        operation_seed = "|".join((stable_article_id, old_rel, target_rel, category_item["category_id"], status))
+        operation_base = f"meta-{hashlib.sha256(operation_seed.encode()).hexdigest()[:20]}"
         operation_id = self._available_operation_id(operation_base)
         path_map = {old_rel: target_rel} if old_rel != target_rel else {}
         log_path = self.root / "wiki" / "log.md"
@@ -723,7 +727,7 @@ class WikiService:
                 "source": old_rel,
                 "target": target_rel,
                 "path_map": path_map,
-                "article_id": article["article_id"],
+                "article_id": stable_article_id,
             },
             operation_id=operation_id,
         )

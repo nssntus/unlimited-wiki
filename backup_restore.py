@@ -661,6 +661,8 @@ def _check_application_schema(db: sqlite3.Connection, path: Path) -> list[str]:
                         raise ValueError
                     if row[2] != "integer" or int(row[1]) < 0:
                         raise ValueError
+                    if row[0] == "running" and (int(row[1]) < 1 or row[3] is not None):
+                        raise ValueError
                     if row[3] is not None:
                         not_before_text = str(row[3])
                         not_before = datetime.fromisoformat(not_before_text)
