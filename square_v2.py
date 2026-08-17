@@ -9,8 +9,9 @@ import ipaddress
 import json
 import re
 import sqlite3
+import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -24,6 +25,11 @@ CORRECTION_KINDS = {"factual", "source", "outdated", "duplicate", "supplement", 
 REUSE_PERMISSIONS = {"view_only", "allow_private_copy"}
 REUSE_POLICY_VERSION = "square-reuse-v1"
 PUBLIC_SORTS = {"relevance", "latest", "updated"}
+PUBLIC_REVIEW_ISSUE_CODES = {
+    "copyright", "privacy", "unsafe", "unsupported_claim", "source_quality",
+    "spam", "duplicate", "policy_violation", "not_configured", "model_error",
+    "invalid_model_response",
+}
 
 
 def _now() -> str:
@@ -112,7 +118,8 @@ def canonical_public_url(value: str) -> str | None:
             return None
         # Browsers accept several non-canonical numeric IPv4 forms that
         # ipaddress deliberately rejects. Never treat them as DNS names.
-        if re.fullmatch(r"(?:0x[0-9a-f]+|[0-9.]+)", ascii_hostname, re.IGNORECASE):
+        numeric_component = r"(?:0x[0-9a-f]+|[0-9]+)"
+        if re.fullmatch(rf"{numeric_component}(?:\.{numeric_component})*", ascii_hostname, re.IGNORECASE):
             return None
         canonical_host = ascii_hostname
     if port is not None and not 1 <= port <= 65535:
@@ -147,6 +154,20 @@ def safe_public_url(value: str) -> bool:
     return canonical_public_url(value) is not None
 
 
+def _public_review_issues(report: Any) -> list[dict]:
+    """Project untrusted model output to stable, non-sensitive public facts."""
+    if not isinstance(report, dict) or not isinstance(report.get("issues"), list):
+        return []
+    result: list[dict] = []
+    for value in report["issues"][:20]:
+        if not isinstance(value, dict):
+            continue
+        code = str(value.get("code") or "").strip().casefold()
+        if code in PUBLIC_REVIEW_ISSUE_CODES and code not in {item["code"] for item in result}:
+            result.append({"code": code})
+    return result
+
+
 def _square_public_markdown(markdown: str) -> str:
     """Remove the private canonical preamble while preserving body Markdown."""
     value = str(markdown or "")
@@ -158,6 +179,37 @@ def _square_public_markdown(markdown: str) -> str:
             if META_RE.match(line.rstrip("\r\n")) is None
         ]
         value = "".join(lines[:block_start] + visible + lines[index:])
+    # Early public snapshots were created after stable identity fields had
+    # already been removed. Recognize their remaining generated preamble only
+    # when the first quote block is anchored by both Category and Status.
+    lines = value.splitlines(True)
+    title_index = next((i for i, line in enumerate(lines) if line.lstrip("\ufeff \t").startswith("# ")), -1)
+    cursor = title_index + 1
+    while cursor > 0 and cursor < len(lines) and not lines[cursor].strip():
+        cursor += 1
+    block_start = cursor
+    blocks: list[tuple[int, int, set[str]]] = []
+    allowed = {
+        "article-id", "category-id", "classification", "classification-updated",
+        "category", "status", "generation", "updated", "archived", "tags",
+        "evidence", "sources", "raw",
+    }
+    while cursor > 0 and cursor < len(lines):
+        start = cursor
+        keys: set[str] = set()
+        while cursor < len(lines):
+            match = META_RE.match(lines[cursor].rstrip("\r\n"))
+            if match is None or match.group(1).strip().casefold() not in allowed:
+                break
+            keys.add(match.group(1).strip().casefold())
+            cursor += 1
+        if not keys:
+            break
+        blocks.append((start, cursor, keys))
+        while cursor < len(lines) and not lines[cursor].strip():
+            cursor += 1
+    if blocks and {"category", "status"}.issubset(blocks[0][2]):
+        value = "".join(lines[:block_start] + lines[cursor:])
     # Older generated articles carry private workflow state in this exact
     # trailing footer. Requiring the terminal horizontal rule keeps body text
     # with the same words untouched.
@@ -274,7 +326,10 @@ def initialize_square_schema(db: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS public_index_jobs (
             entry_id TEXT PRIMARY KEY REFERENCES public_entries(id) ON DELETE CASCADE,
             status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
-            last_error TEXT, updated_at TEXT NOT NULL
+            last_error TEXT, not_before TEXT, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS public_search_meta (
+            id INTEGER PRIMARY KEY CHECK(id=1), generation INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS public_revision_sources (
             revision_id TEXT NOT NULL REFERENCES public_revisions(id) ON DELETE CASCADE,
@@ -337,6 +392,9 @@ def initialize_square_schema(db: sqlite3.Connection) -> None:
         "public_imports": {
             "policy_version": "TEXT",
         },
+        "public_index_jobs": {
+            "not_before": "TEXT",
+        },
     }.items():
         existing = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
         for name, declaration in columns.items():
@@ -371,6 +429,7 @@ def initialize_square_schema(db: sqlite3.Connection) -> None:
         "UPDATE public_imports SET policy_version=? WHERE policy_version IS NULL OR policy_version=''",
         (REUSE_POLICY_VERSION,),
     )
+    db.execute("INSERT OR IGNORE INTO public_search_meta(id,generation) VALUES(1,0)")
 
 
 class SquareMixin:
@@ -400,6 +459,13 @@ class SquareMixin:
         return _safe_sources(snapshot)
 
     @staticmethod
+    def _safe_source_count(db: sqlite3.Connection, revision_id: str) -> int:
+        rows = db.execute(
+            "SELECT label,url,kind FROM public_revision_sources WHERE revision_id=?", (revision_id,),
+        ).fetchall()
+        return len(_safe_sources({"public_sources": [dict(row) for row in rows]}))
+
+    @staticmethod
     def _public_snapshot(snapshot: dict) -> dict:
         return _public_snapshot(snapshot)
 
@@ -408,7 +474,7 @@ class SquareMixin:
             SELECT e.id,e.status,e.current_revision_id,e.created_at,e.first_published_at,e.public_category_id,
                    r.snapshot_json,r.published_at,c.name category_name
             FROM public_entries e JOIN public_revisions r ON r.id=e.current_revision_id
-            LEFT JOIN public_categories c ON c.id=e.public_category_id WHERE e.id=?
+            LEFT JOIN public_categories c ON c.id=e.public_category_id AND c.status='active' WHERE e.id=?
         """, (entry_id,)).fetchone()
         db.execute("DELETE FROM public_search_documents WHERE entry_id=?", (entry_id,))
         db.execute("DELETE FROM public_search_fts WHERE entry_id=?", (entry_id,))
@@ -434,31 +500,106 @@ class SquareMixin:
             _search_projection(category_name), _search_projection(" ".join(tags)), _search_projection(attribution),
         ))
 
+    @staticmethod
+    def _bump_search_generation(db: sqlite3.Connection) -> None:
+        db.execute("UPDATE public_search_meta SET generation=generation+1 WHERE id=1")
+
     def _refresh_square_entry(self, db: sqlite3.Connection, entry_id: str) -> bool:
         """Refresh a derived search projection without coupling it to the public fact write."""
         db.execute("SAVEPOINT square_index_refresh")
         try:
             self._sync_square_entry(db, entry_id)
             db.execute("DELETE FROM public_index_jobs WHERE entry_id=?", (entry_id,))
+            self._bump_search_generation(db)
             db.execute("RELEASE square_index_refresh")
             return True
-        except sqlite3.Error as exc:
+        except (sqlite3.Error, ValueError, TypeError, json.JSONDecodeError) as exc:
             db.execute("ROLLBACK TO square_index_refresh")
             db.execute("RELEASE square_index_refresh")
             db.execute("""
-                INSERT INTO public_index_jobs(entry_id,status,attempts,last_error,updated_at)
-                VALUES(?,'pending',1,?,?)
+                INSERT INTO public_index_jobs(entry_id,status,attempts,last_error,not_before,updated_at)
+                VALUES(?,'pending',1,?,NULL,?)
                 ON CONFLICT(entry_id) DO UPDATE SET status='pending',attempts=attempts+1,
-                  last_error=excluded.last_error,updated_at=excluded.updated_at
+                  last_error=excluded.last_error,not_before=NULL,updated_at=excluded.updated_at
             """, (entry_id, str(exc)[:500], _now()))
+            self._bump_search_generation(db)
             return False
+
+    def claim_public_index_job(self) -> dict | None:
+        now = _now()
+        stale = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(timespec="seconds")
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""
+                UPDATE public_index_jobs SET status='retry',not_before=?,updated_at=?
+                WHERE status='running' AND updated_at<?
+            """, (now, now, stale))
+            row = db.execute("""
+                SELECT entry_id,attempts FROM public_index_jobs
+                WHERE status IN ('pending','retry') AND (not_before IS NULL OR not_before<=?)
+                ORDER BY updated_at,entry_id LIMIT 1
+            """, (now,)).fetchone()
+            if row is None:
+                db.commit(); return None
+            attempt = int(row["attempts"]) + 1
+            db.execute(
+                "UPDATE public_index_jobs SET status='running',attempts=?,updated_at=? WHERE entry_id=?",
+                (attempt, now, row["entry_id"]),
+            )
+            db.commit()
+        return {"entry_id": row["entry_id"], "attempt": attempt}
+
+    def process_public_index_job(self, entry_id: str, attempt: int) -> bool:
+        try:
+            with self._lock, self.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                current = db.execute(
+                    "SELECT status,attempts FROM public_index_jobs WHERE entry_id=?", (entry_id,),
+                ).fetchone()
+                if current is None or current["status"] != "running" or int(current["attempts"]) != attempt:
+                    db.rollback(); return False
+                self._sync_square_entry(db, entry_id)
+                self._bump_search_generation(db)
+                db.execute("DELETE FROM public_index_jobs WHERE entry_id=? AND attempts=?", (entry_id, attempt))
+                db.commit()
+            return True
+        except (sqlite3.Error, ValueError, TypeError, json.JSONDecodeError) as exc:
+            status = "dead" if attempt >= 5 else "retry"
+            next_time = None if status == "dead" else (
+                datetime.now(timezone.utc) + timedelta(seconds=min(300, 2 ** attempt))
+            ).isoformat(timespec="seconds")
+            with self._lock, self.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("""
+                    UPDATE public_index_jobs SET status=?,last_error=?,not_before=?,updated_at=?
+                    WHERE entry_id=? AND status='running' AND attempts=?
+                """, (status, str(exc)[:500], next_time, _now(), entry_id, attempt))
+                db.commit()
+            return False
+
+    def retry_public_index_jobs(self, context: Any, entry_id: str | None = None) -> dict:
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE"); self._authorize_admin_in_transaction(db, context.user_id)
+            if entry_id:
+                cursor = db.execute(
+                    "UPDATE public_index_jobs SET status='pending',not_before=NULL,updated_at=? WHERE entry_id=?",
+                    (_now(), entry_id),
+                )
+            else:
+                cursor = db.execute(
+                    "UPDATE public_index_jobs SET status='pending',not_before=NULL,updated_at=? WHERE status='dead'",
+                    (_now(),),
+                )
+            count = cursor.rowcount
+            db.commit()
+        return {"queued": count}
 
     def rebuild_public_search(self) -> dict:
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             ids = [row[0] for row in db.execute("SELECT id FROM public_entries").fetchall()]
             indexed = sum(1 for entry_id in ids if self._refresh_square_entry(db, entry_id))
-            pending = db.execute("SELECT COUNT(*) FROM public_index_jobs WHERE status='pending'").fetchone()[0]
+            pending = db.execute("SELECT COUNT(*) FROM public_index_jobs").fetchone()[0]
             db.commit()
         return {"indexed": indexed, "pending": pending}
 
@@ -470,7 +611,9 @@ class SquareMixin:
                   ON d.public_category_id=c.id AND d.status='published'
                 LEFT JOIN public_entries e ON e.id=d.entry_id AND e.status='published'
                   AND e.current_revision_id=d.revision_id
-                WHERE c.status='active' GROUP BY c.id ORDER BY c.sort_order,c.name
+                LEFT JOIN public_revisions r ON r.id=e.current_revision_id AND r.visibility='public'
+                WHERE c.status='active' AND (e.id IS NULL OR r.id IS NOT NULL)
+                GROUP BY c.id ORDER BY c.sort_order,c.name
             """).fetchall()
         return [dict(row) for row in rows]
 
@@ -496,19 +639,34 @@ class SquareMixin:
                 LEFT JOIN public_search_documents d ON d.entry_id=et.entry_id AND d.status='published'
                 LEFT JOIN public_entries e ON e.id=d.entry_id AND e.status='published'
                   AND e.current_revision_id=d.revision_id
-                WHERE t.status='active' GROUP BY t.id ORDER BY entry_count DESC,t.name LIMIT 200
+                LEFT JOIN public_revisions r ON r.id=e.current_revision_id AND r.visibility='public'
+                WHERE t.status='active' AND (e.id IS NULL OR r.id IS NOT NULL)
+                GROUP BY t.id ORDER BY entry_count DESC,t.name LIMIT 200
             """).fetchall()
         return [dict(row) for row in rows]
 
     def search_public(self, *, query: str = "", category: str = "", tag: str = "", sort: str = "updated",
                       cursor: str | None = None, limit: int = 24) -> dict:
+        with self._lock:
+            return self._search_public_locked(
+                query=query, category=category, tag=tag, sort=sort, cursor=cursor, limit=limit,
+            )
+
+    def _search_public_locked(self, *, query: str = "", category: str = "", tag: str = "",
+                              sort: str = "updated", cursor: str | None = None,
+                              limit: int = 24) -> dict:
         query = query.strip()
         if len(query) > 120 or len(query.split()) > 8:
             raise ValueError("search query is too complex")
         if sort not in PUBLIC_SORTS or limit < 1 or limit > 50:
             raise ValueError("invalid public search options")
+        with self.connect() as generation_db:
+            generation = int(generation_db.execute(
+                "SELECT generation FROM public_search_meta WHERE id=1",
+            ).fetchone()[0])
         signature = hashlib.sha256(_json({
             "query": query.casefold(), "category": category, "tag": tag, "sort": sort, "limit": limit,
+            "generation": generation,
         }).encode()).hexdigest()[:24]
         position = _decode_cursor(cursor, signature)
         where = [
@@ -556,7 +714,7 @@ class SquareMixin:
                 WITH candidates AS (SELECT e.id,r.id revision_id,r.version,r.content_hash,r.published_at,
                        d.title,d.summary,d.attribution,d.first_published_at,e.featured_order,
                        d.updated_at search_updated_at,{rank} rank_value,
-                       (SELECT COUNT(*) FROM public_revision_sources prs WHERE prs.revision_id=r.id) source_count,
+                       0 source_count,
                        c.id category_id,c.slug category_slug,COALESCE(c.name,d.category_name) category_name,
                        (SELECT json_group_array(json_object('id',t.id,'slug',t.slug,'name',t.name))
                         FROM public_entry_tags et JOIN public_tags t ON t.id=et.tag_id
@@ -567,7 +725,12 @@ class SquareMixin:
                 WHERE {' AND '.join(where)})
                 SELECT * FROM candidates {after} ORDER BY {outer_order} LIMIT ?
             """, params).fetchall()
-        items = [self._public_summary(row) for row in rows[:limit]]
+            item_rows = []
+            for row in rows[:limit]:
+                value = dict(row)
+                value["source_count"] = self._safe_source_count(db, row["revision_id"])
+                item_rows.append(value)
+        items = [self._public_summary(row) for row in item_rows]
         next_cursor = None
         if len(rows) > limit:
             last = rows[limit - 1]
@@ -583,7 +746,7 @@ class SquareMixin:
                 SELECT e.id,r.id revision_id,r.version,r.content_hash,r.published_at,
                        d.title,d.summary,d.attribution,d.first_published_at,e.featured_order,
                        d.updated_at search_updated_at,
-                       (SELECT COUNT(*) FROM public_revision_sources prs WHERE prs.revision_id=r.id) source_count,
+                       0 source_count,
                        c.id category_id,c.slug category_slug,COALESCE(c.name,d.category_name) category_name,
                        (SELECT json_group_array(json_object('id',t.id,'slug',t.slug,'name',t.name))
                         FROM public_entry_tags et JOIN public_tags t ON t.id=et.tag_id
@@ -596,7 +759,12 @@ class SquareMixin:
                   AND e.featured_order IS NOT NULL
                 ORDER BY e.featured_order,e.updated_at DESC,e.id LIMIT ?
             """, (min(max(limit, 1), 50),)).fetchall()
-        return [self._public_summary(row) for row in rows]
+            values = []
+            for row in rows:
+                value = dict(row)
+                value["source_count"] = self._safe_source_count(db, row["revision_id"])
+                values.append(value)
+        return [self._public_summary(row) for row in values]
 
     def public_home(self) -> dict:
         return {
@@ -657,7 +825,7 @@ class SquareMixin:
             "category": {"id": row["category_id"], "slug": row["category_slug"], "name": row["category_name"] or "待公共分类"},
             "tags": tags, "sources": sources,
             "source_count": len(sources), "correction_count": row["correction_count"],
-            "review": {"ai_policy_version": row["ai_policy_version"], "ai_model": row["ai_model"], "ai_rules_version": row["ai_rules_version"], "issues": (ai_report or {}).get("issues", []), "admin_reason": row["admin_reason"]},
+            "review": {"ai_policy_version": row["ai_policy_version"], "ai_model": row["ai_model"], "ai_rules_version": row["ai_rules_version"], "issues": _public_review_issues(ai_report), "admin_reason": row["admin_reason"]},
             "author_profile": {"id": row["profile_id"], "display_name": row["profile_name"]} if row["profile_id"] else None,
             "reuse_permission": row["reuse_permission"] or "view_only",
             "reuse_policy_version": row["reuse_policy_version"] or REUSE_POLICY_VERSION,
@@ -717,7 +885,11 @@ class SquareMixin:
                 "content_hash": row["content_hash"], "published_at": row["published_at"]}
 
     def public_diff(self, entry_id: str, from_version: int, to_version: int) -> dict:
-        if from_version < 1 or to_version < 1 or abs(from_version - to_version) != 1:
+        if from_version < 1 or to_version < 1 or from_version == to_version:
+            raise ValueError("only adjacent public versions can be compared")
+        versions = sorted(item["version"] for item in self.public_versions(entry_id))
+        before_index = versions.index(from_version) if from_version in versions else -1
+        if before_index < 0 or before_index + 1 >= len(versions) or versions[before_index + 1] != to_version:
             raise ValueError("only adjacent public versions can be compared")
         before, after = self.get_public_version(entry_id, from_version), self.get_public_version(entry_id, to_version)
         diff = "".join(difflib.unified_diff(
@@ -734,6 +906,8 @@ class SquareMixin:
                         (SELECT COUNT(*) FROM public_entry_tags a JOIN public_entry_tags b ON b.tag_id=a.tag_id
                          WHERE a.entry_id=? AND b.entry_id=e.id)) score
                 FROM public_entries e JOIN public_search_documents d ON d.entry_id=e.id
+                JOIN public_revisions r ON r.id=e.current_revision_id
+                  AND r.id=d.revision_id AND r.visibility='public'
                 JOIN public_entries source ON source.id=?
                 WHERE e.id<>? AND e.status='published' AND d.status='published'
                 ORDER BY score DESC,d.updated_at DESC LIMIT 6
@@ -783,8 +957,10 @@ class SquareMixin:
 
     def begin_public_import(
         self, context: Any, entry_id: str, revision_id: str, *,
-        expected_policy_version: str, acknowledged: bool,
+        expected_workspace_id: str, expected_policy_version: str, acknowledged: bool,
     ) -> dict:
+        if expected_workspace_id != context.workspace_id:
+            raise ValueError("current workspace changed; confirm the import destination again")
         if expected_policy_version != REUSE_POLICY_VERSION or acknowledged is not True:
             raise ValueError("current reuse policy must be acknowledged")
         self.authorize_workspace(context.user_id, context.workspace_id, "wiki.write")
@@ -875,6 +1051,33 @@ class SquareMixin:
                 (import_id, context.workspace_id),
             )
             db.commit()
+
+    def remap_public_import_paths(self, workspace_id: str, path_map: dict[str, str]) -> None:
+        if not path_map:
+            return
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for old, new in path_map.items():
+                db.execute("""
+                    UPDATE public_imports SET private_path=?,updated_at=?
+                    WHERE workspace_id=? AND private_path=? AND status='complete'
+                """, (new, _now(), workspace_id, old))
+            db.commit()
+
+    def update_public_import_path(self, context: Any, import_id: str, article_id: str, path: str) -> dict:
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._authorize_workspace_in_transaction(db, context.user_id, context.workspace_id, "wiki.read")
+            row = db.execute("""
+                SELECT id FROM public_imports WHERE id=? AND workspace_id=?
+                  AND private_article_id=? AND status='complete'
+            """, (import_id, context.workspace_id, article_id)).fetchone()
+            if row is None:
+                db.rollback(); raise FileNotFoundError(import_id)
+            db.execute("UPDATE public_imports SET private_path=?,updated_at=? WHERE id=?", (path, _now(), import_id))
+            saved = db.execute("SELECT * FROM public_imports WHERE id=?", (import_id,)).fetchone()
+            db.commit()
+        return dict(saved)
 
     def create_correction(self, context: Any, entry_id: str, kind: str, detail: str, evidence_url: str = "") -> dict:
         if kind not in CORRECTION_KINDS or not detail.strip() or len(detail) > 4000:
@@ -991,8 +1194,12 @@ class SquareMixin:
             if row is None:
                 raise FileNotFoundError(profile_id)
             entries = db.execute("""
-                SELECT e.id,d.title,d.summary,d.updated_at FROM public_entries e JOIN public_search_documents d ON d.entry_id=e.id
-                WHERE e.public_profile_id=? AND e.status='published' ORDER BY d.updated_at DESC LIMIT 50
+                SELECT e.id,d.title,d.summary,d.updated_at FROM public_entries e
+                JOIN public_search_documents d ON d.entry_id=e.id
+                JOIN public_revisions r ON r.id=e.current_revision_id
+                  AND r.id=d.revision_id AND r.visibility='public'
+                WHERE e.public_profile_id=? AND e.status='published' AND d.status='published'
+                ORDER BY d.updated_at DESC LIMIT 50
             """, (profile_id,)).fetchall()
         return {**dict(row), "entries": [dict(item) for item in entries]}
 
@@ -1007,9 +1214,13 @@ class SquareMixin:
         with self.connect() as db:
             rows = db.execute("""
                 SELECT c.id,c.slug,c.title,c.description,c.published_at,
-                       COUNT(CASE WHEN e.status='published' THEN 1 END) entry_count
+                       COUNT(CASE WHEN e.status='published' AND d.status='published'
+                         AND e.current_revision_id=d.revision_id AND r.visibility='public' THEN 1 END) entry_count
                 FROM public_collections c LEFT JOIN public_collection_items i ON i.collection_id=c.id
-                LEFT JOIN public_entries e ON e.id=i.entry_id WHERE c.status='published'
+                LEFT JOIN public_entries e ON e.id=i.entry_id
+                LEFT JOIN public_search_documents d ON d.entry_id=e.id
+                LEFT JOIN public_revisions r ON r.id=e.current_revision_id
+                WHERE c.status='published'
                 GROUP BY c.id ORDER BY c.published_at DESC LIMIT ?
             """, (min(max(limit, 1), 50),)).fetchall()
         return [dict(row) for row in rows]
@@ -1022,29 +1233,49 @@ class SquareMixin:
             items = db.execute("""
                 SELECT e.id,d.title,d.summary,i.curator_note,i.sort_order FROM public_collection_items i
                 JOIN public_entries e ON e.id=i.entry_id JOIN public_search_documents d ON d.entry_id=e.id
-                WHERE i.collection_id=? AND e.status='published' ORDER BY i.sort_order,e.id
+                JOIN public_revisions r ON r.id=e.current_revision_id
+                  AND r.id=d.revision_id AND r.visibility='public'
+                WHERE i.collection_id=? AND e.status='published' AND d.status='published'
+                ORDER BY i.sort_order,e.id
             """, (row["id"],)).fetchall()
         return {**dict(row), "items": [dict(item) for item in items]}
 
     def admin_upsert_category(self, context: Any, category_id: str | None, slug: str, name: str, description: str, status: str, sort_order: int) -> dict:
         if status not in {"active", "disabled"} or not name.strip() or len(name) > 80:
             raise ValueError("invalid public category")
-        category_id, now = category_id or uuid.uuid4().hex, _now()
+        category_id, now, requested_slug = category_id or uuid.uuid4().hex, _now(), _slug(slug)
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE"); self._authorize_admin_in_transaction(db, context.user_id)
             old = db.execute("SELECT slug FROM public_categories WHERE id=?", (category_id,)).fetchone()
+            canonical_owner = db.execute(
+                "SELECT id FROM public_categories WHERE slug=? AND id<>?", (requested_slug, category_id),
+            ).fetchone()
+            alias_owner = db.execute(
+                "SELECT category_id FROM public_category_slug_redirects WHERE slug=?", (requested_slug,),
+            ).fetchone()
+            if canonical_owner is not None or (alias_owner is not None and alias_owner["category_id"] != category_id):
+                db.rollback(); raise ValueError("public category slug is reserved")
+            if alias_owner is not None:
+                db.execute("DELETE FROM public_category_slug_redirects WHERE slug=? AND category_id=?", (requested_slug, category_id))
             db.execute("""
                 INSERT INTO public_categories VALUES(?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET slug=excluded.slug,name=excluded.name,description=excluded.description,status=excluded.status,sort_order=excluded.sort_order,updated_at=excluded.updated_at
-            """, (category_id, _slug(slug), name.strip(), description.strip()[:1000], status, int(sort_order), context.user_id, now, now))
-            if old is not None and old["slug"] != _slug(slug):
-                db.execute("""
-                    INSERT INTO public_category_slug_redirects VALUES(?,?,?)
-                    ON CONFLICT(slug) DO UPDATE SET category_id=excluded.category_id
-                """, (old["slug"], category_id, now))
+            """, (category_id, requested_slug, name.strip(), description.strip()[:1000], status, int(sort_order), context.user_id, now, now))
+            if old is not None and old["slug"] != requested_slug:
+                existing_alias = db.execute(
+                    "SELECT category_id FROM public_category_slug_redirects WHERE slug=?", (old["slug"],),
+                ).fetchone()
+                if existing_alias is not None and existing_alias["category_id"] != category_id:
+                    db.rollback(); raise ValueError("public category slug is reserved")
+                db.execute(
+                    "INSERT OR IGNORE INTO public_category_slug_redirects VALUES(?,?,?)",
+                    (old["slug"], category_id, now),
+                )
+            for entry in db.execute("SELECT id FROM public_entries WHERE public_category_id=?", (category_id,)).fetchall():
+                self._refresh_square_entry(db, entry["id"])
             self._audit(db, context.user_id, "public_category.upsert", "public_category", category_id, {"status": status})
             db.commit()
-        return {"id": category_id, "slug": _slug(slug), "name": name.strip(), "description": description.strip(), "status": status, "sort_order": int(sort_order)}
+        return {"id": category_id, "slug": requested_slug, "name": name.strip(), "description": description.strip(), "status": status, "sort_order": int(sort_order)}
 
     def admin_map_category(self, context: Any, private_label: str, category_id: str) -> dict:
         label = private_label.strip()
@@ -1095,10 +1326,12 @@ class SquareMixin:
                        (target_id, context.user_id, now, source_id))
             db.execute("UPDATE public_categories SET status='merged',updated_at=? WHERE id=?", (now, source_id))
             db.execute("UPDATE public_category_slug_redirects SET category_id=? WHERE category_id=?", (target_id, source_id))
-            db.execute("""
-                INSERT INTO public_category_slug_redirects VALUES(?,?,?)
-                ON CONFLICT(slug) DO UPDATE SET category_id=excluded.category_id
-            """, (source["slug"], target_id, now))
+            conflicting = db.execute(
+                "SELECT category_id FROM public_category_slug_redirects WHERE slug=?", (source["slug"],),
+            ).fetchone()
+            if conflicting is not None and conflicting["category_id"] not in {source_id, target_id}:
+                db.rollback(); raise ValueError("public category slug is reserved")
+            db.execute("INSERT OR REPLACE INTO public_category_slug_redirects VALUES(?,?,?)", (source["slug"], target_id, now))
             for row in db.execute("SELECT id FROM public_entries WHERE public_category_id=?", (target_id,)).fetchall():
                 self._refresh_square_entry(db, row["id"])
             self._audit(db, context.user_id, "public_category.merge", "public_category", source_id,
@@ -1122,8 +1355,11 @@ class SquareMixin:
                 WHERE correction_suggestions.status IN ('open','acknowledged')
                 ORDER BY correction_suggestions.created_at
             """).fetchall()]
+            index_jobs = [dict(row) for row in db.execute(
+                "SELECT entry_id,status,attempts,last_error,not_before,updated_at FROM public_index_jobs ORDER BY updated_at",
+            ).fetchall()]
         return {"categories": categories, "tags": tags, "collections": collections,
-                "category_mappings": mappings, "corrections": corrections}
+                "category_mappings": mappings, "corrections": corrections, "index_jobs": index_jobs}
 
     def admin_public_versions(self, context: Any, entry_id: str) -> list[dict]:
         if context.role != "admin":
@@ -1153,6 +1389,8 @@ class SquareMixin:
                 INSERT INTO public_tags VALUES(?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET slug=excluded.slug,name=excluded.name,status=excluded.status,updated_at=excluded.updated_at
             """, (tag_id, _slug(slug), name.strip(), status, now, now))
+            for entry in db.execute("SELECT entry_id FROM public_entry_tags WHERE tag_id=?", (tag_id,)).fetchall():
+                self._refresh_square_entry(db, entry["entry_id"])
             self._audit(db, context.user_id, "public_tag.upsert", "public_tag", tag_id, {"status": status})
             db.commit()
         return {"id": tag_id, "slug": _slug(slug), "name": name.strip(), "status": status}
@@ -1234,18 +1472,19 @@ class SquareMixin:
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE"); self._authorize_active_user_in_transaction(db, context.user_id)
             row = db.execute("""
-                SELECT e.current_revision_id,r.snapshot_json FROM public_entries e
+                SELECT e.status,e.current_revision_id,r.snapshot_json FROM public_entries e
                 JOIN public_revisions r ON r.id=e.current_revision_id
-                WHERE e.id=? AND e.author_id=? AND e.status='published'
+                WHERE e.id=? AND e.author_id=? AND e.status IN ('published','removed_by_admin')
             """, (entry_id, context.user_id)).fetchone()
             if row is None:
                 db.rollback(); raise FileNotFoundError(entry_id)
             db.execute("UPDATE public_entries SET status='withdrawn_by_author',updated_at=?,moderation_reason=? WHERE id=?", (_now(), reason.strip(), entry_id))
             title = str(json.loads(row["snapshot_json"]).get("title") or "公开词条")
-            for subscriber in db.execute("SELECT user_id FROM public_subscriptions WHERE public_entry_id=? AND status='active'", (entry_id,)).fetchall():
-                if subscriber["user_id"] != context.user_id:
-                    self._notify(db, subscriber["user_id"], "public_withdrawn", "public_entry", entry_id,
-                                 f"《{title}》已由作者撤回", "所有公开版本现已不可访问；你的私人副本不会被删除。")
+            if row["status"] == "published":
+                for subscriber in db.execute("SELECT user_id FROM public_subscriptions WHERE public_entry_id=? AND status='active'", (entry_id,)).fetchall():
+                    if subscriber["user_id"] != context.user_id:
+                        self._notify(db, subscriber["user_id"], "public_withdrawn", "public_entry", entry_id,
+                                     f"《{title}》已由作者撤回", "所有公开版本现已不可访问；你的私人副本不会被删除。")
             self._refresh_square_entry(db, entry_id)
             self._audit(db, context.user_id, "public.withdraw", "public_entry", entry_id, {"reason": reason.strip(), "revision_id": row["current_revision_id"]})
             db.commit()
@@ -1286,3 +1525,34 @@ class SquareMixin:
             return self.search_public(query=query, sort="relevance", limit=min(limit, 8))["items"]
         except (ValueError, sqlite3.OperationalError):
             return []
+
+
+class PublicIndexWorker:
+    def __init__(self, store: Any):
+        self.store = store
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="public-index-worker", daemon=True)
+        self._thread.start()
+
+    def wake(self) -> None:
+        self._wake.set()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        self._thread.join(timeout=3)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                job = self.store.claim_public_index_job()
+            except sqlite3.Error:
+                self._wake.wait(1)
+                self._wake.clear()
+                continue
+            if job is None:
+                self._wake.wait(1)
+                self._wake.clear()
+                continue
+            self.store.process_public_index_job(job["entry_id"], job["attempt"])

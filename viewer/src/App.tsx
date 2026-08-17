@@ -46,6 +46,7 @@ const AdminReviewDetailPage = lazy(() => import("@/pages/admin-page").then((modu
 const AdminReportsPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminReportsPage })))
 const AdminContentPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminContentPage })))
 const AdminSquarePage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminSquarePage })))
+const AdminPublicIndexPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminPublicIndexPage })))
 
 export function App() {
   return (
@@ -101,6 +102,7 @@ export function App() {
               <Route path="/admin/reports" element={<AdminReportsPage />} />
               <Route path="/admin/content" element={<AdminContentPage />} />
               <Route path="/admin/square" element={<AdminSquarePage />} />
+              <Route path="/admin/public-index" element={<AdminPublicIndexPage />} />
               <Route path="/admin/curation" element={<AdminSquarePage />} />
               <Route path="/admin/public-taxonomy" element={<AdminSquarePage />} />
             </Route>

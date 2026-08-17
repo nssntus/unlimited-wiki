@@ -6,6 +6,7 @@ import remarkGfm from "remark-gfm"
 
 import { cn } from "@/lib/utils"
 import { nextHeadingId, scrollToHeading } from "@/lib/markdown-toc"
+import { classifyPublicExternalUrl } from "@/lib/public-url"
 
 const schema = {
   ...defaultSchema,
@@ -82,7 +83,11 @@ export function MarkdownContent({ markdown, fromPath, className, keywords = [], 
           a({ href = "", children, ...props }) {
             const internal = resolveInternal(fromPath, href)
             if (internal) return publicMode ? <span>{children}</span> : <Link to={internal}>{children}</Link>
-            if (/^https?:/i.test(href)) return <a href={href} target={publicMode ? "_blank" : undefined} rel="noopener noreferrer" {...props}>{children}{publicMode && <span className="sr-only">（外部来源，平台未核验）</span>}</a>
+            if (/^https?:/i.test(href)) {
+              const external = publicMode ? classifyPublicExternalUrl(href) : { href, insecure: false }
+              if (!external) return <span>{children} <span className="text-xs text-muted-foreground">（链接已阻止）</span></span>
+              return <><a href={external.href} target={publicMode ? "_blank" : undefined} rel="noopener noreferrer" {...props}>{children}</a>{publicMode && <span className="ml-1 text-xs text-muted-foreground">外部链接 · 未核验{external.insecure ? " · HTTP 未加密" : ""}</span>}</>
+            }
             if (href.startsWith("#")) {
               const id = decodeURIComponent(href.slice(1))
               return <button type="button" className="inline text-link underline underline-offset-4" onClick={() => scrollToHeading(id)}>{children}</button>

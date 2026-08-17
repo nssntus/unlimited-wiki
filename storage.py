@@ -109,6 +109,7 @@ class FileStore:
         metadata: dict | None = None,
         operation_id: str | None = None,
         must_not_exist: bool = False,
+        must_not_exist_paths: set[str] | None = None,
         directories: dict[str, bool] | None = None,
     ) -> dict:
         normalized: dict[str, bytes | None] = {}
@@ -128,8 +129,13 @@ class FileStore:
 
         op_id = operation_id or uuid.uuid4().hex
         op_dir = self.history_root / op_id
+        exclusive_paths = {safe_project_rel(path) for path in (must_not_exist_paths or set())}
+        if not exclusive_paths.issubset(normalized):
+            raise ValueError("exclusive transaction target is not part of changes")
         with self.locked():
             if must_not_exist and any(self.resolve(rel).exists() for rel in normalized):
+                raise FileExistsError("transaction target already exists")
+            if any(self.resolve(rel).exists() for rel in exclusive_paths):
                 raise FileExistsError("transaction target already exists")
             if op_dir.exists():
                 raise FileExistsError(f"operation already exists: {op_id}")

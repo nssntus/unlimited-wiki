@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react"
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom"
 import {
   BellIcon,
@@ -18,6 +18,7 @@ import {
 import { toast } from "sonner"
 
 import {
+  ApiError,
   apiGet,
   apiPost,
   GOVERNANCE_RETENTION_TEXT,
@@ -319,9 +320,8 @@ export function SquarePage() {
 }
 
 export function SquareSearchPage() {
-  const [params, setParams] = useSearchParams(),
-    [loaded, setLoaded] = useState<PublicEntrySummary[]>([]),
-    [nextCursor, setNextCursor] = useState<string | null | undefined>(undefined)
+  const client = useQueryClient()
+  const [params, setParams] = useSearchParams()
   const q = params.get("q") ?? "",
     category = params.get("category") ?? "",
     tag = params.get("tag") ?? "",
@@ -333,40 +333,39 @@ export function SquareSearchPage() {
     sort,
     limit: "24",
   })
-  const results = useQuery({
-    queryKey: queryKeys.squareSearch(requestParams.toString()),
-    queryFn: () =>
+  const requestSignature = requestParams.toString()
+  const searchKey = queryKeys.squareSearch(requestParams.toString())
+  const results = useInfiniteQuery({
+    queryKey: searchKey,
+    initialPageParam: null as string | null,
+    queryFn: ({ pageParam, signal }) =>
       apiGet<CursorPage<PublicEntrySummary>>(
-        `/api/public/search?${requestParams}`
+        `/api/public/search?${requestSignature}${pageParam ? `&cursor=${encodeURIComponent(pageParam)}` : ""}`,
+        { signal }
       ),
+    getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
   })
   const visible = useMemo(
     () =>
-      [...(results.data?.items ?? []), ...loaded].filter(
+      (results.data?.pages.flatMap((page) => page.items) ?? []).filter(
         (value, index, all) =>
           all.findIndex((item) => item.id === value.id) === index
       ),
-    [loaded, results.data]
+    [results.data]
   )
-  const currentCursor =
-    nextCursor === undefined ? results.data?.next_cursor : nextCursor
-  const loadMore = useMutation({
-    mutationFn: () =>
-      apiGet<CursorPage<PublicEntrySummary>>(
-        `/api/public/search?${requestParams}&cursor=${encodeURIComponent(currentCursor!)}`
-      ),
-    onSuccess: (page) => {
-      setLoaded((current) => [...current, ...page.items])
-      setNextCursor(page.next_cursor)
-    },
-  })
   const change = (key: string, value: string) => {
     const next = new URLSearchParams(params)
     if (value) next.set(key, value)
     else next.delete(key)
-    setLoaded([])
-    setNextCursor(undefined)
     setParams(next)
+  }
+  const loadMore = async () => {
+    const result = await results.fetchNextPage()
+    if (result.error instanceof ApiError && result.error.status === 409 && result.error.payload.code === "cursor_expired") {
+      await client.cancelQueries({ queryKey: searchKey })
+      await client.resetQueries({ queryKey: searchKey })
+      toast.info("广场内容已更新，搜索结果已从第一页重新加载")
+    }
   }
   const sortLabel =
     sort === "latest" ? "最新发布" : sort === "updated" ? "最近更新" : "相关度"
@@ -375,7 +374,7 @@ export function SquareSearchPage() {
       <div className="max-w-3xl">
         <h1 className="text-2xl font-semibold">搜索广场</h1>
         <div className="mt-5">
-          <SearchForm initial={q} />
+          <SearchForm key={q} initial={q} />
         </div>
         <div className="mt-4 flex flex-wrap gap-3">
           <Select
@@ -397,8 +396,6 @@ export function SquareSearchPage() {
             <Button
               variant="ghost"
               onClick={() => {
-                setLoaded([])
-                setNextCursor(undefined)
                 setParams(q ? { q } : {})
               }}
             >
@@ -413,14 +410,14 @@ export function SquareSearchPage() {
         ) : (
           <EntryList entries={visible} empty="没有符合条件的公开词条" />
         )}
-        {currentCursor && (
+        {results.hasNextPage && (
           <div className="mt-6 flex justify-center">
             <Button
               variant="outline"
-              disabled={loadMore.isPending}
-              onClick={() => loadMore.mutate()}
+              disabled={results.isFetchingNextPage}
+              onClick={() => void loadMore()}
             >
-              {loadMore.isPending && <Spinner data-icon="inline-start" />}
+              {results.isFetchingNextPage && <Spinner data-icon="inline-start" />}
               加载更多
             </Button>
           </div>
@@ -432,7 +429,7 @@ export function SquareSearchPage() {
 
 export function PublicCategoriesPage() {
   const categories = useQuery({
-    queryKey: ["public-categories"],
+    queryKey: queryKeys.publicCategories,
     queryFn: () => apiGet<PublicCategory[]>("/api/public/categories"),
   })
   return (
@@ -472,7 +469,7 @@ export function PublicCategoriesPage() {
 export function PublicCategoryPage() {
   const { slug = "" } = useParams()
   const category = useQuery({
-    queryKey: ["public-category", slug],
+    queryKey: queryKeys.publicCategory(slug),
     queryFn: () =>
       apiGet<PublicCategory & { redirected_from?: string | null }>(
         `/api/public/categories/${slug}`
@@ -519,7 +516,7 @@ export function PublicCategoryPage() {
 export function PublicTagPage() {
   const { slug = "" } = useParams()
   const tags = useQuery({
-    queryKey: ["public-tags"],
+    queryKey: queryKeys.publicTags,
     queryFn: () => apiGet<PublicTag[]>("/api/public/tags"),
   })
   const tag = tags.data?.find((item) => item.slug === slug)
@@ -740,7 +737,7 @@ function AuthorCorrections({
   const client = useQueryClient()
   const [responses, setResponses] = useState<Record<string, string>>({})
   const corrections = useQuery({
-    queryKey: ["public-entry-corrections", entryId],
+    queryKey: queryKeys.publicEntryCorrections(entryId),
     queryFn: () =>
       apiGet<PublicCorrection[]>(`/api/public/entries/${entryId}/corrections`),
     enabled: active,
@@ -753,7 +750,7 @@ function AuthorCorrections({
       }),
     onSuccess: async () => {
       await client.invalidateQueries({
-        queryKey: ["public-entry-corrections", entryId],
+        queryKey: queryKeys.publicEntryCorrections(entryId),
       })
       toast.success("纠错处理状态已更新")
     },
@@ -893,6 +890,7 @@ export function PublicEntryPage() {
       apiPost<{ article: { path: string } }>("/api/public/import", {
         entry_id: id,
         revision_id: entry.data!.revision_id,
+        expected_workspace_id: session!.workspace!.id,
         policy_version: entry.data!.reuse_policy_version,
         acknowledged: importAcknowledged,
         subscribe: subscribeImport,
@@ -924,7 +922,8 @@ export function PublicEntryPage() {
     mutationFn: () =>
       apiPost(`/api/public/entries/${id}/withdraw`, { reason: withdrawReason }),
     onSuccess: async () => {
-      await client.invalidateQueries({ queryKey: queryKeys.square })
+      await client.cancelQueries({ queryKey: queryKeys.square })
+      client.removeQueries({ queryKey: queryKeys.square })
       toast.success("公开词条已撤回")
       window.location.hash = "#/square"
     },
@@ -1322,14 +1321,14 @@ export function PublicVersionPage() {
   const { id = "", version = "" } = useParams(),
     numeric = Number(version)
   const item = useQuery({
-    queryKey: ["public-version", id, numeric],
+    queryKey: queryKeys.publicVersion(id, numeric),
     queryFn: () =>
       apiGet<PublicRevision>(`/api/public/entries/${id}/versions/${numeric}`),
     enabled: Boolean(id && Number.isInteger(numeric)),
     retry: false,
   })
   const diff = useQuery({
-    queryKey: ["public-diff", id, numeric],
+    queryKey: queryKeys.publicDiff(id, numeric - 1, numeric),
     queryFn: () =>
       apiGet<{ diff: string }>(
         `/api/public/entries/${id}/diff?from=${numeric - 1}&to=${numeric}`
@@ -1448,7 +1447,7 @@ export function PublicDiffPage() {
     to > 0 &&
     Math.abs(from - to) === 1
   const diff = useQuery({
-    queryKey: ["public-diff", id, from, to],
+    queryKey: queryKeys.publicDiff(id, from, to),
     queryFn: () =>
       apiGet<{ diff: string }>(
         `/api/public/entries/${id}/diff?from=${from}&to=${to}`
@@ -1479,7 +1478,7 @@ export function PublicDiffPage() {
 
 export function PublicCollectionsPage() {
   const collections = useQuery({
-    queryKey: ["public-collections"],
+    queryKey: queryKeys.publicCollections,
     queryFn: () => apiGet<PublicCollection[]>("/api/public/collections"),
   })
   return (

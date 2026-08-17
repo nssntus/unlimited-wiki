@@ -1628,3 +1628,39 @@ def test_completed_restore_residue_is_safe_to_backup_and_ignored_by_git(tmp_path
         cwd=repository, text=True, capture_output=True, check=True,
     ).stdout.splitlines()
     assert ignored == [".restore/master.key", ".restore-complete-deadbeef/master.key"]
+
+
+def test_backup_rejects_ordinary_table_masquerading_as_public_search_fts(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, _user, _article, _raw = seed_instance(source)
+    with platform.connect() as db:
+        db.execute("DROP TABLE public_search_fts")
+        db.execute("""
+            CREATE TABLE public_search_fts(
+                entry_id,title,summary,body_text,category_name,public_tags,attribution
+            )
+        """)
+        db.commit()
+    assert_backup_contract_rejects(source, tmp_path, "public search virtual table")
+
+
+def test_backup_rejects_conflicting_public_category_slug_namespace(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, _user, _article, _raw = seed_instance(source)
+    with platform.connect() as db:
+        db.execute(
+            "INSERT INTO public_categories(id,slug,name,created_at,updated_at) VALUES(?,?,?,?,?)",
+            ("a" * 32, "reserved-slug", "Category A", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+        )
+        db.execute(
+            "INSERT INTO public_categories(id,slug,name,created_at,updated_at) VALUES(?,?,?,?,?)",
+            ("b" * 32, "category-b", "Category B", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+        )
+        db.execute(
+            "INSERT INTO public_category_slug_redirects(slug,category_id,created_at) VALUES(?,?,?)",
+            ("reserved-slug", "b" * 32, "2026-01-01T00:00:00+00:00"),
+        )
+        db.commit()
+    assert_backup_contract_rejects(source, tmp_path, "category slug namespace")

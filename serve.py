@@ -47,7 +47,7 @@ from platform_store import (
 )
 from platform_review import PlatformReviewWorker
 from publication import public_markdown, snapshot_fingerprint
-from square_v2 import REUSE_POLICY_VERSION, canonical_public_url
+from square_v2 import PublicIndexWorker, REUSE_POLICY_VERSION, canonical_public_url
 from state_store import StateStore
 from wiki_service import LLMConfig, WikiService, article_summary
 
@@ -154,6 +154,7 @@ class WikiApp:
         self.review_worker = PlatformReviewWorker(
             self.platform, self.platform_reviewer, self.deployment.review_settings,
         ) if self.platform is not None and self.start_worker else None
+        self.public_index_worker = PublicIndexWorker(self.platform) if self.platform is not None and self.start_worker else None
 
     @property
     def multi_user(self) -> bool:
@@ -232,6 +233,9 @@ class WikiApp:
                         self.platform.authorized_workspace_action(user_id, workspace_id, "wiki.write")
                     ),
                     require_task_actor=True,
+                    path_remap_callback=lambda path_map, workspace_id=context.workspace_id: (
+                        self.platform.remap_public_import_paths(workspace_id, path_map)
+                    ),
                 )
                 with self._service_lock:
                     self._services[context.workspace_id] = service
@@ -348,6 +352,8 @@ class WikiApp:
             service.close()
         if self.review_worker is not None:
             self.review_worker.close()
+        if self.public_index_worker is not None:
+            self.public_index_worker.close()
 
     def export_workspace(self, context: SessionContext) -> bytes:
         workspace = self.platform.authorize_workspace(context.user_id, context.workspace_id, "workspace.manage")
@@ -943,11 +949,20 @@ def make_handler(app: WikiApp):
                 raw_limit = _single_query(parsed, "limit") or "24"
                 if not raw_limit.isdecimal():
                     raise ApiError(400, "invalid limit")
-                return self._json(200, app.platform.search_public(
-                    query=_single_query(parsed, "q"), category=_single_query(parsed, "category"),
-                    tag=_single_query(parsed, "tag"), sort=_single_query(parsed, "sort") or "relevance",
-                    cursor=_single_query(parsed, "cursor") or None, limit=int(raw_limit),
-                ))
+                try:
+                    result = app.platform.search_public(
+                        query=_single_query(parsed, "q"), category=_single_query(parsed, "category"),
+                        tag=_single_query(parsed, "tag"), sort=_single_query(parsed, "sort") or "relevance",
+                        cursor=_single_query(parsed, "cursor") or None, limit=int(raw_limit),
+                    )
+                except ValueError as exc:
+                    if str(exc).startswith("cursor does not match"):
+                        raise ApiError(
+                            409, "search results changed; restart from the first page",
+                            details={"code": "cursor_expired"},
+                        ) from exc
+                    raise
+                return self._json(200, result)
             if path == "/api/public/categories":
                 return self._json(200, app.platform.public_categories() if app.platform else [])
             match = re.fullmatch(r"/api/public/categories/([a-z0-9-]{1,64})", path)
@@ -1481,31 +1496,42 @@ def make_handler(app: WikiApp):
                 return self._json(200, response)
             if path == "/api/public/import":
                 _fields(
-                    data, {"entry_id", "revision_id", "subscribe", "policy_version", "acknowledged"},
-                    {"entry_id", "revision_id", "policy_version", "acknowledged"},
+                    data, {"entry_id", "revision_id", "expected_workspace_id", "subscribe", "policy_version", "acknowledged"},
+                    {"entry_id", "revision_id", "expected_workspace_id", "policy_version", "acknowledged"},
                 )
                 subscribe = data.get("subscribe", True)
                 if not isinstance(subscribe, bool): raise ApiError(422, "subscribe must be boolean")
+                expected_workspace_id = _string(data, "expected_workspace_id", maximum=32, required=True)
+                if expected_workspace_id != self.context.workspace_id:
+                    raise ApiError(409, "current workspace changed", details={"code": "workspace_changed"})
                 def import_action():
                     intent = app.platform.begin_public_import(
                         self.context, _string(data, "entry_id", maximum=32, required=True),
                         _string(data, "revision_id", maximum=32, required=True),
+                        expected_workspace_id=expected_workspace_id,
                         expected_policy_version=_string(data, "policy_version", maximum=80, required=True),
                         acknowledged=data.get("acknowledged") is True,
                     )
                     if intent.get("existing"):
+                        article = service.resolve_article_id(intent["private_article_id"])
+                        if article["path"] != intent["private_path"]:
+                            intent = app.platform.update_public_import_path(
+                                self.context, intent["id"], intent["private_article_id"], article["path"],
+                            )
                         imported = {
-                            "article": service.read_article(intent["private_path"]),
+                            "article": article,
                             "operation_id": f"public-import-{intent['id']}", "replay": True,
                         }
                         response = intent
                     else:
-                        imported = service.import_public_article(intent)
+                        imported = None
                         try:
+                            imported = service.import_public_article(intent)
                             response = app.platform.finish_public_import(self.context, intent["id"], subscribe=subscribe)
                         except BaseException:
                             try:
-                                service.rollback(imported["operation_id"])
+                                if imported is not None:
+                                    service.rollback(imported["operation_id"])
                             finally:
                                 app.platform.abandon_public_import(self.context, intent["id"])
                             raise
@@ -1782,6 +1808,16 @@ def make_handler(app: WikiApp):
                 response, _ = self._idempotency(data, lambda: app.platform.relist_public(
                     self.context, match.group(1), _string(data, "reason", maximum=1000, required=True),
                 ))
+                return self._json(200, response)
+            if path == "/api/admin/public-index/retry":
+                self._require_role("admin")
+                _fields(data, {"entry_id"})
+                entry_id = _string(data, "entry_id", maximum=32) or None
+                response, _ = self._idempotency(
+                    data, lambda: app.platform.retry_public_index_jobs(self.context, entry_id),
+                )
+                if app.public_index_worker is not None:
+                    app.public_index_worker.wake()
                 return self._json(200, response)
             match = re.fullmatch(r"/api/admin/reports/([a-f0-9]{32})/decision", path)
             if match:

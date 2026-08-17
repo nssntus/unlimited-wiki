@@ -192,12 +192,14 @@ class WikiService:
         authorize_actor: Callable[[str], bool] | None = None,
         actor_guard: Callable[[str], object] | None = None,
         require_task_actor: bool = False,
+        path_remap_callback: Callable[[dict[str, str]], None] | None = None,
     ):
         self.root = project_root.resolve()
         (self.root / "wiki").mkdir(exist_ok=True)
         (self.root / "raw").mkdir(exist_ok=True)
         self.files = FileStore(self.root)
         self.state = StateStore(self.root)
+        self.path_remap_callback = path_remap_callback
         self._recover_path_projections()
         self._ensure_dynamic_registry()
         self.llm = llm_config or LLMConfig()
@@ -377,6 +379,7 @@ class WikiService:
                 continue
             if manifest.get("status") != "committed":
                 continue
+            recovered_paths: dict[str, str] = {}
             for old, new in manifest.get("metadata", {}).get("path_map", {}).items():
                 if not (self.root / "wiki" / new).is_file():
                     continue
@@ -385,6 +388,9 @@ class WikiService:
                 except (FileNotFoundError, ValueError):
                     current = None
                 self.state.remap_article_path(old, new, base_revision=current["revision"] if current else None)
+                recovered_paths[old] = new
+            if recovered_paths and self.path_remap_callback is not None:
+                self.path_remap_callback(recovered_paths)
 
     def _remap_committed_paths(self, operation_id: str, path_map: dict[str, str]) -> None:
         remapped: list[tuple[str, str]] = []
@@ -392,6 +398,8 @@ class WikiService:
             for old, new in path_map.items():
                 self.state.remap_article_path(old, new, base_revision=self.read_article(new)["revision"])
                 remapped.append((old, new))
+            if self.path_remap_callback is not None:
+                self.path_remap_callback(path_map)
         except BaseException:
             self.files.rollback(operation_id)
             for old, new in reversed(remapped):
@@ -432,6 +440,12 @@ class WikiService:
         order = {item["category_id"]: index for index, item in enumerate(ordered_categories)}
         rows.sort(key=lambda row: (order.get(row["primary_category_id"], 999), row["title"].casefold()))
         return rows
+
+    def resolve_article_id(self, article_id: str) -> dict:
+        matches = [item for item in self.articles() if item.get("article_id") == article_id]
+        if len(matches) != 1:
+            raise RuntimeError("private imported article requires repair")
+        return matches[0]
 
     def _wiki_path(self, rel: str) -> Path:
         if rel in {"index.md", "log.md"}:
@@ -717,13 +731,35 @@ class WikiService:
             article_id = str(intent["private_article_id"])
             entry_id = str(intent["public_entry_id"])
             revision_id = str(intent["public_revision_id"])
-            operation_id = f"public-import-{intent['id']}"
+            operation_base = f"public-import-{intent['id']}"
+            operation_id = operation_base
             target = self.root / "wiki" / rel
             if target.is_file():
                 article = self.read_article(rel)
                 if article.get("article_id") != article_id:
                     raise RuntimeError("public import target is occupied")
+                for manifest_path in sorted(self.files.history_root.glob(f"{operation_base}*/manifest.json")):
+                    try:
+                        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    metadata = manifest.get("metadata", {})
+                    if (
+                        manifest.get("status") == "committed"
+                        and metadata.get("public_entry_id") == entry_id
+                        and metadata.get("public_revision_id") == revision_id
+                    ):
+                        operation_id = str(manifest.get("operation_id") or operation_id)
+                        break
                 return {"operation_id": operation_id, "article": article, "replay": True}
+            attempt = 1
+            while True:
+                try:
+                    self.files.operation(operation_id)
+                except FileNotFoundError:
+                    break
+                attempt += 1
+                operation_id = f"{operation_base}-attempt-{attempt}"
             snapshot = intent["snapshot"]
             markdown = str(snapshot.get("markdown") or "")
             if not kw.parse_title(markdown):
@@ -753,6 +789,7 @@ class WikiService:
                 self.files.commit(
                     changes, kind="public-import", operation_id=operation_id,
                     metadata={"public_entry_id": entry_id, "public_revision_id": revision_id},
+                    must_not_exist_paths={f"wiki/{rel}"},
                 )
             except FileExistsError:
                 if target.is_file() and self.read_article(rel).get("article_id") == article_id:

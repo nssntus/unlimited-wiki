@@ -1,10 +1,10 @@
 import { useMemo, useState } from "react"
-import { useQuery } from "@tanstack/react-query"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Link, useLocation, useNavigate } from "react-router-dom"
 import { Clock3Icon, CopyIcon, EllipsisIcon, ExternalLinkIcon, FilePenLineIcon, InfoIcon, MergeIcon, RefreshCwIcon, SendIcon, Settings2Icon } from "lucide-react"
 import { toast } from "sonner"
 
-import { apiGet, type Article, type ArticleSummary, queryKeys, type Task } from "@/lib/api"
+import { apiGet, apiPost, type Article, type ArticleSummary, queryKeys, type Task } from "@/lib/api"
 import { GenerationDialog, type GenerationRequest } from "@/features/generation-dialog"
 import { GovernanceDialog } from "@/features/governance-dialog"
 import { MarkdownContent, StatusBadge } from "@/components/markdown-content"
@@ -21,6 +21,7 @@ import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTi
 import { Separator } from "@/components/ui/separator"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Textarea } from "@/components/ui/textarea"
 import { useSession } from "@/features/session-context"
 
 function pathFromLocation(pathname: string) {
@@ -145,6 +146,9 @@ export function ArticlePage() {
   const navigate = useNavigate()
   const [generation, setGeneration] = useState<GenerationRequest | null>(null)
   const [govern, setGovern] = useState(false)
+  const [withdrawOpen, setWithdrawOpen] = useState(false)
+  const [withdrawReason, setWithdrawReason] = useState("")
+  const client = useQueryClient()
   const path = pathFromLocation(location.pathname)
   const articles = useQuery({ queryKey: queryKeys.articles, queryFn: () => apiGet<ArticleSummary[]>("/api/articles") })
   const defaultPath = articles.data?.[0]?.path
@@ -157,6 +161,20 @@ export function ArticlePage() {
   })
   const keywords = useQuery({ queryKey: ["keywords"], queryFn: () => apiGet<{ term: string; path: string | null; title: string; kind: "page" | "missing" }[]>("/api/keywords") })
   const content = useMemo(() => article.data ? stripMetadata(article.data.markdown) : "", [article.data])
+  const withdraw = useMutation({
+    mutationFn: () => apiPost(`/api/public/entries/${article.data!.publication.public_entry_id}/withdraw`, {
+      reason: withdrawReason.trim(),
+    }),
+    onSuccess: async () => {
+      await client.cancelQueries({ queryKey: queryKeys.square })
+      client.removeQueries({ queryKey: queryKeys.square })
+      await client.invalidateQueries({ queryKey: queryKeys.article(articlePath) })
+      setWithdrawOpen(false)
+      setWithdrawReason("")
+      toast.success("该公开词条已永久撤回")
+    },
+    onError: (error) => toast.error(error.message),
+  })
 
   if (articles.isLoading || (articlePath && article.isLoading)) return <PageFrame><div className="mx-auto max-w-3xl"><Skeleton className="h-6 w-40" /><Skeleton className="mt-8 h-12 w-3/5" /><Skeleton className="mt-12 h-72 w-full" /></div></PageFrame>
   if (!articlePath) return <PageFrame><Empty className="min-h-[60svh]"><EmptyHeader><EmptyMedia variant="icon"><FilePenLineIcon /></EmptyMedia><EmptyTitle>知识库还是空的</EmptyTitle><EmptyDescription>{canWrite ? "将 Markdown 放入 Raw 后，从原料箱创建第一篇正本。" : "当前空间还没有可阅读的词条。"}</EmptyDescription></EmptyHeader>{canWrite && <EmptyContent><Button render={<Link to="/inbox" />}>打开原料箱</Button></EmptyContent>}</Empty></PageFrame>
@@ -188,7 +206,7 @@ export function ArticlePage() {
           {data.remote_task?.status === "failed" && <Alert variant="destructive" className="mb-6"><InfoIcon /><AlertTitle>词条生成失败</AlertTitle><AlertDescription>{data.remote_task.error_type || "model_error"} · {data.remote_task.error_message || "请在任务中心重试。"}</AlertDescription></Alert>}
           {data.remote_task?.result?.conflict === true && <Alert className="mb-6"><InfoIcon /><AlertTitle>生成结果未覆盖当前正文</AlertTitle><AlertDescription>生成期间正文发生变化，结果已被冲突保护拦截；请在任务中心基于当前正文重试。</AlertDescription></Alert>}
           {data.publication.state === "update_available" && <Alert className="mb-6"><RefreshCwIcon /><AlertTitle>广场版本需要更新</AlertTitle><AlertDescription className="flex flex-wrap items-center justify-between gap-3"><span>当前私有正文或公开可见信息已更新，广场仍展示版本 {data.publication.public_version}。{canWrite ? "是否提交本次更新重新审核？" : "请联系 Editor 或 Owner 提交更新。"}</span>{canWrite && <Button size="sm" render={<Link to={`/share?article=${encodeURIComponent(data.path)}`} />}>提交广场更新</Button>}</AlertDescription></Alert>}
-          {data.publication.state === "removed" && <Alert variant="destructive" className="mb-6"><InfoIcon /><AlertTitle>该词条已从广场下架</AlertTitle><AlertDescription className="flex flex-wrap items-center justify-between gap-3"><span>{data.publication.moderation_reason || (canWrite ? "请根据通知中的处理理由修改私有正本。原公开快照不会被改写。" : "原公开快照已下架，私有正文仍可阅读。")}</span>{canWrite && <Button variant="outline" size="sm" render={<Link to={`/edit/${data.path}`} />}>修改正文</Button>}</AlertDescription></Alert>}
+          {data.publication.state === "removed" && <Alert variant="destructive" className="mb-6"><InfoIcon /><AlertTitle>该词条已从广场下架</AlertTitle><AlertDescription><span>{data.publication.moderation_reason || (canWrite ? "请根据通知中的处理理由修改私有正本。原公开快照不会被改写。" : "原公开快照已下架，私有正文仍可阅读。")}</span>{canWrite && <div className="mt-3 flex flex-wrap gap-2"><Button variant="outline" size="sm" render={<Link to={`/edit/${data.path}`} />}>修改正文</Button>{data.publication.public_entry_id && <Button variant="destructive" size="sm" onClick={() => setWithdrawOpen(true)}>永久撤回公开词条</Button>}</div>}</AlertDescription></Alert>}
           {data.publication.state === "relist_available" && <Alert className="mb-6"><RefreshCwIcon /><AlertTitle>修改完成后可申请重新上架</AlertTitle><AlertDescription className="flex flex-wrap items-center justify-between gap-3"><span>当前正文已不同于被下架版本。{canWrite ? "提交后会创建新快照，并重新经过 AI 预审和 Admin 审核。" : "请联系 Editor 或 Owner 申请重新上架。"}</span>{canWrite && <Button size="sm" render={<Link to={`/share?article=${encodeURIComponent(data.path)}`} />}>申请重新上架</Button>}</AlertDescription></Alert>}
           {(data.publication.state === "submitted" || data.publication.state === "update_pending" || data.publication.state === "relist_pending") && <Alert className="mb-6"><Clock3Icon /><AlertTitle>{data.publication.state === "update_pending" ? "广场更新正在审核" : data.publication.state === "relist_pending" ? "重新上架申请正在审核" : "广场投稿正在审核"}</AlertTitle><AlertDescription className="flex flex-wrap items-center justify-between gap-3"><span>{data.publication.submission_matches_current ? "当前正文已固化为审核快照，审核通过前不会改变广场内容。" : "提交审核后正文又发生了变化；当前审核快照不会自动变化，审核结束后可再次提交。"}</span>{canWrite && data.publication.submission_id && <Button variant="outline" size="sm" render={<Link to={`/submissions/${data.publication.submission_id}`} />}>查看进度</Button>}</AlertDescription></Alert>}
           <PageTitle
@@ -214,6 +232,13 @@ export function ArticlePage() {
       {canWrite && <GenerationDialog request={generation} onOpenChange={(open) => !open && setGeneration(null)} />}
       {canWrite && <GovernanceDialog key={data.revision} article={data} open={govern} onOpenChange={setGovern} />}
       {canWrite && data.publication.state === "update_available" && <PublicationUpdatePrompt key={updatePromptKey} article={data} />}
+      <AlertDialog open={withdrawOpen} onOpenChange={(open) => { setWithdrawOpen(open); if (!open) setWithdrawReason("") }}>
+        <AlertDialogContent>
+          <AlertDialogHeader><AlertDialogTitle>永久撤回该公开词条？</AlertDialogTitle><AlertDialogDescription>这会把 Admin 下架状态转为作者终态撤回。所有公开版本将继续不可访问，Admin 也不能重新上架；已合法导入的私人副本不受影响。</AlertDialogDescription></AlertDialogHeader>
+          <Textarea value={withdrawReason} onChange={(event) => setWithdrawReason(event.target.value)} maxLength={1000} placeholder="说明永久撤回理由" />
+          <AlertDialogFooter><AlertDialogCancel>取消</AlertDialogCancel><AlertDialogAction variant="destructive" disabled={withdraw.isPending || !withdrawReason.trim()} onClick={() => withdraw.mutate()}>确认永久撤回</AlertDialogAction></AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </>
   )
 }

@@ -153,7 +153,7 @@ export const REUSE_POLICY_TEXT = "允许登录用户将本词条当时的当前�
 export const IMPORT_CONFIRMATION_TEXT = "将把本词条当前公开版本复制到你的私人 Wiki。复制后会形成可独立编辑的副本，并保留来源词条、公开版本和作者署名；后续公开更新不会自动覆盖。再次公开或向平台外传播时，仍需遵守原始来源和平台规则。"
 export const GOVERNANCE_RETENTION_TEXT = "为处理争议、防止重复滥用并保留必要的处理依据，举报与纠错记录目前会长期保留，直至平台发布并实施独立的数据保留政策。相关记录不会公开，仅限获得授权的人员按职责访问。"
 export type PublicEntrySummary = { id: string; revision_id: string; version: number; title: string; category: PublicCategory; tags: PublicTag[]; attribution: string; summary: string; published_at: string; first_published_at: string; updated_at: string; source_count: number; content_hash: string; featured: boolean }
-export type PublicEntry = { id: string; revision_id: string; version: number; snapshot: Submission["snapshot"]; attribution: string; published_at: string; first_published_at: string; content_hash: string; category: PublicCategory; tags: PublicTag[]; sources: PublicSource[]; source_count: number; correction_count: number; review: { ai_policy_version: string | null; ai_model: string | null; ai_rules_version: string | null; issues: Array<{ code?: string; location?: string; explanation?: string }>; admin_reason: string }; author_profile: { id: string; display_name: string } | null; reuse_permission: ReusePermission; reuse_policy_version: string; steward_label: string; subscribed: boolean; imported: boolean; featured: boolean; can_manage: boolean; related: Array<{ id: string; title: string; summary: string }>; references: Array<{ id: string; title: string; summary: string }> }
+export type PublicEntry = { id: string; revision_id: string; version: number; snapshot: Submission["snapshot"]; attribution: string; published_at: string; first_published_at: string; content_hash: string; category: PublicCategory; tags: PublicTag[]; sources: PublicSource[]; source_count: number; correction_count: number; review: { ai_policy_version: string | null; ai_model: string | null; ai_rules_version: string | null; issues: Array<{ code: string }>; admin_reason: string }; author_profile: { id: string; display_name: string } | null; reuse_permission: ReusePermission; reuse_policy_version: string; steward_label: string; subscribed: boolean; imported: boolean; featured: boolean; can_manage: boolean; related: Array<{ id: string; title: string; summary: string }>; references: Array<{ id: string; title: string; summary: string }> }
 export type PublicHome = { categories: PublicCategory[]; tags: PublicTag[]; featured: PublicEntrySummary[]; latest: PublicEntrySummary[]; updated: PublicEntrySummary[]; collections: PublicCollection[] }
 export type PublicRevision = { id: string; version: number; snapshot?: Submission["snapshot"]; content_hash: string; published_at: string; visibility?: "public" | "isolated"; isolation_reason?: string | null }
 export type PublicCollection = { id: string; slug: string; title: string; description: string; published_at: string; entry_count?: number; items?: Array<{ id: string; title: string; summary: string; curator_note: string }> }
@@ -166,6 +166,7 @@ export type AdminSquareState = {
   collections: Array<PublicCollection & { status: "draft" | "published" | "disabled"; updated_at: string }>
   category_mappings: Array<{ private_label: string; category_id: string | null; status: string; updated_at: string }>
   corrections: Array<PublicCorrection & { entry_title: string }>
+  index_jobs: Array<{ entry_id: string; status: "pending" | "running" | "retry" | "dead"; attempts: number; last_error: string | null; not_before: string | null; updated_at: string }>
 }
 export type Notification = { id: string; kind: string; object_type: string; object_id: string; title: string; message: string; read_at: string | null; created_at: string }
 export type AdminPublicEntry = { id: string; status: "published" | "removed_by_admin"; author_id: string; author_nickname: string; revision_id: string; version: number; snapshot: Submission["snapshot"]; content_hash: string; published_at: string; moderation_reason: string | null; moderated_at: string | null; featured: boolean; featured_order: number | null }
@@ -234,8 +235,8 @@ async function parseResponse<T>(response: Response): Promise<T> {
   return payload as T
 }
 
-export async function apiGet<T>(path: string): Promise<T> {
-  const response = await fetch(`${apiBase}${path}`, { credentials: "same-origin", headers: { Accept: "application/json" } })
+export async function apiGet<T>(path: string, options: { signal?: AbortSignal } = {}): Promise<T> {
+  const response = await fetch(`${apiBase}${path}`, { credentials: "same-origin", headers: { Accept: "application/json" }, signal: options.signal })
   return parseResponse<T>(response)
 }
 
@@ -268,13 +269,20 @@ export const queryKeys = {
   submission: (id: string) => ["submission", id] as const,
   notifications: ["notifications"] as const,
   square: ["square"] as const,
-  squareHome: ["square-home"] as const,
-  squareSearch: (params: string) => ["square-search", params] as const,
-  publicEntry: (id: string) => ["public-entry", id] as const,
-  publicVersions: (id: string) => ["public-versions", id] as const,
-  publicCollection: (slug: string) => ["public-collection", slug] as const,
-  publicProfile: (id: string) => ["public-profile", id] as const,
-  publicLibrary: ["public-library"] as const,
+  squareHome: ["square", "home"] as const,
+  squareSearch: (params: string) => ["square", "search", params] as const,
+  publicCategories: ["square", "categories"] as const,
+  publicTags: ["square", "tags"] as const,
+  publicCategory: (slug: string) => ["square", "category", slug] as const,
+  publicCollections: ["square", "collections"] as const,
+  publicEntry: (id: string) => ["square", "entry", id] as const,
+  publicVersions: (id: string) => ["square", "entry", id, "versions"] as const,
+  publicVersion: (id: string, version: number) => ["square", "entry", id, "version", version] as const,
+  publicDiff: (id: string, from: number, to: number) => ["square", "entry", id, "diff", from, to] as const,
+  publicEntryCorrections: (id: string) => ["square", "entry", id, "corrections"] as const,
+  publicCollection: (slug: string) => ["square", "collection", slug] as const,
+  publicProfile: (id: string) => ["square", "profile", id] as const,
+  publicLibrary: ["square", "me", "library"] as const,
   adminReviews: ["admin-reviews"] as const,
   adminSquare: ["admin-square"] as const,
   adminPublicEntries: (status: string) => ["admin-public-entries", status] as const,

@@ -1,11 +1,12 @@
 import json
 import sqlite3
+import time
 
 import pytest
 
 from platform_store import PlatformStore
 from publication import snapshot_fingerprint
-from square_v2 import REUSE_POLICY_VERSION, canonical_public_url, safe_public_url
+from square_v2 import PublicIndexWorker, REUSE_POLICY_VERSION, canonical_public_url, safe_public_url
 from wiki_service import WikiService
 
 
@@ -71,14 +72,10 @@ def test_square_search_uses_public_projection_cursor_and_chinese(square):
     assert page["next_cursor"] is None
     first_page = store.search_public(query="知识", sort="relevance", limit=1)
     assert first_page["next_cursor"]
-    # Removing an earlier result must not shift the next page or repeat rows.
+    # A changed FTS corpus expires old BM25 positions instead of repeating rows.
     store.remove_public(context, first_page["items"][0]["id"], "pagination race")
-    second_page = store.search_public(query="知识", sort="relevance", limit=1, cursor=first_page["next_cursor"])
-    assert second_page["items"][0]["id"] != first_page["items"][0]["id"]
-    assert second_page["items"][0]["id"] == next(
-        entry_id for entry_id in {first["public_entry_id"], second["public_entry_id"]}
-        if entry_id != first_page["items"][0]["id"]
-    )
+    with pytest.raises(ValueError, match="cursor does not match"):
+        store.search_public(query="知识", sort="relevance", limit=1, cursor=first_page["next_cursor"])
     with pytest.raises(ValueError, match="cursor does not match"):
         store.search_public(query="不同查询", sort="relevance", limit=1, cursor=first_page["next_cursor"])
 
@@ -118,6 +115,44 @@ def test_search_index_failure_does_not_rollback_public_fact_and_is_retryable(squ
     )
     store.remove_public(context, entry_id, "policy review")
     assert store.search_public(query="Index retry")["items"] == []
+
+
+def test_public_index_worker_retries_pending_projection_without_restart(square, monkeypatch):
+    store, context, category, _tag = square
+    snapshot = _snapshot("Worker retry", "Search projection", category_id=category["id"])
+    preview = store.create_preview(
+        context, "concepts/worker-retry.md", "r1", "0" * 32,
+        snapshot_fingerprint(snapshot), snapshot,
+    )
+    submission = store.submit_preview(context, preview["preview_id"])
+    store.ai_decide(submission["id"], "pass", {"summary": "pass", "issues": []})
+    original = store._sync_square_entry
+    monkeypatch.setattr(
+        store, "_sync_square_entry",
+        lambda _db, _entry_id: (_ for _ in ()).throw(sqlite3.OperationalError("temporary fts failure")),
+    )
+    approved = store.admin_decide(
+        context, submission["id"], "approve", "Admin reviewed",
+        public_category_id=category["id"],
+    )
+    monkeypatch.setattr(store, "_sync_square_entry", original)
+
+    worker = PublicIndexWorker(store)
+    try:
+        worker.wake()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            with store.connect() as db:
+                if db.execute(
+                    "SELECT 1 FROM public_index_jobs WHERE entry_id=?", (approved["public_entry_id"],),
+                ).fetchone() is None:
+                    break
+            time.sleep(0.02)
+        else:
+            pytest.fail("public index worker did not reconcile the pending job")
+    finally:
+        worker.close()
+    assert store.search_public(query="Worker retry")["items"][0]["id"] == approved["public_entry_id"]
 
 
 def test_public_dto_does_not_leak_private_snapshot_fields_and_snapshot_is_immutable(square):
@@ -175,6 +210,45 @@ Visible body
     assert tuple(after) == tuple(before)
     assert store.public_home()["featured"][0]["id"] == entry_id
     assert store.search_public(query="projection")["items"][0]["source_count"] == 1
+
+
+def test_legacy_public_preamble_does_not_expose_raw_paths(square):
+    store, context, category, _tag = square
+    snapshot = _snapshot("Legacy projection", "Visible body", category_id=category["id"])
+    snapshot["markdown"] = """# Legacy projection
+
+> Category: tools
+> Status: 词条
+
+> Evidence: internal research
+> Raw: ../../raw/private/source.md
+
+Visible body
+
+> Raw: this body quote is public prose
+"""
+    approved = _publish(
+        store, context, snapshot, article_id="9" * 32, source_revision="r1",
+        category_id=category["id"],
+    )
+    with store.connect() as db:
+        before = db.execute(
+            "SELECT snapshot_json,content_hash FROM public_revisions WHERE entry_id=?",
+            (approved["public_entry_id"],),
+        ).fetchone()
+    public = store.get_public_v2(approved["public_entry_id"])
+    markdown = public["snapshot"]["markdown"]
+    assert "../../raw/private/source.md" not in markdown
+    assert "internal research" not in markdown
+    assert "Visible body" in markdown
+    assert "this body quote is public prose" in markdown
+    assert store.search_public(query="private source")["items"] == []
+    with store.connect() as db:
+        after = db.execute(
+            "SELECT snapshot_json,content_hash FROM public_revisions WHERE entry_id=?",
+            (approved["public_entry_id"],),
+        ).fetchone()
+    assert tuple(after) == tuple(before)
 
 
 def test_public_sources_require_explicit_global_http_urls(square):
@@ -317,10 +391,12 @@ def test_import_is_idempotent_and_keeps_private_identity_and_provenance(square, 
     revision_id = store.get_public_v2(entry_id)["revision_id"]
     first = store.begin_public_import(
         context, entry_id, revision_id,
+        expected_workspace_id=context.workspace_id,
         expected_policy_version=REUSE_POLICY_VERSION, acknowledged=True,
     )
     replay = store.begin_public_import(
         context, entry_id, revision_id,
+        expected_workspace_id=context.workspace_id,
         expected_policy_version=REUSE_POLICY_VERSION, acknowledged=True,
     )
     assert replay["id"] == first["id"] and replay["replay"] is True
@@ -344,6 +420,7 @@ def test_import_is_idempotent_and_keeps_private_identity_and_provenance(square, 
     store.set_reuse_permission(context, entry_id, "view_only")
     existing = store.begin_public_import(
         context, entry_id, revision_id,
+        expected_workspace_id=context.workspace_id,
         expected_policy_version=REUSE_POLICY_VERSION, acknowledged=True,
     )
     assert existing["id"] == first["id"] and existing["existing"] is True
@@ -484,6 +561,7 @@ def test_import_only_accepts_current_revision_and_later_approval_keeps_entry_per
     with pytest.raises(FileNotFoundError):
         store.begin_public_import(
             context, first["public_entry_id"], first_revision,
+            expected_workspace_id=context.workspace_id,
             expected_policy_version=REUSE_POLICY_VERSION, acknowledged=True,
         )
 
@@ -491,6 +569,7 @@ def test_import_only_accepts_current_revision_and_later_approval_keeps_entry_per
 @pytest.mark.parametrize("url", [
     "http://2130706433/x", "http://127.1/x", "http://0177.0.0.1/x",
     "http://0x7f000001/x", "https://[::ffff:127.0.0.1]/x",
+    "http://0x7f.1/x", "http://0xc0.0250.1.1/x", "http://127.0x0.0.1/x",
     "\nhttps://example.com/x", "https://exa mple.com/x", "https://example.com:99999/x",
 ])
 def test_public_url_rejects_noncanonical_or_non_global_hosts(url):
@@ -517,6 +596,9 @@ def test_public_source_output_revalidates_legacy_rows(square):
         "label": "example.com", "url": "https://example.com/reference", "kind": "reference",
     }]
     assert result["source_count"] == 1
+    store.admin_set_featured(context, entry_id, True, "source count", 0)
+    assert store.search_public(query="Output fence")["items"][0]["source_count"] == 1
+    assert store.public_home()["featured"][0]["source_count"] == 1
 
 
 def test_stale_account_context_cannot_write_square_state(square):
@@ -585,3 +667,124 @@ def test_category_slug_redirect_merge_mapping_and_revision_taxonomy(square):
     result = store.admin_map_category(context, "private-research", other["id"])
     assert result["migrated"] == 1
     assert store.get_public_v2(unmapped["public_entry_id"])["category"]["id"] == other["id"]
+
+
+def test_public_review_issues_are_allowlisted_without_model_text(square):
+    store, context, category, _tag = square
+    snapshot = _snapshot("Review projection", "Visible", category_id=category["id"])
+    preview = store.create_preview(
+        context, "concepts/review.md", "r1", "d" * 32,
+        snapshot_fingerprint(snapshot), snapshot,
+    )
+    submission = store.submit_preview(context, preview["preview_id"])
+    private_text = "private-research raw/secret.md"
+    store.ai_decide(submission["id"], "pass", {
+        "summary": "pass",
+        "issues": [
+            {"code": "privacy", "location": private_text, "explanation": private_text},
+            {"code": "invented", "explanation": private_text},
+        ],
+    })
+    approved = store.admin_decide(
+        context, submission["id"], "approve", "Admin reviewed", public_category_id=category["id"],
+    )
+    public = store.get_public_v2(approved["public_entry_id"])
+    assert public["review"]["issues"] == [{"code": "privacy"}]
+    assert private_text not in json.dumps(public, ensure_ascii=False)
+
+
+def test_import_workspace_precondition_and_recovered_operation_retry(square):
+    store, context, category, _tag = square
+    approved = _publish(
+        store, context,
+        _snapshot("Recoverable import", "Body", category_id=category["id"], permission="allow_private_copy"),
+        article_id="e" * 32, source_revision="r1", category_id=category["id"],
+    )
+    detail = store.get_public_v2(approved["public_entry_id"])
+    with pytest.raises(ValueError, match="workspace changed"):
+        store.begin_public_import(
+            context, approved["public_entry_id"], detail["revision_id"],
+            expected_workspace_id="0" * 32,
+            expected_policy_version=REUSE_POLICY_VERSION, acknowledged=True,
+        )
+    with store.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM public_imports").fetchone()[0] == 0
+
+    intent = store.begin_public_import(
+        context, approved["public_entry_id"], detail["revision_id"],
+        expected_workspace_id=context.workspace_id,
+        expected_policy_version=REUSE_POLICY_VERSION, acknowledged=True,
+    )
+    service = WikiService(store.workspace_root(context.workspace_root_name), start_worker=False)
+    try:
+        base = f"public-import-{intent['id']}"
+        service.files.commit({"wiki/recovery-probe.md": "probe"}, kind="test", operation_id=base)
+        service.files.rollback(base)
+        imported = service.import_public_article(intent)
+        assert imported["operation_id"] == f"{base}-attempt-2"
+        assert imported["article"]["article_id"] == intent["private_article_id"]
+        replayed = service.import_public_article(intent)
+        assert replayed["operation_id"] == imported["operation_id"]
+        assert replayed["replay"] is True
+        store.finish_public_import(context, intent["id"])
+        store.remap_public_import_paths(
+            context.workspace_id, {intent["private_path"]: "concepts/moved-import.md"},
+        )
+        assert store.my_square_library(context)["imports"][0]["private_path"] == "concepts/moved-import.md"
+    finally:
+        service.close()
+
+
+def test_stale_search_projection_is_hidden_from_profile_collection_and_related(square):
+    store, context, category, _tag = square
+    first = _publish(
+        store, context, _snapshot("Stale title", "Body", category_id=category["id"]),
+        article_id="1" * 32, source_revision="r1", category_id=category["id"],
+    )
+    second = _publish(
+        store, context, _snapshot("Related peer", "Body", category_id=category["id"]),
+        article_id="2" * 32, source_revision="r1", category_id=category["id"],
+    )
+    profile = store.set_public_profile(context, True, "Author", "Bio")
+    collection = store.admin_upsert_collection(
+        context, None, "stale-check", "Stale check", "", "published",
+        [{"entry_id": first["public_entry_id"]}], "curated",
+    )
+    with store.connect() as db:
+        db.execute("UPDATE public_entries SET public_profile_id=? WHERE id=?", (profile["id"], first["public_entry_id"]))
+        new_revision = db.execute(
+            "SELECT current_revision_id FROM public_entries WHERE id=?", (second["public_entry_id"],),
+        ).fetchone()[0]
+        db.execute("UPDATE public_entries SET current_revision_id=? WHERE id=?", (new_revision, first["public_entry_id"]))
+        db.commit()
+    assert store.get_public_profile(profile["id"])["entries"] == []
+    assert store.get_public_collection(collection["slug"])["items"] == []
+    assert all(item["id"] != first["public_entry_id"] for item in store.related_public(second["public_entry_id"]))
+
+
+def test_taxonomy_refreshes_search_and_historical_slugs_are_reserved(square):
+    store, context, category, tag = square
+    published = _publish(
+        store, context, _snapshot("Taxonomy projection", "Body", category_id=category["id"], tag_ids=[tag["id"]]),
+        article_id="4" * 32, source_revision="r1", category_id=category["id"], tag_ids=[tag["id"]],
+    )
+    store.admin_upsert_category(context, category["id"], "knowledge-new", "独特新分类词", "", "active", 0)
+    assert store.search_public(query="独特新分类词")["items"][0]["id"] == published["public_entry_id"]
+    with pytest.raises(ValueError, match="reserved"):
+        store.admin_upsert_category(context, None, "knowledge-systems", "劫持", "", "active", 0)
+    assert store.resolve_public_category("knowledge-systems")["id"] == category["id"]
+    store.admin_upsert_tag(context, tag["id"], "retrieval", "独特新标签词", "active")
+    assert store.search_public(query="独特新标签词")["items"][0]["id"] == published["public_entry_id"]
+
+
+def test_author_can_terminally_withdraw_admin_removed_entry(square):
+    store, context, category, _tag = square
+    published = _publish(
+        store, context, _snapshot("Terminal withdraw", "Body", category_id=category["id"]),
+        article_id="5" * 32, source_revision="r1", category_id=category["id"],
+    )
+    entry_id = published["public_entry_id"]
+    store.remove_public(context, entry_id, "moderated")
+    assert store.author_withdraw_public(context, entry_id, "author final decision")["status"] == "withdrawn_by_author"
+    with pytest.raises(FileNotFoundError):
+        store.relist_public(context, entry_id, "cannot restore")

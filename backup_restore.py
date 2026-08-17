@@ -125,7 +125,8 @@ PLATFORM_OPTIONAL_SCHEMA = {
         "entry_id", "revision_id", "title", "summary", "body_text", "public_category_id", "category_name",
         "public_tags", "attribution", "first_published_at", "updated_at", "status",
     },
-    "public_index_jobs": {"entry_id", "status", "attempts", "last_error", "updated_at"},
+    "public_index_jobs": {"entry_id", "status", "attempts", "last_error", "not_before", "updated_at"},
+    "public_search_meta": {"id", "generation"},
     "public_revision_sources": {"revision_id", "position", "label", "url", "kind"},
     "public_revision_reviews": {
         "revision_id", "ai_policy_version", "ai_model", "ai_rules_version", "ai_report_json",
@@ -204,6 +205,7 @@ PLATFORM_OPTIONAL_PRIMARY_KEYS = {
     "curation_records": ("id",),
     "public_search_documents": ("entry_id",),
     "public_index_jobs": ("entry_id",),
+    "public_search_meta": ("id",),
     "public_revision_sources": ("revision_id", "position"),
     "public_revision_reviews": ("revision_id",),
     "public_revision_taxonomy": ("revision_id",),
@@ -267,12 +269,17 @@ PLATFORM_TEXT_IDENTITY_COLUMNS = {
     "public_collection_items": {"collection_id", "entry_id"},
     "curation_records": {"id", "object_id", "curator_id"},
     "public_search_documents": {"entry_id", "revision_id", "public_category_id"},
+    "public_index_jobs": {"entry_id"},
     "public_revision_sources": {"revision_id"},
     "public_revision_reviews": {"revision_id", "reviewed_by"},
     "public_revision_taxonomy": {"revision_id", "category_id"},
     "public_revision_tags": {"revision_id", "tag_id"},
     "submission_review_attempts": {"submission_id"},
 }
+EXPECTED_PUBLIC_SEARCH_FTS_SQL = """CREATE VIRTUAL TABLE public_search_fts USING fts5(
+    entry_id UNINDEXED,title,summary,body_text,category_name,public_tags,attribution,
+    tokenize='unicode61 remove_diacritics 2'
+)"""
 WORKSPACE_TEXT_IDENTITY_COLUMNS = {
     "idempotency": {"endpoint", "key"},
     "tasks": {"id", "active_key"},
@@ -528,7 +535,7 @@ def _check_platform_correctness_indexes(db: sqlite3.Connection) -> list[str]:
 
         table = str(expected["table"])
         schema_type = db.execute(
-            "SELECT type FROM sqlite_schema WHERE name=?", (table,),
+            "SELECT type,sql FROM sqlite_schema WHERE name=?", (table,),
         ).fetchone()
         if schema_type is None:
             continue
@@ -572,12 +579,17 @@ def _check_application_schema(db: sqlite3.Connection, path: Path) -> list[str]:
     tables.extend((table, columns, False) for table, columns in optional.items())
     for table, required_columns, required in tables:
         schema_type = db.execute(
-            "SELECT type FROM sqlite_schema WHERE name=?", (table,),
+            "SELECT type,sql FROM sqlite_schema WHERE name=?", (table,),
         ).fetchone()
         if schema_type is None and not required:
             continue
         if schema_type is None or schema_type[0] != "table":
             raise RuntimeError(f"{label} SQLite schema is unsupported: {table}")
+        if table == "public_search_fts" and (
+            not schema_type[1]
+            or _sql_tokens(str(schema_type[1])) != _sql_tokens(EXPECTED_PUBLIC_SEARCH_FTS_SQL)
+        ):
+            raise RuntimeError("platform SQLite schema has an invalid public search virtual table")
         table_info = list(db.execute(f'PRAGMA table_info("{table}")'))
         columns = {str(row[1]) for row in table_info}
         legacy_platform_idempotency = table == "platform_idempotency" and "scope" not in columns
@@ -614,6 +626,28 @@ def _check_application_schema(db: sqlite3.Connection, path: Path) -> list[str]:
         if not expected_unique_keys.issubset(actual_unique_keys):
             raise RuntimeError(f"{label} SQLite schema is missing a unique constraint: {table}")
     if anchors is PLATFORM_SCHEMA_ANCHORS:
+        meta_table = db.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='public_search_meta'",
+        ).fetchone()
+        if meta_table is not None:
+            meta = db.execute(
+                "SELECT id,generation,typeof(generation) value_type FROM public_search_meta WHERE id=1",
+            ).fetchone()
+            if (
+                meta is None or meta[0] != 1 or meta[2] != "integer" or int(meta[1]) < 0
+                or db.execute("SELECT COUNT(*) FROM public_search_meta").fetchone()[0] != 1
+            ):
+                raise RuntimeError("platform SQLite schema has invalid public search metadata")
+        taxonomy_tables = db.execute("""
+            SELECT COUNT(*) FROM sqlite_schema
+            WHERE type='table' AND name IN ('public_categories','public_category_slug_redirects')
+        """).fetchone()[0]
+        if taxonomy_tables == 2 and db.execute("""
+            SELECT 1 FROM public_categories category
+            JOIN public_category_slug_redirects redirect ON redirect.slug=category.slug
+            WHERE redirect.category_id<>category.id LIMIT 1
+        """).fetchone() is not None:
+            raise RuntimeError("platform SQLite has a conflicting public category slug namespace")
         return _check_platform_correctness_indexes(db)
     return []
 
