@@ -102,6 +102,96 @@ def test_backup_preserves_non_sqlite_files_with_wal_and_shm_suffixes(tmp_path: P
         assert (target / path.relative_to(source)).read_bytes() == content
 
 
+def test_backup_allows_workspace_without_initialized_state(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform = PlatformStore(source)
+    user, _recovery = platform.register("owner@example.com", "Owner", "correct-horse-123")
+    state_root = source / "spaces" / user["workspace_root_name"] / ".wiki-state"
+    state_root.mkdir()
+
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    assert verify_backup(backup)["schema_version"] == 1
+
+
+@pytest.mark.parametrize("state_artifact", ["state.sqlite3-wal", "state.sqlite3-shm", "write.lock"])
+def test_backup_rejects_initialized_workspace_without_state_database(
+    tmp_path: Path, state_artifact: str,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform = PlatformStore(source)
+    user, _recovery = platform.register("owner@example.com", "Owner", "correct-horse-123")
+    state_root = source / "spaces" / user["workspace_root_name"] / ".wiki-state"
+    state_root.mkdir()
+    (state_root / state_artifact).write_bytes(b"orphan state artifact")
+
+    backup = tmp_path / "backup-001"
+    with pytest.raises(RuntimeError, match="SQLite database is missing"):
+        create_backup(source, backup)
+    assert not backup.exists()
+
+
+def test_verify_rejects_orphan_workspace_sqlite_sidecar(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    _platform, user, _article, _raw = seed_instance(source)
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+
+    state_root = backup / "spaces" / user["workspace_root_name"] / ".wiki-state"
+    database = state_root / "state.sqlite3"
+    database.unlink()
+    (state_root / "state.sqlite3-wal").write_bytes(b"orphan wal")
+    manifest_path = backup / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    database_relative = database.relative_to(backup).as_posix()
+    manifest["files"] = [item for item in manifest["files"] if item["path"] != database_relative]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="SQLite database is missing"):
+        verify_backup(backup)
+
+
+@pytest.mark.parametrize("extra_kind", ["file", "directory"])
+def test_verify_rejects_entries_outside_data_directories(tmp_path: Path, extra_kind: str):
+    source = tmp_path / "source"
+    source.mkdir()
+    seed_instance(source)
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    extra = backup / "extra.txt"
+    if extra_kind == "directory":
+        extra.mkdir()
+    else:
+        extra.write_bytes(b"extra")
+        manifest_path = backup / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["files"].append({
+            "path": "extra.txt", "size": extra.stat().st_size, "sha256": backup_restore._sha256(extra),
+        })
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="unsupported entries"):
+        verify_backup(backup)
+
+
+def test_verify_rejects_manifest_paths_outside_data_directories(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    seed_instance(source)
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    manifest_path = backup / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"].append({"path": "extra.txt", "size": 0, "sha256": "0" * 64})
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="invalid file entry"):
+        verify_backup(backup)
+
+
 @pytest.mark.parametrize("database_kind", ["platform", "workspace"])
 def test_backup_and_verify_reject_corrupt_known_sqlite_databases(tmp_path: Path, database_kind: str):
     source = tmp_path / "source"

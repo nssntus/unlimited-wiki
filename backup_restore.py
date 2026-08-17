@@ -90,12 +90,18 @@ def _sqlite_paths(root: Path) -> list[Path]:
     paths = [root / ".platform" / "platform.sqlite3"]
     spaces = root / "spaces"
     if spaces.is_dir() and not spaces.is_symlink():
-        paths.extend(
-            workspace / ".wiki-state" / "state.sqlite3"
-            for workspace in spaces.iterdir()
-            if workspace.is_dir() and not workspace.is_symlink()
-            and (workspace / ".wiki-state" / "state.sqlite3").exists()
-        )
+        for workspace in spaces.iterdir():
+            if not workspace.is_dir() or workspace.is_symlink():
+                continue
+            state_root = workspace / ".wiki-state"
+            if not state_root.exists():
+                continue
+            if state_root.is_symlink() or not state_root.is_dir():
+                raise RuntimeError("workspace state path must be a directory")
+            # A missing or empty state directory is an uninitialized workspace.
+            # Once any state artifact exists, the main database is mandatory.
+            if any(state_root.iterdir()):
+                paths.append(state_root / "state.sqlite3")
     return sorted(paths)
 
 
@@ -474,6 +480,9 @@ def verify_backup(backup_root: Path) -> dict:
     if backup_root.is_symlink():
         raise RuntimeError("backup root must not be a symbolic link")
     backup_root = backup_root.resolve()
+    allowed_root_entries = {*DATA_DIRECTORIES, MANIFEST_NAME}
+    if any(path.name not in allowed_root_entries for path in backup_root.iterdir()):
+        raise RuntimeError("backup root contains unsupported entries")
     for name in DATA_DIRECTORIES:
         _validate_tree(backup_root / name, "backup data")
     manifest_path = backup_root / MANIFEST_NAME
@@ -483,11 +492,15 @@ def verify_backup(backup_root: Path) -> dict:
     if manifest.get("schema_version") != SCHEMA_VERSION or not isinstance(manifest.get("files"), list):
         raise RuntimeError("backup manifest is unsupported")
     for item in manifest["files"]:
+        raw_path = item.get("path") if isinstance(item, dict) else None
+        relative = Path(raw_path) if isinstance(raw_path, str) else None
         if (
             not isinstance(item, dict)
-            or not isinstance(item.get("path"), str)
-            or Path(item["path"]).is_absolute()
-            or ".." in Path(item["path"]).parts
+            or relative is None
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or len(relative.parts) < 2
+            or relative.parts[0] not in DATA_DIRECTORIES
             or not isinstance(item.get("size"), int)
             or item["size"] < 0
             or not isinstance(item.get("sha256"), str)
