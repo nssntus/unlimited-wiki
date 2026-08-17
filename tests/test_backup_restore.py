@@ -20,7 +20,7 @@ from backup_restore import (
     restore_journal_path,
     verify_backup,
 )
-from platform_store import PlatformStore
+from platform_store import SUBMISSION_STATES, PlatformStore
 from publication import snapshot_fingerprint
 from state_store import StateStore
 from square_v2 import normalize_taxonomy_name
@@ -508,6 +508,58 @@ def test_backup_accepts_legacy_approved_submission_without_taxonomy_proposal(tmp
     backup = tmp_path / "backup"
     create_backup(source, backup)
     assert verify_backup(backup)["schema_version"] == 2
+
+
+def test_backup_rejects_unknown_submission_status(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    _token, context = platform.create_session(user["id"])
+    snapshot = {
+        "title": "Invalid submission state",
+        "category": "",
+        "content_status": "draft",
+        "markdown": "# Invalid submission state\n\nPublic body.\n",
+    }
+    preview = platform.create_preview(
+        context, "_inbox/invalid-submission-state.md", "r1", "b" * 32,
+        snapshot_fingerprint(snapshot), snapshot,
+    )
+    submission = platform.submit_preview(context, preview["preview_id"])
+    with platform.connect() as db:
+        db.execute(
+            "UPDATE submissions SET status='not-a-state',taxonomy_decision_json=NULL,public_entry_id=NULL WHERE id=?",
+            (submission["id"],),
+        )
+    assert_backup_contract_rejects(source, tmp_path, "invalid submission status")
+
+
+@pytest.mark.parametrize("status", sorted(SUBMISSION_STATES))
+def test_backup_accepts_every_supported_submission_status(tmp_path: Path, status: str):
+    source = tmp_path / f"source-{status}"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    if status == "approved":
+        approve_taxonomy_proposal(platform, user)
+    else:
+        _token, context = platform.create_session(user["id"])
+        snapshot = {
+            "title": f"Submission {status}",
+            "category": "",
+            "content_status": "draft",
+            "markdown": f"# Submission {status}\n\nPublic body.\n",
+        }
+        preview = platform.create_preview(
+            context, f"_inbox/submission-{status}.md", "r1", "c" * 32,
+            snapshot_fingerprint(snapshot), snapshot,
+        )
+        submission = platform.submit_preview(context, preview["preview_id"])
+        with platform.connect() as db:
+            db.execute("UPDATE submissions SET status=? WHERE id=?", (status, submission["id"]))
+    backup = tmp_path / f"backup-{status}"
+    create_backup(source, backup)
+    assert verify_backup(backup)["schema_version"] == 2
+    restore_backup(backup, tmp_path / f"restored-{status}")
 
 
 @pytest.mark.parametrize(

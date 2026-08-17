@@ -20,6 +20,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from platform_store import SUBMISSION_STATES
 from square_v2 import normalize_taxonomy_name, taxonomy_normalized_key
 
 
@@ -645,6 +646,8 @@ def _check_taxonomy_storage(db: sqlite3.Connection) -> None:
     for row in db.execute(
         f"SELECT id,status,public_entry_id,{decision_column} AS taxonomy_decision_json FROM submissions"
     ):
+        if row["status"] not in SUBMISSION_STATES:
+            raise RuntimeError("platform SQLite has invalid submission status")
         proposal = proposals.get(row["id"])
         decision_json = row["taxonomy_decision_json"]
         revisions = db.execute(
