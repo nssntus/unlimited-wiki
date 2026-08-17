@@ -240,7 +240,7 @@ def assert_correctness_index(db: sqlite3.Connection, name: str) -> None:
     assert index[2] == 1
     assert bool(index[4]) == (expected["predicate"] is not None)
     assert columns == expected["columns"]
-    assert backup_restore._normalized_index_predicate(row[1]) == expected["predicate"]
+    assert backup_restore._sql_tokens(row[1]) == backup_restore._sql_tokens(expected["sql"])
 
 
 def test_backup_verify_and_restore_round_trip(tmp_path: Path):
@@ -376,6 +376,11 @@ def test_backup_rejects_malformed_optional_application_tables(tmp_path: Path, da
     ("name", "replacement"),
     [
         (
+            "idx_workspaces_org_identity",
+            "CREATE UNIQUE INDEX idx_workspaces_org_identity "
+            "ON workspaces((id),organization_id)",
+        ),
+        (
             "idx_workspace_members_default",
             "CREATE UNIQUE INDEX idx_workspace_members_default "
             "ON workspace_members(user_id) WHERE status='active'",
@@ -414,6 +419,44 @@ def test_backup_rejects_incorrect_legacy_workspace_identity_index(tmp_path: Path
     assert_backup_contract_rejects(source, tmp_path, "invalid correctness index")
 
 
+@pytest.mark.parametrize(
+    ("name", "replacement"),
+    [
+        (
+            "idx_workspace_members_default",
+            "CREATE UNIQUE INDEX idx_workspace_members_default "
+            "ON workspace_members(user_id) WHERE is_default=1 AND status='ACTIVE'",
+        ),
+        (
+            "idx_workspace_invitation_pending",
+            "CREATE UNIQUE INDEX idx_workspace_invitation_pending "
+            "ON workspace_invitations(workspace_id,invitee_user_id) WHERE status='PENDING'",
+        ),
+        (
+            "idx_workspace_members_default",
+            "CREATE UNIQUE INDEX idx_workspace_members_default ON workspace_members(user_id) "
+            "WHERE is_default=(1 AND status)='active'",
+        ),
+        (
+            "idx_public_entries_source_article",
+            "CREATE UNIQUE INDEX idx_public_entries_source_article "
+            "ON public_entries(author_id,source_workspace_id,source_article_id) "
+            "WHERE (source_workspace_id IS NOT NULL AND source_article_id) IS NOT NULL",
+        ),
+    ],
+)
+def test_backup_rejects_correctness_index_token_bypasses(
+    tmp_path: Path, name: str, replacement: str,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, _user, _article, _raw = seed_instance(source)
+    with platform.connect() as db:
+        db.execute(f'DROP INDEX "{name}"')
+        db.execute(replacement)
+    assert_backup_contract_rejects(source, tmp_path, "invalid correctness index")
+
+
 def test_missing_correctness_indexes_are_migrated_when_data_is_valid(tmp_path: Path):
     source = tmp_path / "source"
     source.mkdir()
@@ -431,6 +474,68 @@ def test_missing_correctness_indexes_are_migrated_when_data_is_valid(tmp_path: P
     with restored.connect() as db:
         for name in backup_restore.PLATFORM_CORRECTNESS_INDEXES:
             assert_correctness_index(db, name)
+        db.execute("PRAGMA foreign_keys=ON")
+        workspace = db.execute(
+            "SELECT organization_id,owner_id FROM workspaces LIMIT 1"
+        ).fetchone()
+        second_workspace = "4" * 32
+        db.execute(
+            "INSERT INTO workspaces "
+            "(id,owner_id,organization_id,root_name,display_name,status,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,'active','2026-01-01','2026-01-01')",
+            (second_workspace, workspace[1], workspace[0], second_workspace, "Second"),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(
+                "INSERT INTO workspace_members "
+                "(organization_id,workspace_id,user_id,role,status,is_default,added_by,created_at,updated_at) "
+                "VALUES(?,?,?,'owner','active',1,?,'2026-01-01','2026-01-01')",
+                (workspace[0], second_workspace, workspace[1], workspace[1]),
+            )
+        db.rollback()
+
+        invitee_id = "5" * 32
+        db.execute(
+            "INSERT INTO users(id,email,nickname,password_hash,role,status,created_at) "
+            "VALUES(?,'restored-invitee@example.com','Invitee','unused','user','active','2026-01-01')",
+            (invitee_id,),
+        )
+        invitation_values = (
+            workspace[0], _user["workspace_id"], invitee_id, workspace[1],
+            "2027-01-01", "2026-01-01", "2026-01-01",
+        )
+        db.execute(
+            "INSERT INTO workspace_invitations "
+            "(id,organization_id,workspace_id,invitee_user_id,role,status,invited_by,expires_at,created_at,updated_at) "
+            "VALUES(?,?,?,?,'viewer','pending',?,?,?,?)",
+            ("6" * 32, *invitation_values),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(
+                "INSERT INTO workspace_invitations "
+                "(id,organization_id,workspace_id,invitee_user_id,role,status,invited_by,expires_at,created_at,updated_at) "
+                "VALUES(?,?,?,?,'viewer','pending',?,?,?,?)",
+                ("7" * 32, *invitation_values),
+            )
+        db.rollback()
+
+        public_values = (
+            workspace[1], "2026-01-01", "2026-01-01", _user["workspace_id"], "8" * 32,
+        )
+        db.execute(
+            "INSERT INTO public_entries "
+            "(id,author_id,status,current_revision_id,created_at,updated_at,source_workspace_id,source_article_id) "
+            "VALUES(? ,?,'published',NULL,?,?,?,?)",
+            ("9" * 32, *public_values),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(
+                "INSERT INTO public_entries "
+                "(id,author_id,status,current_revision_id,created_at,updated_at,source_workspace_id,source_article_id) "
+                "VALUES(? ,?,'published',NULL,?,?,?,?)",
+                ("a" * 32, *public_values),
+            )
+        db.rollback()
 
 
 @pytest.mark.parametrize(

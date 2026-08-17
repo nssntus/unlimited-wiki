@@ -206,7 +206,7 @@ PLATFORM_CORRECTNESS_INDEXES = {
     "idx_workspace_members_default": {
         "table": "workspace_members",
         "columns": ("user_id",),
-        "predicate": "is_default=1andstatus='active'",
+        "predicate": "is_default=1 AND status='active'",
         "sql": "CREATE UNIQUE INDEX idx_workspace_members_default "
         "ON workspace_members(user_id) WHERE is_default=1 AND status='active'",
     },
@@ -220,7 +220,7 @@ PLATFORM_CORRECTNESS_INDEXES = {
     "idx_public_entries_source_article": {
         "table": "public_entries",
         "columns": ("author_id", "source_workspace_id", "source_article_id"),
-        "predicate": "source_workspace_idisnotnullandsource_article_idisnotnull",
+        "predicate": "source_workspace_id IS NOT NULL AND source_article_id IS NOT NULL",
         "sql": "CREATE UNIQUE INDEX idx_public_entries_source_article "
         "ON public_entries(author_id,source_workspace_id,source_article_id) "
         "WHERE source_workspace_id IS NOT NULL AND source_article_id IS NOT NULL",
@@ -331,14 +331,75 @@ def _is_sqlite_sidecar(root: Path, path: Path) -> bool:
     return False
 
 
-def _normalized_index_predicate(sql: str | None) -> str | None:
-    if not sql:
-        return None
-    match = re.search(r"\bWHERE\b(.+)$", sql, flags=re.IGNORECASE | re.DOTALL)
-    if match is None:
-        return None
-    predicate = re.sub(r'[\s"`\[\]();]', "", match.group(1))
-    return predicate.casefold()
+def _sql_tokens(sql: str) -> tuple[tuple[str, str], ...] | None:
+    tokens = []
+    index = 0
+    while index < len(sql):
+        character = sql[index]
+        if character.isspace():
+            index += 1
+            continue
+        if character == "'":
+            index += 1
+            value = []
+            while index < len(sql):
+                if sql[index] == "'":
+                    if index + 1 < len(sql) and sql[index + 1] == "'":
+                        value.append("'")
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                value.append(sql[index])
+                index += 1
+            else:
+                return None
+            tokens.append(("string", "".join(value)))
+            continue
+        if character in {'"', "`", "["}:
+            closing = "]" if character == "[" else character
+            index += 1
+            value = []
+            while index < len(sql):
+                if sql[index] == closing:
+                    if index + 1 < len(sql) and sql[index + 1] == closing:
+                        value.append(closing)
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                value.append(sql[index])
+                index += 1
+            else:
+                return None
+            tokens.append(("word", "".join(value).casefold()))
+            continue
+        if character.isalpha() or character == "_":
+            end = index + 1
+            while end < len(sql) and (sql[end].isalnum() or sql[end] == "_"):
+                end += 1
+            tokens.append(("word", sql[index:end].casefold()))
+            index = end
+            continue
+        if character.isdigit():
+            end = index + 1
+            while end < len(sql) and (sql[end].isdigit() or sql[end] == "."):
+                end += 1
+            tokens.append(("number", sql[index:end]))
+            index = end
+            continue
+        operator = next(
+            (candidate for candidate in ("->>", "==", "!=", "<>", "<=", ">=", "||", "->")
+             if sql.startswith(candidate, index)),
+            None,
+        )
+        if operator is not None:
+            tokens.append(("symbol", operator))
+            index += len(operator)
+            continue
+        tokens.append(("symbol", character))
+        index += 1
+    return tuple(tokens)
 
 
 def _check_platform_correctness_indexes(db: sqlite3.Connection) -> list[str]:
@@ -365,7 +426,8 @@ def _check_platform_correctness_indexes(db: sqlite3.Connection) -> list[str]:
                 or not index[2]
                 or bool(index[4]) != expected_partial
                 or columns != expected["columns"]
-                or _normalized_index_predicate(row[2]) != expected["predicate"]
+                or not row[2]
+                or _sql_tokens(str(row[2])) != _sql_tokens(str(expected["sql"]))
             ):
                 raise RuntimeError(f"platform SQLite schema has an invalid correctness index: {name}")
             continue
