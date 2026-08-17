@@ -1083,7 +1083,8 @@ class SquareMixin:
         if kind not in CORRECTION_KINDS or not detail.strip() or len(detail) > 4000:
             raise ValueError("invalid correction")
         if evidence_url:
-            if not safe_public_url(evidence_url):
+            evidence_url = canonical_public_url(evidence_url) or ""
+            if not evidence_url:
                 raise ValueError("invalid evidence URL")
         now, correction_id = _now(), uuid.uuid4().hex
         with self._lock, self.connect() as db:

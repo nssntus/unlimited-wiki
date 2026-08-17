@@ -14,7 +14,7 @@ export function classifyPublicExternalUrl(raw: string): { href: string; insecure
   try {
     const parsed = new URL(raw)
     if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) return null
-    const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase()
+    const hostname = parsed.hostname.replace(/^\[|\]$/g, "").replace(/\.+$/, "").toLowerCase()
     if (!hostname || hostname === "localhost" || hostname.endsWith(".localhost") || hostname.endsWith(".local") || hostname.endsWith(".internal")) return null
     if (/^\d+(?:\.\d+){3}$/.test(hostname) && isPrivateIpv4(hostname)) return null
     // URL normalizes browser-compatible decimal/octal/hex IPv4 before this check.

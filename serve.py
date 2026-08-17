@@ -1518,10 +1518,7 @@ def make_handler(app: WikiApp):
                             intent = app.platform.update_public_import_path(
                                 self.context, intent["id"], intent["private_article_id"], article["path"],
                             )
-                        imported = {
-                            "article": article,
-                            "operation_id": f"public-import-{intent['id']}", "replay": True,
-                        }
+                        imported = service.import_public_article(intent)
                         response = intent
                     else:
                         imported = None

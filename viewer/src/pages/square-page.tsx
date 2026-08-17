@@ -777,7 +777,7 @@ function AuthorCorrections({
                   </a>
                   <p className="mt-1 text-muted-foreground">
                     将在新标签页打开；平台未抓取或核验第三方页面内容。
-                    {item.evidence_url.startsWith("http://") && " 此来源使用非加密连接。"}
+                    {item.evidence_url.toLowerCase().startsWith("http://") && " 此来源使用非加密连接。"}
                   </p>
                 </div>
               )}
@@ -854,7 +854,7 @@ function AuthorCorrections({
 
 export function PublicEntryPage() {
   const { id = "" } = useParams(),
-    { session } = useSession(),
+    { session, reconcileWorkspace } = useSession(),
     client = useQueryClient()
   const [importOpen, setImportOpen] = useState(false),
     [manageOpen, setManageOpen] = useState(false)
@@ -901,7 +901,24 @@ export function PublicEntryPage() {
       toast.success("已收入当前 Wiki 的待归类区")
       window.location.hash = `#/${result.article.path}`
     },
-    onError: (error) => toast.error(error.message),
+    onError: async (error) => {
+      if (
+        error instanceof ApiError &&
+        error.status === 409 &&
+        error.payload.code === "workspace_changed"
+      ) {
+        setImportOpen(false)
+        setImportAcknowledged(false)
+        toast.error("当前 Wiki 空间已变化，正在重新确认导入目标")
+        try {
+          await reconcileWorkspace()
+        } catch {
+          // SessionProvider keeps the blocking confirmation gate visible.
+        }
+        return
+      }
+      toast.error(error.message)
+    },
   })
   const reuse = useMutation({
     mutationFn: (permission: "view_only" | "allow_private_copy") =>
@@ -1327,13 +1344,24 @@ export function PublicVersionPage() {
     enabled: Boolean(id && Number.isInteger(numeric)),
     retry: false,
   })
+  const versions = useQuery({
+    queryKey: queryKeys.publicVersions(id),
+    queryFn: () =>
+      apiGet<PublicRevision[]>(`/api/public/entries/${id}/versions`),
+    enabled: Boolean(id),
+    retry: false,
+  })
+  const versionIndex =
+    versions.data?.findIndex((value) => value.version === numeric) ?? -1
+  const olderVersion =
+    versionIndex >= 0 ? versions.data?.[versionIndex + 1] : undefined
   const diff = useQuery({
-    queryKey: queryKeys.publicDiff(id, numeric - 1, numeric),
+    queryKey: queryKeys.publicDiff(id, olderVersion?.version ?? 0, numeric),
     queryFn: () =>
       apiGet<{ diff: string }>(
-        `/api/public/entries/${id}/diff?from=${numeric - 1}&to=${numeric}`
+        `/api/public/entries/${id}/diff?from=${olderVersion!.version}&to=${numeric}`
       ),
-    enabled: numeric > 1,
+    enabled: Boolean(olderVersion),
     retry: false,
   })
   if (!item.data)
@@ -1364,10 +1392,10 @@ export function PublicVersionPage() {
         fromPath=""
         publicMode
       />
-      {numeric > 1 && (
+      {olderVersion && (
         <section className="mt-12 border-t pt-8">
           <h2 className="text-lg font-semibold">
-            与 v{numeric - 1} 的文本差异
+            与 v{olderVersion.version} 的文本差异
           </h2>
           <pre className="mt-4 max-h-[32rem] overflow-auto border bg-muted/30 p-4 text-xs whitespace-pre-wrap">
             {diff.data?.diff || "没有可显示的差异"}
@@ -1445,7 +1473,7 @@ export function PublicDiffPage() {
     Number.isInteger(to) &&
     from > 0 &&
     to > 0 &&
-    Math.abs(from - to) === 1
+    from < to
   const diff = useQuery({
     queryKey: queryKeys.publicDiff(id, from, to),
     queryFn: () =>
@@ -1470,7 +1498,7 @@ export function PublicDiffPage() {
         </Button>
       </div>
       <pre className="mt-8 max-h-[70dvh] overflow-auto border bg-muted/30 p-4 text-xs whitespace-pre-wrap">
-        {valid ? diff.data?.diff || "没有可显示的差异" : "只能比较相邻公开版本。"}
+        {valid ? diff.data?.diff || "没有可显示的差异" : "只能比较相邻的可见公开版本。"}
       </pre>
     </main>
   )

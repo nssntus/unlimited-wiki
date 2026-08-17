@@ -47,7 +47,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     await client.cancelQueries()
     client.removeQueries({ predicate: (entry) => entry.queryKey[0] !== "session" })
   }
-  const confirmWorkspace = async (target: string | null) => {
+  const confirmWorkspace = async (target: string | null, navigateAfter = true) => {
     setSwitchState({ kind: "confirming", target })
     try {
       const next = await apiGet<Session>("/api/auth/session")
@@ -63,7 +63,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       setCsrfToken(next.csrf_token ?? "")
       switchingRef.current = false
       setSwitchState({ kind: "idle" })
-      navigate("/", { replace: true })
+      if (navigateAfter) navigate("/", { replace: true })
       return next
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) {
@@ -96,6 +96,12 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     if (next.workspace?.id === workspaceId) return
     if (postError) throw postError
     throw new Error(`空间切换未生效，当前仍是 ${next.workspace?.display_name ?? "其他空间"}`)
+  }
+  const reconcileWorkspace = async () => {
+    if (switchingRef.current) return
+    switchingRef.current = true
+    await clearTenantCache()
+    await confirmWorkspace(null, false)
   }
   const changeWorkspaceLifecycle = async (workspaceId: string, action: "suspend" | "restore" | "delete" | "leave") => {
     if (switchingRef.current) return
@@ -136,7 +142,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     })
     return () => setWorkspaceUnavailableHandler(null)
   })
-  const value = { session: query.data, loading: query.isLoading, signOut, switchWorkspace, changeWorkspaceLifecycle, switchingWorkspace, hasPermission }
+  const value = { session: query.data, loading: query.isLoading, signOut, switchWorkspace, reconcileWorkspace, changeWorkspaceLifecycle, switchingWorkspace, hasPermission }
   const content = switchState.kind !== "idle"
     ? switchState.kind === "error"
       ? <WorkspaceSwitchGate error={switchState.message} onRetry={retryWorkspaceConfirmation} />

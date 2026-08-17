@@ -694,7 +694,10 @@ class WikiService:
         changes["wiki/log.md"] = append_log_text(log_path.read_text(encoding="utf-8") if log_path.exists() else "", operation_id=operation_id, kind="govern", title=article["title"])
         self.files.commit(changes, kind="meta", metadata={"source": old_rel, "target": target_rel}, operation_id=operation_id)
         updated = self.read_article(target_rel)
-        self.state.remap_article_path(old_rel, target_rel, base_revision=updated["revision"])
+        if old_rel != target_rel:
+            self._remap_committed_paths(operation_id, {old_rel: target_rel})
+        else:
+            self.state.remap_article_path(old_rel, target_rel, base_revision=updated["revision"])
         return {"operation_id": operation_id, "article": updated}
 
     def save_article(self, rel: str, markdown: str, expected_revision: str, *, force: bool = False) -> dict:

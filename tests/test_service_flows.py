@@ -30,6 +30,14 @@ def test_status_and_structure_are_independent(service: WikiService):
     assert len(service.articles()) == 2
 
 
+def test_apply_meta_notifies_platform_path_projection(service: WikiService):
+    remaps: list[dict[str, str]] = []
+    service.path_remap_callback = lambda value: remaps.append(value)
+    result = service.apply_meta("concepts/base.md", category="tools", status="词条")
+    assert result["article"]["path"] == "tools/base.md"
+    assert remaps == [{"concepts/base.md": "tools/base.md"}]
+
+
 def test_model_markdown_extractor_accepts_preamble_and_fence():
     response = "下面是词条：\n\n```markdown\n# Prompt Engineering\n\n正文。\n```\n"
     assert extract_markdown_article(response) == "# Prompt Engineering\n\n正文。\n"

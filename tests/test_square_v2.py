@@ -434,10 +434,11 @@ def test_subscription_correction_profile_and_collection_flow(square):
                         article_id="1" * 32, source_revision="r1", category_id=category["id"])
     entry_id = approved["public_entry_id"]
     assert store.set_subscription(context, entry_id, True)["subscribed"] is True
-    correction = store.create_correction(context, entry_id, "factual", "Please verify this statement", "https://example.com/evidence")
+    correction = store.create_correction(context, entry_id, "factual", "Please verify this statement", "HTTP://EXAMPLE.COM/evidence")
     author_correction = store.list_entry_corrections(context, entry_id)[0]
     assert author_correction["id"] == correction["id"]
     assert "submitter_id" not in author_correction
+    assert author_correction["evidence_url"] == "http://example.com/evidence"
     assert "submitter_id" not in store.list_my_corrections(context)[0]
     assert store.admin_square_state(context)["corrections"][0]["id"] == correction["id"]
     decided = store.decide_correction(context, correction["id"], "accepted", "Will address in the next public revision")
