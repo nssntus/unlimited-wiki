@@ -21,6 +21,98 @@ from backup_restore import (
     verify_backup,
 )
 from platform_store import PlatformStore
+from state_store import StateStore
+
+
+LEGACY_PLATFORM_DDL = """
+CREATE TABLE users (
+    id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, nickname TEXT NOT NULL,
+    password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('user','admin')),
+    status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL
+);
+CREATE TABLE workspaces (
+    id TEXT PRIMARY KEY, owner_id TEXT NOT NULL UNIQUE REFERENCES users(id),
+    root_name TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE sessions (
+    token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    csrf_hash TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE recovery_codes (
+    code_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at TEXT NOT NULL, used_at TEXT
+);
+CREATE TABLE login_attempts (
+    scope_hash TEXT PRIMARY KEY, failures INTEGER NOT NULL, blocked_until TEXT, updated_at TEXT NOT NULL
+);
+CREATE TABLE model_settings (
+    workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL, base_url_enc TEXT NOT NULL, api_key_enc TEXT NOT NULL,
+    model TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE share_previews (
+    id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(id),
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id), article_path TEXT NOT NULL,
+    source_revision TEXT NOT NULL, content_hash TEXT NOT NULL, snapshot_json TEXT NOT NULL,
+    expires_at TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE submissions (
+    id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(id),
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id), status TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL, content_hash TEXT NOT NULL, ai_report_json TEXT,
+    reason TEXT, reviewer_id TEXT REFERENCES users(id), public_entry_id TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE public_entries (
+    id TEXT PRIMARY KEY, author_id TEXT NOT NULL REFERENCES users(id), status TEXT NOT NULL,
+    current_revision_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    moderation_reason TEXT, moderated_by TEXT REFERENCES users(id), moderated_at TEXT
+);
+CREATE TABLE public_revisions (
+    id TEXT PRIMARY KEY, entry_id TEXT NOT NULL REFERENCES public_entries(id),
+    submission_id TEXT NOT NULL UNIQUE REFERENCES submissions(id), version INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL, content_hash TEXT NOT NULL, published_at TEXT NOT NULL,
+    UNIQUE(entry_id, version)
+);
+CREATE TABLE reports (
+    id TEXT PRIMARY KEY, entry_id TEXT NOT NULL REFERENCES public_entries(id),
+    reporter_id TEXT REFERENCES users(id), reason_code TEXT NOT NULL, detail TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open', resolution TEXT, resolved_by TEXT REFERENCES users(id),
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE notifications (
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL, object_type TEXT NOT NULL, object_id TEXT NOT NULL,
+    title TEXT NOT NULL, message TEXT NOT NULL, read_at TEXT, created_at TEXT NOT NULL
+);
+CREATE TABLE audit_events (
+    id TEXT PRIMARY KEY, actor_id TEXT, action TEXT NOT NULL, object_type TEXT NOT NULL,
+    object_id TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE migrations (
+    id TEXT PRIMARY KEY, kind TEXT NOT NULL UNIQUE, workspace_id TEXT NOT NULL,
+    status TEXT NOT NULL, manifest_json TEXT NOT NULL, created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+
+LEGACY_WORKSPACE_DDL = """
+CREATE TABLE idempotency (
+    endpoint TEXT NOT NULL, key TEXT NOT NULL, payload_hash TEXT NOT NULL,
+    status TEXT NOT NULL, response_json TEXT, created_at TEXT NOT NULL,
+    PRIMARY KEY(endpoint, key)
+);
+CREATE TABLE tasks (
+    id TEXT PRIMARY KEY, kind TEXT NOT NULL, subject TEXT NOT NULL, active_key TEXT NOT NULL,
+    status TEXT NOT NULL, payload_json TEXT NOT NULL, result_json TEXT, error_type TEXT,
+    error_message TEXT, attempts INTEGER NOT NULL DEFAULT 0, next_run_at TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE raw_records (
+    path TEXT PRIMARY KEY, byte_hash TEXT NOT NULL, text_hash TEXT NOT NULL,
+    target_path TEXT, disposition TEXT NOT NULL, operation_id TEXT, created_at TEXT NOT NULL
+);
+"""
 
 
 def seed_instance(root: Path):
@@ -34,15 +126,51 @@ def seed_instance(root: Path):
     raw.parent.mkdir(parents=True)
     raw.write_text("source bytes", encoding="utf-8")
     state_root = workspace / ".wiki-state"
-    state_root.mkdir()
-    with sqlite3.connect(state_root / "state.sqlite3") as db:
+    state = StateStore(workspace, recover_running=False)
+    db = state.connect()
+    try:
         db.execute("CREATE TABLE marker(value TEXT NOT NULL)")
         db.execute("INSERT INTO marker VALUES('complete')")
+        db.commit()
+    finally:
+        db.close()
     platform.save_model(
         user["workspace_id"], "openai-compatible", "https://models.example/v1", "secret-key", "model-a",
     )
     platform.create_session(user["id"])
     return platform, user, article, raw
+
+
+def seed_minimum_legacy_instance(root: Path) -> str:
+    platform_root = root / ".platform"
+    spaces_root = root / "spaces"
+    platform_root.mkdir()
+    spaces_root.mkdir()
+    (platform_root / "master.key").write_bytes(b"k" * 32)
+    database = platform_root / "platform.sqlite3"
+    with sqlite3.connect(database) as db:
+        db.executescript(LEGACY_PLATFORM_DDL)
+        db.execute(
+            "INSERT INTO users(id,email,nickname,password_hash,role,status,created_at) VALUES(?,?,?,?,?,?,?)",
+            ("b" * 32, "legacy@example.com", "Legacy", "unused", "admin", "active", "2026-01-01T00:00:00Z"),
+        )
+        db.execute(
+            "INSERT INTO workspaces(id,owner_id,root_name,display_name,created_at) VALUES(?,?,?,?,?)",
+            ("a" * 32, "b" * 32, "a" * 32, "Legacy Wiki", "2026-01-01T00:00:00Z"),
+        )
+    workspace = spaces_root / ("a" * 32)
+    (workspace / "wiki").mkdir(parents=True)
+    (workspace / "raw").mkdir()
+    state_root = workspace / ".wiki-state"
+    state_root.mkdir()
+    with sqlite3.connect(state_root / "state.sqlite3") as db:
+        db.executescript(LEGACY_WORKSPACE_DDL)
+    return "a" * 32
+
+
+def write_manifest(root: Path) -> None:
+    manifest = backup_restore._manifest(root, root)
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
 
 def test_backup_verify_and_restore_round_trip(tmp_path: Path):
@@ -52,7 +180,7 @@ def test_backup_verify_and_restore_round_trip(tmp_path: Path):
     backup = tmp_path / "backup-001"
 
     manifest = create_backup(source, backup)
-    assert manifest["schema_version"] == 1
+    assert manifest["schema_version"] == 2
     assert all(not item["path"].endswith((".sqlite3-wal", ".sqlite3-shm")) for item in manifest["files"])
     assert verify_backup(backup)["files"] == manifest["files"]
     assert (backup / ".platform" / "master.key").stat().st_size == 32
@@ -70,6 +198,138 @@ def test_backup_verify_and_restore_round_trip(tmp_path: Path):
         assert db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
         assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert db.execute("PRAGMA foreign_key_check").fetchone() is None
+
+
+def test_backup_restores_minimum_supported_legacy_schemas(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    root_name = seed_minimum_legacy_instance(source)
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    assert verify_backup(backup)["schema_version"] == 2
+
+    target = tmp_path / "target"
+    restore_backup(backup, target)
+    platform = PlatformStore(target)
+    workspace = platform.workspace_root(root_name)
+    state = StateStore(workspace, recover_running=False)
+    with platform.connect() as db:
+        assert "organization_id" in {row["name"] for row in db.execute("PRAGMA table_info(workspaces)")}
+        assert db.execute("SELECT COUNT(*) FROM workspace_members").fetchone()[0] == 1
+    with state.connect() as db:
+        task_columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
+        assert {"actor_user_id", "paused_from_status"}.issubset(task_columns)
+
+
+@pytest.mark.parametrize(
+    ("database_kind", "ddl_replacement"),
+    [
+        ("platform", ("email TEXT NOT NULL UNIQUE", "email TEXT NOT NULL")),
+        (
+            "workspace",
+            ("created_at TEXT NOT NULL,\n    PRIMARY KEY(endpoint, key)", "created_at TEXT NOT NULL"),
+        ),
+    ],
+)
+def test_backup_rejects_application_schema_without_identity_constraints(
+    tmp_path: Path, database_kind: str, ddl_replacement: tuple[str, str],
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    root_name = seed_minimum_legacy_instance(source)
+    database = (
+        source / ".platform" / "platform.sqlite3"
+        if database_kind == "platform"
+        else source / "spaces" / root_name / ".wiki-state" / "state.sqlite3"
+    )
+    database.unlink()
+    ddl = LEGACY_PLATFORM_DDL if database_kind == "platform" else LEGACY_WORKSPACE_DDL
+    with sqlite3.connect(database) as db:
+        db.executescript(ddl.replace(*ddl_replacement))
+    with pytest.raises(RuntimeError, match="unique constraint|primary key"):
+        create_backup(source, tmp_path / "invalid-backup")
+
+    forged = tmp_path / "forged"
+    forged.mkdir()
+    for name in backup_restore.DATA_DIRECTORIES:
+        backup_restore.shutil.copytree(source / name, forged / name)
+    write_manifest(forged)
+    with pytest.raises(RuntimeError, match="unique constraint|primary key"):
+        verify_backup(forged)
+
+
+@pytest.mark.parametrize("invalid_kind", ["partial_unique", "identity_type"])
+def test_backup_rejects_partial_unique_and_invalid_identity_types(
+    tmp_path: Path, invalid_kind: str,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform_root = source / ".platform"
+    spaces_root = source / "spaces"
+    platform_root.mkdir()
+    spaces_root.mkdir()
+    (platform_root / "master.key").write_bytes(b"k" * 32)
+    ddl = LEGACY_PLATFORM_DDL
+    suffix = ""
+    if invalid_kind == "partial_unique":
+        ddl = ddl.replace("email TEXT NOT NULL UNIQUE", "email TEXT NOT NULL")
+        suffix = "CREATE UNIQUE INDEX users_email_partial ON users(email) WHERE status='deleted';"
+    else:
+        ddl = ddl.replace("id TEXT PRIMARY KEY, email", "id INTEGER PRIMARY KEY, email", 1)
+    with sqlite3.connect(platform_root / "platform.sqlite3") as db:
+        db.executescript(ddl + suffix)
+    with pytest.raises(RuntimeError, match="unique constraint|identity type"):
+        create_backup(source, tmp_path / "invalid-backup")
+
+
+@pytest.mark.parametrize("database_kind", ["platform", "workspace"])
+def test_backup_rejects_malformed_optional_application_tables(tmp_path: Path, database_kind: str):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    if database_kind == "platform":
+        with platform.connect() as db:
+            db.execute("DROP TABLE workspace_invitations")
+            db.execute("CREATE TABLE workspace_invitations(dummy TEXT)")
+    else:
+        state_path = (
+            source / "spaces" / user["workspace_root_name"] / ".wiki-state" / "state.sqlite3"
+        )
+        with sqlite3.connect(state_path) as db:
+            db.execute("DROP TABLE classification_suggestions")
+            db.execute("CREATE TABLE classification_suggestions(dummy TEXT)")
+    with pytest.raises(RuntimeError, match="SQLite schema is unsupported"):
+        create_backup(source, tmp_path / "invalid-backup")
+
+
+def test_backup_restores_migratable_legacy_platform_idempotency_schema(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    with platform.connect() as db:
+        db.execute("DROP TABLE platform_idempotency")
+        db.execute("""
+            CREATE TABLE platform_idempotency (
+                user_id TEXT NOT NULL, endpoint TEXT NOT NULL, key TEXT NOT NULL,
+                payload_hash TEXT NOT NULL, status TEXT NOT NULL, response_json TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                PRIMARY KEY(user_id,endpoint,key)
+            )
+        """)
+        db.execute(
+            "INSERT INTO platform_idempotency VALUES(?,?,?,?,?,?,?,?)",
+            (user["id"], "/api/test", "key", "hash", "done", '{}', "2026-01-01", "2026-01-01"),
+        )
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    target = tmp_path / "target"
+    restore_backup(backup, target)
+    restored = PlatformStore(target)
+    with restored.connect() as db:
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(platform_idempotency)")}
+        row = db.execute("SELECT scope,status FROM platform_idempotency").fetchone()
+    assert "scope" in columns and "user_id" not in columns
+    assert tuple(row) == (f"account:{user['id']}", "done")
 
 
 def test_backup_preserves_non_sqlite_files_with_wal_and_shm_suffixes(tmp_path: Path):
@@ -112,7 +372,7 @@ def test_backup_allows_workspace_without_initialized_state(tmp_path: Path):
 
     backup = tmp_path / "backup-001"
     create_backup(source, backup)
-    assert verify_backup(backup)["schema_version"] == 1
+    assert verify_backup(backup)["schema_version"] == 2
 
 
 @pytest.mark.parametrize("state_artifact", ["state.sqlite3-wal", "state.sqlite3-shm", "write.lock"])
@@ -150,8 +410,221 @@ def test_verify_rejects_orphan_workspace_sqlite_sidecar(tmp_path: Path):
     manifest["files"] = [item for item in manifest["files"] if item["path"] != database_relative]
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="SQLite database is missing"):
+    with pytest.raises(RuntimeError, match="must not contain SQLite sidecars"):
         verify_backup(backup)
+
+
+@pytest.mark.parametrize("invalid_kind", ["orphan_wal", "root_extra"])
+def test_restore_rejects_every_backup_rejected_by_verify(tmp_path: Path, invalid_kind: str):
+    source = tmp_path / "source"
+    source.mkdir()
+    _platform, user, _article, _raw = seed_instance(source)
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    manifest_path = backup / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    if invalid_kind == "orphan_wal":
+        state_root = backup / "spaces" / user["workspace_root_name"] / ".wiki-state"
+        database = state_root / "state.sqlite3"
+        database.unlink()
+        (state_root / "state.sqlite3-wal").write_bytes(b"orphan wal")
+        relative = database.relative_to(backup).as_posix()
+        manifest["files"] = [item for item in manifest["files"] if item["path"] != relative]
+    else:
+        extra = backup / "extra.txt"
+        extra.write_bytes(b"extra")
+        manifest["files"].append({
+            "path": "extra.txt", "size": extra.stat().st_size, "sha256": backup_restore._sha256(extra),
+        })
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RuntimeError):
+        verify_backup(backup)
+    target = tmp_path / "target"
+    with pytest.raises(RuntimeError):
+        restore_backup(backup, target)
+    assert not (target / ".platform").exists()
+    assert not (target / "spaces").exists()
+    assert not (target / ".restore").exists()
+
+
+def test_restore_rejects_backup_manifest_change_during_verification(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    seed_instance(source)
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    real_verify = backup_restore.verify_backup
+    changed = False
+
+    def verify_then_change(path: Path):
+        nonlocal changed
+        result = real_verify(path)
+        if Path(path).resolve() == backup.resolve() and not changed:
+            manifest_path = backup / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["created_at"] = "changed-after-verification"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            changed = True
+        return result
+
+    monkeypatch.setattr(backup_restore, "verify_backup", verify_then_change)
+    target = tmp_path / "target"
+    with pytest.raises(RuntimeError, match="changed during verification"):
+        restore_backup(backup, target)
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("database_kind", ["platform", "workspace"])
+def test_application_schema_is_required_for_create_verify_and_restore(
+    tmp_path: Path, database_kind: str,
+):
+    def database(root: Path, root_name: str) -> Path:
+        if database_kind == "platform":
+            return root / ".platform" / "platform.sqlite3"
+        return root / "spaces" / root_name / ".wiki-state" / "state.sqlite3"
+
+    source = tmp_path / "source"
+    source.mkdir()
+    _platform, user, _article, _raw = seed_instance(source)
+    invalid = database(source, user["workspace_root_name"])
+    invalid.unlink()
+    with sqlite3.connect(invalid) as db:
+        db.execute("CREATE TABLE unrelated(value TEXT)")
+    with pytest.raises(RuntimeError, match="SQLite schema is unsupported"):
+        create_backup(source, tmp_path / "invalid-source-backup")
+
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    _platform, clean_user, _article, _raw = seed_instance(clean)
+    backup = tmp_path / "backup-001"
+    create_backup(clean, backup)
+    invalid = database(backup, clean_user["workspace_root_name"])
+    invalid.unlink()
+    with sqlite3.connect(invalid) as db:
+        db.execute("CREATE TABLE unrelated(value TEXT)")
+    manifest_path = backup / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    relative = invalid.relative_to(backup).as_posix()
+    entry = next(item for item in manifest["files"] if item["path"] == relative)
+    entry["size"] = invalid.stat().st_size
+    entry["sha256"] = backup_restore._sha256(invalid)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="SQLite schema is unsupported"):
+        verify_backup(backup)
+    target = tmp_path / "target"
+    with pytest.raises(RuntimeError, match="SQLite schema is unsupported"):
+        restore_backup(backup, target)
+    assert not (target / ".platform").exists()
+    assert not (target / "spaces").exists()
+
+
+@pytest.mark.parametrize("removed_directory", ["workspace", "empty_category"])
+def test_manifest_authenticates_workspace_and_empty_directories(
+    tmp_path: Path, removed_directory: str,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _platform, user, _article, _raw = seed_instance(source)
+    workspace_relative = Path("spaces") / user["workspace_root_name"]
+    empty_category_relative = workspace_relative / "wiki" / "empty-category"
+    (source / empty_category_relative).mkdir()
+    backup = tmp_path / "backup-001"
+    manifest = create_backup(source, backup)
+    assert workspace_relative.as_posix() in manifest["directories"]
+    assert empty_category_relative.as_posix() in manifest["directories"]
+
+    if removed_directory == "workspace":
+        backup_restore.shutil.rmtree(backup / workspace_relative)
+    else:
+        (backup / empty_category_relative).rmdir()
+    with pytest.raises(RuntimeError, match="file set|directory set|workspace layout"):
+        verify_backup(backup)
+    target = tmp_path / "target"
+    with pytest.raises(RuntimeError, match="file set|directory set|workspace layout"):
+        restore_backup(backup, target)
+    assert not (target / ".platform").exists()
+    assert not (target / "spaces").exists()
+
+
+def test_restore_preserves_empty_category_directories(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    _platform, user, _article, _raw = seed_instance(source)
+    relative = Path("spaces") / user["workspace_root_name"] / "wiki" / "empty-category"
+    (source / relative).mkdir()
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    target = tmp_path / "target"
+    restore_backup(backup, target)
+    assert (target / relative).is_dir()
+
+
+def test_deleted_team_workspace_remains_required_and_round_trips(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, article, _raw = seed_instance(source)
+    with platform.connect() as db:
+        organization_id = db.execute(
+            "SELECT organization_id FROM workspaces WHERE id=?", (user["workspace_id"],),
+        ).fetchone()[0]
+        db.execute(
+            "UPDATE organizations SET kind='team',personal_owner_id=NULL WHERE id=?",
+            (organization_id,),
+        )
+        db.execute("UPDATE workspaces SET status='deleted' WHERE id=?", (user["workspace_id"],))
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    target = tmp_path / "target"
+    restore_backup(backup, target)
+    restored_article = target / article.relative_to(source)
+    assert restored_article.read_bytes() == article.read_bytes()
+
+    missing_source = tmp_path / "missing-source"
+    backup_restore.shutil.copytree(source, missing_source)
+    backup_restore.shutil.rmtree(missing_source / "spaces" / user["workspace_root_name"])
+    with pytest.raises(RuntimeError, match="workspace layout is incomplete"):
+        create_backup(missing_source, tmp_path / "missing-backup")
+
+
+def test_deleted_personal_workspace_tombstone_may_have_no_data_root(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    with platform.connect() as db:
+        organization_id = db.execute(
+            "SELECT organization_id FROM workspaces WHERE id=?", (user["workspace_id"],),
+        ).fetchone()[0]
+        db.execute("UPDATE users SET status='deleted' WHERE id=?", (user["id"],))
+        db.execute("UPDATE organizations SET status='deleted' WHERE id=?", (organization_id,))
+        db.execute("DELETE FROM workspace_members WHERE workspace_id=?", (user["workspace_id"],))
+        db.execute("DELETE FROM organization_members WHERE organization_id=?", (organization_id,))
+        db.execute("DELETE FROM model_settings WHERE workspace_id=?", (user["workspace_id"],))
+    backup_restore.shutil.rmtree(source / "spaces" / user["workspace_root_name"])
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    assert verify_backup(backup)["schema_version"] == 2
+    target = tmp_path / "target"
+    restore_backup(backup, target)
+    assert not (target / "spaces" / user["workspace_root_name"]).exists()
+
+
+def test_restore_rejects_backup_root_symlink_that_verify_rejects(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    seed_instance(source)
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    link = tmp_path / "backup-link"
+    link.symlink_to(backup, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="backup root must not be a symbolic link"):
+        verify_backup(link)
+    target = tmp_path / "target"
+    with pytest.raises(RuntimeError, match="backup root must not be a symbolic link"):
+        restore_backup(link, target)
+    assert not target.exists()
 
 
 @pytest.mark.parametrize("extra_kind", ["file", "directory"])
@@ -203,7 +676,9 @@ def test_backup_and_verify_reject_corrupt_known_sqlite_databases(tmp_path: Path,
             return root / ".platform" / "platform.sqlite3"
         return root / "spaces" / user["workspace_root_name"] / ".wiki-state" / "state.sqlite3"
 
-    database(source).write_bytes(b"truncated database")
+    source_database = database(source)
+    backup_restore._check_sqlite(source_database, checkpoint=True)
+    source_database.write_bytes(b"truncated database")
     with pytest.raises(sqlite3.DatabaseError):
         create_backup(source, tmp_path / "corrupt-source-backup")
 

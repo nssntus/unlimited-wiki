@@ -132,7 +132,7 @@ sudo -u unlimited-wiki python3 backup_restore.py verify /var/backups/unlimited-w
 sudo systemctl start unlimited-wiki.service
 ```
 
-备份会先取得实例锁、checkpoint 并检查所有 SQLite 数据库，再生成逐文件 SHA-256 manifest，并以原子目录改名发布。尚未初始化的 Workspace 可以没有 `.wiki-state/`，或保留一个空目录；一旦该目录中出现 WAL、锁文件或其他状态产物，`state.sqlite3` 就必须存在且通过完整性检查，否则备份和验证都会拒绝。备份目录应位于非 Web 根目录、权限为 `0700` 的加密磁盘；TLS 私钥和 `/etc/unlimited-wiki.env` 需通过公司的秘密备份流程另行保管。定时单元调用 `deploy/offline-backup.sh`：它只会重启脚本实际停止的服务，重启失败会让备份 unit 失败。备份保留清理由运维平台完成，不会自动删除唯一副本。
+备份会先取得实例锁、checkpoint 并检查所有 SQLite 数据库，再生成 manifest v2：普通文件记录大小与 SHA-256，目录也逐项记录，因此空 Workspace、`wiki/`、`raw/` 和空分类目录都属于受校验的数据。SQLite 除 `integrity_check` 与外键检查外，还必须符合最早受支持的平台/Workspace 应用表、列、关键主键/全局唯一约束和身份字段类型签名；任意合法 SQLite 文件不能冒充应用数据库。尚未初始化的 Workspace 可以没有 `.wiki-state/`，或保留一个空目录；一旦该目录中出现 WAL、锁文件或其他状态产物，`state.sqlite3` 就必须存在且通过检查。已发布备份不允许包含固定数据库的 WAL/SHM；restore 会先验证原包，再完整复制到私有 staging 并复验，不会通过过滤异常内容“修复”坏包。备份目录应位于非 Web 根目录、权限为 `0700` 的加密磁盘；TLS 私钥和 `/etc/unlimited-wiki.env` 需通过公司的秘密备份流程另行保管。定时单元调用 `deploy/offline-backup.sh`：它只会重启脚本实际停止的服务，重启失败会让备份 unit 失败。备份保留清理由运维平台完成，不会自动删除唯一副本。
 
 恢复必须在停服状态下进行，并且目标不能已有 `.platform/` 或 `spaces/`。先把旧数据目录移动到隔离位置，再执行：
 

@@ -22,13 +22,179 @@ from pathlib import Path
 
 
 MANIFEST_NAME = "manifest.json"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DATA_DIRECTORIES = (".platform", "spaces")
 RUNTIME_DIRECTORY = ".runtime"
 RESTORE_WORK_DIRECTORY = ".restore"
 INSTANCE_LOCK_NAME = "instance.lock"
 RESTORE_JOURNAL_NAME = "restore.json"
 RESTORE_JOURNAL_SCHEMA = 3
+
+PLATFORM_SCHEMA_ANCHORS = {
+    "users": {"id", "email", "nickname", "password_hash", "role", "status", "created_at"},
+    "workspaces": {"id", "owner_id", "root_name", "display_name", "created_at"},
+    "sessions": {"token_hash", "user_id", "csrf_hash", "expires_at", "created_at"},
+    "model_settings": {
+        "workspace_id", "provider", "base_url_enc", "api_key_enc", "model", "updated_at",
+    },
+    "recovery_codes": {"code_hash", "user_id", "expires_at", "used_at"},
+    "login_attempts": {"scope_hash", "failures", "blocked_until", "updated_at"},
+    "share_previews": {
+        "id", "owner_id", "workspace_id", "article_path", "source_revision", "content_hash",
+        "snapshot_json", "expires_at", "created_at",
+    },
+    "submissions": {
+        "id", "owner_id", "workspace_id", "status", "snapshot_json", "content_hash",
+        "ai_report_json", "reason", "reviewer_id", "public_entry_id", "created_at", "updated_at",
+    },
+    "public_entries": {
+        "id", "author_id", "status", "current_revision_id", "created_at", "updated_at",
+        "moderation_reason", "moderated_by", "moderated_at",
+    },
+    "public_revisions": {
+        "id", "entry_id", "submission_id", "version", "snapshot_json", "content_hash", "published_at",
+    },
+    "reports": {
+        "id", "entry_id", "reporter_id", "reason_code", "detail", "status", "resolution",
+        "resolved_by", "created_at", "updated_at",
+    },
+    "notifications": {
+        "id", "user_id", "kind", "object_type", "object_id", "title", "message", "read_at", "created_at",
+    },
+    "audit_events": {"id", "actor_id", "action", "object_type", "object_id", "detail_json", "created_at"},
+    "migrations": {"id", "kind", "workspace_id", "status", "manifest_json", "created_at", "updated_at"},
+}
+WORKSPACE_SCHEMA_ANCHORS = {
+    "idempotency": {"endpoint", "key", "payload_hash", "status", "response_json", "created_at"},
+    "tasks": {
+        "id", "kind", "subject", "active_key", "status", "payload_json", "result_json",
+        "error_type", "error_message", "attempts", "next_run_at", "created_at", "updated_at",
+    },
+    "raw_records": {
+        "path", "byte_hash", "text_hash", "target_path", "disposition", "operation_id", "created_at",
+    },
+}
+PLATFORM_OPTIONAL_SCHEMA = {
+    "organizations": {
+        "id", "kind", "personal_owner_id", "display_name", "status", "created_by", "created_at", "updated_at",
+    },
+    "organization_members": {
+        "organization_id", "user_id", "role", "status", "added_by", "created_at", "updated_at",
+    },
+    "workspace_members": {
+        "organization_id", "workspace_id", "user_id", "role", "status", "is_default", "added_by",
+        "created_at", "updated_at",
+    },
+    "workspace_invitations": {
+        "id", "organization_id", "workspace_id", "invitee_user_id", "role", "status", "invited_by",
+        "expires_at", "created_at", "updated_at",
+    },
+    "platform_idempotency": {
+        "scope", "endpoint", "key", "payload_hash", "status", "response_json", "created_at", "updated_at",
+    },
+    "account_registration_invites": {
+        "id", "token_hash", "email", "status", "expires_at", "created_at", "used_at",
+    },
+    "rate_limits": {"scope_hash", "window_started", "request_count", "updated_at"},
+}
+WORKSPACE_OPTIONAL_SCHEMA = {
+    "classification_suggestions": {
+        "article_id", "article_revision", "taxonomy_revision", "status", "suggestion_json", "task_id",
+        "error_type", "error_message", "created_at", "updated_at",
+    },
+    "raw_classification_plans": {
+        "raw_path", "raw_revision", "taxonomy_revision", "status", "plan_json", "task_id", "error_type",
+        "error_message", "created_at", "updated_at",
+    },
+    "classification_previews": {"id", "kind", "payload_json", "expires_at", "created_at"},
+    "classification_draft": {"id", "revision", "payload_json", "updated_at"},
+    "reconciliation_items": {
+        "id", "fingerprint", "kind", "payload_json", "status", "created_at", "updated_at",
+    },
+}
+PLATFORM_PRIMARY_KEYS = {
+    "users": ("id",),
+    "workspaces": ("id",),
+    "sessions": ("token_hash",),
+    "recovery_codes": ("code_hash",),
+    "login_attempts": ("scope_hash",),
+    "model_settings": ("workspace_id",),
+    "share_previews": ("id",),
+    "submissions": ("id",),
+    "public_entries": ("id",),
+    "public_revisions": ("id",),
+    "reports": ("id",),
+    "notifications": ("id",),
+    "audit_events": ("id",),
+    "migrations": ("id",),
+}
+PLATFORM_UNIQUE_KEYS = {
+    "users": {("email",)},
+    "workspaces": {("root_name",)},
+    "public_revisions": {("submission_id",), ("entry_id", "version")},
+    "migrations": {("kind",)},
+}
+WORKSPACE_PRIMARY_KEYS = {
+    "idempotency": ("endpoint", "key"),
+    "tasks": ("id",),
+    "raw_records": ("path",),
+}
+PLATFORM_OPTIONAL_PRIMARY_KEYS = {
+    "organizations": ("id",),
+    "organization_members": ("organization_id", "user_id"),
+    "workspace_members": ("workspace_id", "user_id"),
+    "workspace_invitations": ("id",),
+    "platform_idempotency": ("scope", "endpoint", "key"),
+    "account_registration_invites": ("id",),
+    "rate_limits": ("scope_hash",),
+}
+WORKSPACE_OPTIONAL_PRIMARY_KEYS = {
+    "classification_suggestions": ("article_id", "article_revision", "taxonomy_revision"),
+    "raw_classification_plans": ("raw_path", "raw_revision", "taxonomy_revision"),
+    "classification_previews": ("id",),
+    "classification_draft": ("id",),
+    "reconciliation_items": ("id",),
+}
+PLATFORM_OPTIONAL_UNIQUE_KEYS = {
+    "organizations": {("personal_owner_id",)},
+    "account_registration_invites": {("token_hash",)},
+}
+WORKSPACE_OPTIONAL_UNIQUE_KEYS = {"reconciliation_items": {("fingerprint",)}}
+LEGACY_PLATFORM_IDEMPOTENCY_COLUMNS = {
+    "user_id", "endpoint", "key", "payload_hash", "status", "response_json", "created_at", "updated_at",
+}
+PLATFORM_TEXT_IDENTITY_COLUMNS = {
+    "users": {"id", "email"},
+    "workspaces": {"id", "owner_id", "root_name"},
+    "sessions": {"token_hash", "user_id"},
+    "recovery_codes": {"code_hash", "user_id"},
+    "login_attempts": {"scope_hash"},
+    "model_settings": {"workspace_id"},
+    "share_previews": {"id", "owner_id", "workspace_id"},
+    "submissions": {"id", "owner_id", "workspace_id"},
+    "public_entries": {"id", "author_id"},
+    "public_revisions": {"id", "entry_id", "submission_id"},
+    "reports": {"id", "entry_id"},
+    "notifications": {"id", "user_id"},
+    "audit_events": {"id"},
+    "migrations": {"id", "kind", "workspace_id"},
+    "organizations": {"id", "personal_owner_id"},
+    "organization_members": {"organization_id", "user_id"},
+    "workspace_members": {"organization_id", "workspace_id", "user_id"},
+    "workspace_invitations": {"id", "organization_id", "workspace_id", "invitee_user_id"},
+    "platform_idempotency": {"scope", "endpoint", "key"},
+    "account_registration_invites": {"id", "token_hash", "email"},
+    "rate_limits": {"scope_hash"},
+}
+WORKSPACE_TEXT_IDENTITY_COLUMNS = {
+    "idempotency": {"endpoint", "key"},
+    "tasks": {"id", "active_key"},
+    "raw_records": {"path"},
+    "classification_suggestions": {"article_id", "article_revision"},
+    "raw_classification_plans": {"raw_path", "raw_revision"},
+    "classification_previews": {"id"},
+    "reconciliation_items": {"id", "fingerprint"},
+}
 
 
 def instance_lock_path(project_root: Path) -> Path:
@@ -119,9 +285,9 @@ def _is_known_sqlite_path(root: Path, path: Path) -> bool:
             and parts[1:] == (".wiki-state", "state.sqlite3")
         )
         or (
-        len(parts) == 4
-        and parts[0] == "spaces"
-        and parts[2:] == (".wiki-state", "state.sqlite3")
+            len(parts) == 4
+            and parts[0] == "spaces"
+            and parts[2:] == (".wiki-state", "state.sqlite3")
         )
     )
 
@@ -132,6 +298,68 @@ def _is_sqlite_sidecar(root: Path, path: Path) -> bool:
             database = path.with_name(path.name[:-len(suffix)])
             return _is_known_sqlite_path(root, database)
     return False
+
+
+def _check_application_schema(db: sqlite3.Connection, path: Path) -> None:
+    anchors = PLATFORM_SCHEMA_ANCHORS if path.parent.name == ".platform" else WORKSPACE_SCHEMA_ANCHORS
+    primary_keys = PLATFORM_PRIMARY_KEYS if anchors is PLATFORM_SCHEMA_ANCHORS else WORKSPACE_PRIMARY_KEYS
+    unique_keys = PLATFORM_UNIQUE_KEYS if anchors is PLATFORM_SCHEMA_ANCHORS else {}
+    optional = PLATFORM_OPTIONAL_SCHEMA if anchors is PLATFORM_SCHEMA_ANCHORS else WORKSPACE_OPTIONAL_SCHEMA
+    optional_primary = (
+        PLATFORM_OPTIONAL_PRIMARY_KEYS if anchors is PLATFORM_SCHEMA_ANCHORS else WORKSPACE_OPTIONAL_PRIMARY_KEYS
+    )
+    optional_unique = (
+        PLATFORM_OPTIONAL_UNIQUE_KEYS if anchors is PLATFORM_SCHEMA_ANCHORS else WORKSPACE_OPTIONAL_UNIQUE_KEYS
+    )
+    text_columns = (
+        PLATFORM_TEXT_IDENTITY_COLUMNS if anchors is PLATFORM_SCHEMA_ANCHORS else WORKSPACE_TEXT_IDENTITY_COLUMNS
+    )
+    label = "platform" if anchors is PLATFORM_SCHEMA_ANCHORS else "workspace state"
+    tables = [(table, columns, True) for table, columns in anchors.items()]
+    tables.extend((table, columns, False) for table, columns in optional.items())
+    for table, required_columns, required in tables:
+        schema_type = db.execute(
+            "SELECT type FROM sqlite_schema WHERE name=?", (table,),
+        ).fetchone()
+        if schema_type is None and not required:
+            continue
+        if schema_type is None or schema_type[0] != "table":
+            raise RuntimeError(f"{label} SQLite schema is unsupported: {table}")
+        table_info = list(db.execute(f'PRAGMA table_info("{table}")'))
+        columns = {str(row[1]) for row in table_info}
+        legacy_platform_idempotency = table == "platform_idempotency" and "scope" not in columns
+        if legacy_platform_idempotency:
+            required_columns = LEGACY_PLATFORM_IDEMPOTENCY_COLUMNS
+        if not required_columns.issubset(columns):
+            raise RuntimeError(f"{label} SQLite schema is unsupported: {table}")
+        declared_types = {str(row[1]): str(row[2]).upper() for row in table_info}
+        required_text_columns = text_columns.get(table, set())
+        if legacy_platform_idempotency:
+            required_text_columns = {"user_id", "endpoint", "key"}
+        for column in required_text_columns:
+            if declared_types.get(column) != "TEXT":
+                raise RuntimeError(f"{label} SQLite schema has an unsupported identity type: {table}")
+        primary_key = tuple(
+            str(row[1]) for row in sorted((row for row in table_info if row[5]), key=lambda row: row[5])
+        )
+        expected_primary_key = primary_keys.get(table, optional_primary.get(table))
+        if legacy_platform_idempotency:
+            expected_primary_key = ("user_id", "endpoint", "key")
+        if primary_key != expected_primary_key:
+            raise RuntimeError(f"{label} SQLite schema has an unsupported primary key: {table}")
+        actual_unique_keys = set()
+        for index in db.execute(f'PRAGMA index_list("{table}")'):
+            if not index[2] or index[4]:
+                continue
+            columns = tuple(
+                str(row[2]) for row in sorted(
+                    db.execute(f'PRAGMA index_info("{index[1]}")'), key=lambda row: row[0],
+                )
+            )
+            actual_unique_keys.add(columns)
+        expected_unique_keys = unique_keys.get(table, optional_unique.get(table, set()))
+        if not expected_unique_keys.issubset(actual_unique_keys):
+            raise RuntimeError(f"{label} SQLite schema is missing a unique constraint: {table}")
 
 
 def _check_sqlite(path: Path, *, checkpoint: bool) -> None:
@@ -151,13 +379,14 @@ def _check_sqlite(path: Path, *, checkpoint: bool) -> None:
             raise RuntimeError(f"SQLite integrity check failed: {path.name}")
         if db.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise RuntimeError(f"SQLite foreign key check failed: {path.name}")
+        _check_application_schema(db, path)
     if checkpoint:
         wal = Path(f"{path}-wal")
         if wal.exists() and wal.stat().st_size:
             raise RuntimeError(f"SQLite WAL was not fully checkpointed: {path.name}")
 
 
-def _copy_data(source: Path, destination: Path) -> None:
+def _copy_source_data(source: Path, destination: Path) -> None:
     def ignore(directory, names):
         return {
             name for name in names
@@ -175,19 +404,75 @@ def _validate_tree(root: Path, label: str) -> None:
     if root.is_symlink() or not root.is_dir():
         raise RuntimeError(f"{label} must contain regular files and directories only")
     for path in root.rglob("*"):
-        mode = path.lstat().st_mode
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            if _is_sqlite_sidecar(root, path):
+                continue
+            raise RuntimeError(f"{label} changed during validation")
         if stat.S_ISLNK(mode):
             raise RuntimeError(f"{label} must not contain symbolic links")
         if not stat.S_ISREG(mode) and not stat.S_ISDIR(mode):
             raise RuntimeError(f"{label} contains an unsupported file type")
 
 
+def _check_workspace_layout(root: Path) -> None:
+    platform_db = root / ".platform" / "platform.sqlite3"
+    target = f"{platform_db.resolve().as_uri()}?mode=ro&immutable=1"
+    with sqlite3.connect(target, uri=True) as db:
+        columns = {str(row[1]) for row in db.execute('PRAGMA table_info("workspaces")')}
+        query = "SELECT root_name FROM workspaces"
+        organization_table = db.execute(
+            "SELECT type FROM sqlite_schema WHERE name='organizations'",
+        ).fetchone()
+        if "organization_id" in columns and organization_table and organization_table[0] == "table":
+            query = """
+                SELECT workspace.root_name FROM workspaces workspace
+                LEFT JOIN organizations organization ON organization.id=workspace.organization_id
+                LEFT JOIN users personal_owner ON personal_owner.id=organization.personal_owner_id
+                WHERE organization.id IS NULL OR NOT (
+                    organization.kind='personal'
+                    AND organization.status='deleted'
+                    AND personal_owner.id IS NOT NULL
+                    AND personal_owner.status='deleted'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM workspace_members member
+                        WHERE member.workspace_id=workspace.id AND member.status='active'
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM organization_members member
+                        WHERE member.organization_id=organization.id AND member.status='active'
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM model_settings setting WHERE setting.workspace_id=workspace.id
+                    )
+                )
+            """
+        roots = [row[0] for row in db.execute(query)]
+    for root_name in roots:
+        if (
+            not isinstance(root_name, str)
+            or not root_name
+            or Path(root_name).parts != (root_name,)
+            or root_name in {".", ".."}
+        ):
+            raise RuntimeError("platform workspace root is invalid")
+        workspace = root / "spaces" / root_name
+        if any(path.is_symlink() or not path.is_dir() for path in (workspace, workspace / "wiki", workspace / "raw")):
+            raise RuntimeError(f"backup workspace layout is incomplete: {root_name}")
+
+
 def _manifest(root: Path, source_root: Path) -> dict:
     for name in DATA_DIRECTORIES:
         _validate_tree(root / name, "backup data")
     entries = []
+    directories = []
     for path in sorted(root.rglob("*")):
-        if path.is_file() and path != root / MANIFEST_NAME and not _is_sqlite_sidecar(root, path):
+        if path.is_dir():
+            directories.append(path.relative_to(root).as_posix())
+        elif path.is_file() and path != root / MANIFEST_NAME:
+            if _is_sqlite_sidecar(root, path):
+                raise RuntimeError("published backup must not contain SQLite sidecars")
             relative = path.relative_to(root).as_posix()
             entries.append({"path": relative, "size": path.stat().st_size, "sha256": _sha256(path)})
     try:
@@ -201,6 +486,7 @@ def _manifest(root: Path, source_root: Path) -> dict:
         "schema_version": SCHEMA_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "git_sha": git_sha,
+        "directories": directories,
         "files": entries,
     }
 
@@ -409,14 +695,8 @@ def _copy_restore_directory(
 ) -> None:
     temporary = work_root / f"install-{target.name}-{uuid.uuid4().hex}"
 
-    def ignore(directory, names):
-        return {
-            name for name in names
-            if _is_sqlite_sidecar(source, Path(directory) / name)
-        }
-
     try:
-        shutil.copytree(source, temporary, symlinks=True, ignore=ignore)
+        shutil.copytree(source, temporary, symlinks=True)
         if not _directory_matches(source, temporary):
             raise RuntimeError("restore staging changed during installation")
         _fsync_tree(temporary)
@@ -437,17 +717,26 @@ def _directory_matches(source: Path, target: Path) -> bool:
         return False
     if any(path.is_symlink() for path in target.rglob("*")):
         return False
+    source_directories = {
+        path.relative_to(source).as_posix()
+        for path in source.rglob("*") if path.is_dir() and not path.is_symlink()
+    }
+    target_directories = {
+        path.relative_to(target).as_posix()
+        for path in target.rglob("*") if path.is_dir() and not path.is_symlink()
+    }
+    if source_directories != target_directories:
+        return False
     source_files = {
         path.relative_to(source).as_posix(): path
         for path in source.rglob("*")
-        if path.is_file() and not path.is_symlink() and not _is_sqlite_sidecar(source, path)
+        if path.is_file() and not path.is_symlink()
     }
     target_files = {
         path.relative_to(target).as_posix(): path
         for path in target.rglob("*")
         if path.is_file()
         and not path.is_symlink()
-        and not _is_sqlite_sidecar(source, source / path.relative_to(target))
     }
     if set(source_files) != set(target_files):
         return False
@@ -458,17 +747,28 @@ def _directory_matches(source: Path, target: Path) -> bool:
     )
 
 
-def _prepare_restore_stage(backup_root: Path, project_root: Path, stage: Path) -> dict:
-    stage.mkdir(mode=0o700)
-    shutil.copy2(backup_root / MANIFEST_NAME, stage / MANIFEST_NAME)
-    _copy_data(backup_root, stage)
+def _prepare_restore_stage(
+    backup_root: Path, project_root: Path, stage: Path, verified_manifest_sha256: str,
+) -> dict:
+    if _sha256(backup_root / MANIFEST_NAME) != verified_manifest_sha256:
+        raise RuntimeError("backup changed after verification")
+    shutil.copytree(backup_root, stage, symlinks=True)
+    if (
+        _sha256(backup_root / MANIFEST_NAME) != verified_manifest_sha256
+        or _sha256(stage / MANIFEST_NAME) != verified_manifest_sha256
+    ):
+        raise RuntimeError("backup changed during restore staging")
     # Verify the private copy before applying the documented session revocation.
     verify_backup(stage)
     platform_db = stage / ".platform" / "platform.sqlite3"
     with sqlite3.connect(platform_db) as db:
         db.execute("DELETE FROM sessions")
-    for path in _sqlite_paths(stage):
+    sqlite_paths = _sqlite_paths(stage)
+    for path in sqlite_paths:
         _check_sqlite(path, checkpoint=True)
+    for path in sqlite_paths:
+        for suffix in ("-wal", "-shm"):
+            Path(f"{path}{suffix}").unlink(missing_ok=True)
     manifest = _manifest(stage, project_root)
     _write_json_atomic(stage / MANIFEST_NAME, manifest)
     verify_backup(stage)
@@ -489,8 +789,26 @@ def verify_backup(backup_root: Path) -> dict:
     if manifest_path.is_symlink() or not manifest_path.is_file():
         raise RuntimeError("backup manifest is missing")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != SCHEMA_VERSION or not isinstance(manifest.get("files"), list):
+    if (
+        manifest.get("schema_version") != SCHEMA_VERSION
+        or not isinstance(manifest.get("files"), list)
+        or not isinstance(manifest.get("directories"), list)
+    ):
         raise RuntimeError("backup manifest is unsupported")
+    expected_directories = set()
+    for raw_directory in manifest["directories"]:
+        relative = Path(raw_directory) if isinstance(raw_directory, str) else None
+        if (
+            relative is None
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or not relative.parts
+            or relative.parts[0] not in DATA_DIRECTORIES
+        ):
+            raise RuntimeError("backup manifest contains an invalid directory entry")
+        expected_directories.add(raw_directory)
+    if len(expected_directories) != len(manifest["directories"]):
+        raise RuntimeError("backup manifest contains duplicate directory entries")
     for item in manifest["files"]:
         raw_path = item.get("path") if isinstance(item, dict) else None
         relative = Path(raw_path) if isinstance(raw_path, str) else None
@@ -510,12 +828,14 @@ def verify_backup(backup_root: Path) -> dict:
     expected = {item["path"]: item for item in manifest["files"]}
     if len(expected) != len(manifest["files"]):
         raise RuntimeError("backup manifest contains duplicate file entries")
+    for path in backup_root.rglob("*"):
+        if path.is_file() and _is_sqlite_sidecar(backup_root, path):
+            raise RuntimeError("published backup must not contain SQLite sidecars")
     actual = {
         path.relative_to(backup_root).as_posix(): path
         for path in backup_root.rglob("*")
         if path.is_file()
         and path != manifest_path
-        and not _is_sqlite_sidecar(backup_root, path)
     }
     if set(actual) != set(expected):
         raise RuntimeError("backup file set does not match manifest")
@@ -523,11 +843,18 @@ def verify_backup(backup_root: Path) -> dict:
         item = expected[relative]
         if path.is_symlink() or path.stat().st_size != item["size"] or _sha256(path) != item["sha256"]:
             raise RuntimeError(f"backup checksum mismatch: {relative}")
+    actual_directories = {
+        path.relative_to(backup_root).as_posix()
+        for path in backup_root.rglob("*") if path.is_dir() and not path.is_symlink()
+    }
+    if actual_directories != expected_directories:
+        raise RuntimeError("backup directory set does not match manifest")
     key = backup_root / ".platform" / "master.key"
     if not key.is_file() or key.stat().st_size != 32:
         raise RuntimeError("backup platform master key is missing or invalid")
     for path in _sqlite_paths(backup_root):
         _check_sqlite(path, checkpoint=False)
+    _check_workspace_layout(backup_root)
     return manifest
 
 
@@ -554,7 +881,7 @@ def create_backup(project_root: Path, destination: Path) -> dict:
             _check_sqlite(path, checkpoint=True)
         try:
             stage.mkdir(mode=0o700, parents=True)
-            _copy_data(project_root, stage)
+            _copy_source_data(project_root, stage)
             manifest = _manifest(stage, project_root)
             (stage / MANIFEST_NAME).write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
@@ -571,8 +898,15 @@ def create_backup(project_root: Path, destination: Path) -> dict:
 
 
 def restore_backup(backup_root: Path, project_root: Path, *, owner: str | None = None) -> dict:
+    if backup_root.is_symlink():
+        raise RuntimeError("backup root must not be a symbolic link")
     backup_root = backup_root.resolve()
     project_root = project_root.resolve()
+    manifest_sha256_before = _sha256(backup_root / MANIFEST_NAME)
+    manifest = verify_backup(backup_root)
+    verified_manifest_sha256 = _sha256(backup_root / MANIFEST_NAME)
+    if manifest_sha256_before != verified_manifest_sha256:
+        raise RuntimeError("backup changed during verification")
     identity = _owner_ids(owner)
     project_root.mkdir(parents=True, exist_ok=True)
     runtime = project_root / RUNTIME_DIRECTORY
@@ -612,7 +946,9 @@ def restore_backup(backup_root: Path, project_root: Path, *, owner: str | None =
                     raise RuntimeError(f"restore state is inconsistent for {name}")
             stage = work_root / f"restore-{uuid.uuid4().hex}"
             try:
-                manifest = _prepare_restore_stage(backup_root, project_root, stage)
+                manifest = _prepare_restore_stage(
+                    backup_root, project_root, stage, verified_manifest_sha256,
+                )
                 journal["stage"] = str(stage)
                 journal["stage_manifest_sha256"] = _sha256(stage / MANIFEST_NAME)
                 _write_json_atomic(journal_path, journal)
@@ -624,10 +960,12 @@ def restore_backup(backup_root: Path, project_root: Path, *, owner: str | None =
         else:
             stage = work_root / f"restore-{uuid.uuid4().hex}"
             try:
-                manifest = _prepare_restore_stage(backup_root, project_root, stage)
+                manifest = _prepare_restore_stage(
+                    backup_root, project_root, stage, verified_manifest_sha256,
+                )
                 journal = {
                     "schema_version": RESTORE_JOURNAL_SCHEMA,
-                    "backup_manifest_sha256": _sha256(backup_root / MANIFEST_NAME),
+                    "backup_manifest_sha256": verified_manifest_sha256,
                     "stage_manifest_sha256": _sha256(stage / MANIFEST_NAME),
                     "stage": str(stage),
                     "pending": list(DATA_DIRECTORIES),
