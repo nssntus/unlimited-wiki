@@ -173,6 +173,44 @@ def write_manifest(root: Path) -> None:
     (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
 
+def mark_deleted_personal_tombstone(platform: PlatformStore, user: dict) -> None:
+    with platform.connect() as db:
+        organization_id = db.execute(
+            "SELECT organization_id FROM workspaces WHERE id=?", (user["workspace_id"],),
+        ).fetchone()[0]
+        db.execute("UPDATE users SET status='deleted' WHERE id=?", (user["id"],))
+        db.execute("UPDATE organizations SET status='deleted' WHERE id=?", (organization_id,))
+        db.execute("DELETE FROM workspace_members WHERE workspace_id=?", (user["workspace_id"],))
+        db.execute("DELETE FROM organization_members WHERE organization_id=?", (organization_id,))
+        db.execute("DELETE FROM model_settings WHERE workspace_id=?", (user["workspace_id"],))
+
+
+def install_session_delete_blocker(database: Path, blocker: str) -> None:
+    with sqlite3.connect(database) as db:
+        db.execute("PRAGMA foreign_keys=ON")
+        if blocker == "trigger_without_sessions":
+            db.execute("DELETE FROM sessions")
+        if blocker.startswith("trigger"):
+            db.execute("""
+                CREATE TRIGGER block_session_delete BEFORE DELETE ON sessions
+                BEGIN SELECT RAISE(ABORT,'blocked session cleanup'); END
+            """)
+        else:
+            action = "RESTRICT" if blocker == "foreign_key_restrict" else "CASCADE"
+            target = "Sessions" if blocker == "foreign_key_mixed_case_cascade" else "sessions"
+            db.execute(f"""
+                CREATE TABLE session_references (
+                    token_hash TEXT NOT NULL REFERENCES {target}(token_hash) ON DELETE {action}
+                )
+            """)
+            token_hash = db.execute("SELECT token_hash FROM sessions LIMIT 1").fetchone()[0]
+            db.execute("INSERT INTO session_references VALUES(?)", (token_hash,))
+        db.commit()
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    Path(f"{database}-wal").unlink(missing_ok=True)
+    Path(f"{database}-shm").unlink(missing_ok=True)
+
+
 def test_backup_verify_and_restore_round_trip(tmp_path: Path):
     source = tmp_path / "source"
     source.mkdir()
@@ -330,6 +368,37 @@ def test_backup_restores_migratable_legacy_platform_idempotency_schema(tmp_path:
         row = db.execute("SELECT scope,status FROM platform_idempotency").fetchone()
     assert "scope" in columns and "user_id" not in columns
     assert tuple(row) == (f"account:{user['id']}", "done")
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "trigger_with_sessions", "trigger_without_sessions", "foreign_key_restrict",
+        "foreign_key_cascade", "foreign_key_mixed_case_cascade",
+    ],
+)
+def test_session_revocation_blockers_are_rejected_before_restore(tmp_path: Path, blocker: str):
+    source = tmp_path / "source"
+    source.mkdir()
+    seed_instance(source)
+    platform_database = source / ".platform" / "platform.sqlite3"
+    install_session_delete_blocker(platform_database, blocker)
+    with pytest.raises(RuntimeError, match="unsupported triggers|session references|revoke restored sessions"):
+        create_backup(source, tmp_path / "invalid-source-backup")
+
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    seed_instance(clean)
+    backup = tmp_path / "backup-001"
+    create_backup(clean, backup)
+    install_session_delete_blocker(backup / ".platform" / "platform.sqlite3", blocker)
+    write_manifest(backup)
+    with pytest.raises(RuntimeError, match="unsupported triggers|session references|revoke restored sessions"):
+        verify_backup(backup)
+    target = tmp_path / "target"
+    with pytest.raises(RuntimeError, match="unsupported triggers|session references|revoke restored sessions"):
+        restore_backup(backup, target)
+    assert not target.exists()
 
 
 def test_backup_preserves_non_sqlite_files_with_wal_and_shm_suffixes(tmp_path: Path):
@@ -593,15 +662,7 @@ def test_deleted_personal_workspace_tombstone_may_have_no_data_root(tmp_path: Pa
     source = tmp_path / "source"
     source.mkdir()
     platform, user, _article, _raw = seed_instance(source)
-    with platform.connect() as db:
-        organization_id = db.execute(
-            "SELECT organization_id FROM workspaces WHERE id=?", (user["workspace_id"],),
-        ).fetchone()[0]
-        db.execute("UPDATE users SET status='deleted' WHERE id=?", (user["id"],))
-        db.execute("UPDATE organizations SET status='deleted' WHERE id=?", (organization_id,))
-        db.execute("DELETE FROM workspace_members WHERE workspace_id=?", (user["workspace_id"],))
-        db.execute("DELETE FROM organization_members WHERE organization_id=?", (organization_id,))
-        db.execute("DELETE FROM model_settings WHERE workspace_id=?", (user["workspace_id"],))
+    mark_deleted_personal_tombstone(platform, user)
     backup_restore.shutil.rmtree(source / "spaces" / user["workspace_root_name"])
     backup = tmp_path / "backup-001"
     create_backup(source, backup)
@@ -609,6 +670,45 @@ def test_deleted_personal_workspace_tombstone_may_have_no_data_root(tmp_path: Pa
     target = tmp_path / "target"
     restore_backup(backup, target)
     assert not (target / "spaces" / user["workspace_root_name"]).exists()
+
+
+@pytest.mark.parametrize("residual_kind", ["deleted_personal", "orphan"])
+def test_backup_rejects_retired_or_orphan_workspace_roots(tmp_path: Path, residual_kind: str):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    if residual_kind == "deleted_personal":
+        mark_deleted_personal_tombstone(platform, user)
+        residual_name = user["workspace_root_name"]
+    else:
+        residual_name = "f" * 32
+    residual = source / "spaces" / residual_name
+    (residual / "wiki").mkdir(parents=True, exist_ok=True)
+    (residual / "raw").mkdir(exist_ok=True)
+    secret = residual / "wiki" / "secret.md"
+    secret.write_text("# Deleted private content\n", encoding="utf-8")
+    destination = tmp_path / "invalid-source-backup"
+    with pytest.raises(RuntimeError, match="retired or orphan workspace roots"):
+        create_backup(source, destination)
+    assert not destination.exists()
+
+    backup_restore.shutil.rmtree(residual)
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    forged = backup / "spaces" / residual_name
+    (forged / "wiki").mkdir(parents=True)
+    (forged / "raw").mkdir()
+    (forged / "wiki" / "secret.md").write_text("# Deleted private content\n", encoding="utf-8")
+    write_manifest(backup)
+    assert any(item["path"].endswith("secret.md") for item in json.loads(
+        (backup / "manifest.json").read_text(encoding="utf-8")
+    )["files"])
+    with pytest.raises(RuntimeError, match="retired or orphan workspace roots"):
+        verify_backup(backup)
+    target = tmp_path / "target"
+    with pytest.raises(RuntimeError, match="retired or orphan workspace roots"):
+        restore_backup(backup, target)
+    assert not target.exists()
 
 
 def test_restore_rejects_backup_root_symlink_that_verify_rejects(tmp_path: Path):

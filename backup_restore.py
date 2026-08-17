@@ -315,6 +315,19 @@ def _check_application_schema(db: sqlite3.Connection, path: Path) -> None:
         PLATFORM_TEXT_IDENTITY_COLUMNS if anchors is PLATFORM_SCHEMA_ANCHORS else WORKSPACE_TEXT_IDENTITY_COLUMNS
     )
     label = "platform" if anchors is PLATFORM_SCHEMA_ANCHORS else "workspace state"
+    if db.execute("SELECT 1 FROM sqlite_schema WHERE type='trigger' LIMIT 1").fetchone() is not None:
+        raise RuntimeError(f"{label} SQLite schema contains unsupported triggers")
+    if anchors is PLATFORM_SCHEMA_ANCHORS:
+        tables_with_session_foreign_keys = []
+        for row in db.execute("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+            table = str(row[0])
+            if any(
+                str(foreign_key[2]).casefold() == "sessions"
+                for foreign_key in db.execute(f'PRAGMA foreign_key_list("{table}")')
+            ):
+                tables_with_session_foreign_keys.append(table)
+        if tables_with_session_foreign_keys:
+            raise RuntimeError("platform SQLite schema contains unsupported session references")
     tables = [(table, columns, True) for table, columns in anchors.items()]
     tables.extend((table, columns, False) for table, columns in optional.items())
     for table, required_columns, required in tables:
@@ -362,6 +375,42 @@ def _check_application_schema(db: sqlite3.Connection, path: Path) -> None:
             raise RuntimeError(f"{label} SQLite schema is missing a unique constraint: {table}")
 
 
+def _exercise_session_revocation(db: sqlite3.Connection, *, commit: bool) -> None:
+    db.execute("PRAGMA foreign_keys=ON")
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        session_count = db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        changes_before = db.total_changes
+        db.execute("DELETE FROM sessions")
+        if (
+            db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] != 0
+            or db.total_changes - changes_before != session_count
+        ):
+            raise RuntimeError("platform SQLite cannot revoke restored sessions")
+        if db.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise RuntimeError("platform SQLite cannot revoke restored sessions")
+        if commit:
+            db.commit()
+        else:
+            db.rollback()
+    except BaseException:
+        db.rollback()
+        raise
+
+
+def _check_platform_restore_actions(db: sqlite3.Connection, path: Path) -> None:
+    if path.parent.name != ".platform":
+        return
+    probe = sqlite3.connect(":memory:")
+    try:
+        db.backup(probe)
+        _exercise_session_revocation(probe, commit=False)
+    except (RuntimeError, sqlite3.DatabaseError) as exc:
+        raise RuntimeError("platform SQLite cannot revoke restored sessions") from exc
+    finally:
+        probe.close()
+
+
 def _check_sqlite(path: Path, *, checkpoint: bool) -> None:
     if path.is_symlink() or not path.is_file():
         raise RuntimeError(f"SQLite database is missing or invalid: {path.name}")
@@ -380,6 +429,7 @@ def _check_sqlite(path: Path, *, checkpoint: bool) -> None:
         if db.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise RuntimeError(f"SQLite foreign key check failed: {path.name}")
         _check_application_schema(db, path)
+        _check_platform_restore_actions(db, path)
     if checkpoint:
         wal = Path(f"{path}-wal")
         if wal.exists() and wal.stat().st_size:
@@ -421,35 +471,37 @@ def _check_workspace_layout(root: Path) -> None:
     target = f"{platform_db.resolve().as_uri()}?mode=ro&immutable=1"
     with sqlite3.connect(target, uri=True) as db:
         columns = {str(row[1]) for row in db.execute('PRAGMA table_info("workspaces")')}
-        query = "SELECT root_name FROM workspaces"
+        query = "SELECT root_name,0 AS retired_personal FROM workspaces"
         organization_table = db.execute(
             "SELECT type FROM sqlite_schema WHERE name='organizations'",
         ).fetchone()
         if "organization_id" in columns and organization_table and organization_table[0] == "table":
             query = """
-                SELECT workspace.root_name FROM workspaces workspace
+                SELECT workspace.root_name,
+                    CASE WHEN (
+                        organization.kind='personal'
+                        AND organization.status='deleted'
+                        AND personal_owner.id IS NOT NULL
+                        AND personal_owner.status='deleted'
+                        AND NOT EXISTS (
+                            SELECT 1 FROM workspace_members member
+                            WHERE member.workspace_id=workspace.id AND member.status='active'
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM organization_members member
+                            WHERE member.organization_id=organization.id AND member.status='active'
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM model_settings setting WHERE setting.workspace_id=workspace.id
+                        )
+                    ) THEN 1 ELSE 0 END AS retired_personal
+                FROM workspaces workspace
                 LEFT JOIN organizations organization ON organization.id=workspace.organization_id
                 LEFT JOIN users personal_owner ON personal_owner.id=organization.personal_owner_id
-                WHERE organization.id IS NULL OR NOT (
-                    organization.kind='personal'
-                    AND organization.status='deleted'
-                    AND personal_owner.id IS NOT NULL
-                    AND personal_owner.status='deleted'
-                    AND NOT EXISTS (
-                        SELECT 1 FROM workspace_members member
-                        WHERE member.workspace_id=workspace.id AND member.status='active'
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1 FROM organization_members member
-                        WHERE member.organization_id=organization.id AND member.status='active'
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1 FROM model_settings setting WHERE setting.workspace_id=workspace.id
-                    )
-                )
             """
-        roots = [row[0] for row in db.execute(query)]
-    for root_name in roots:
+        rows = db.execute(query).fetchall()
+    required_roots = set()
+    for root_name, retired_personal in rows:
         if (
             not isinstance(root_name, str)
             or not root_name
@@ -457,6 +509,19 @@ def _check_workspace_layout(root: Path) -> None:
             or root_name in {".", ".."}
         ):
             raise RuntimeError("platform workspace root is invalid")
+        if not retired_personal:
+            required_roots.add(root_name)
+    spaces = root / "spaces"
+    actual_roots = set()
+    for workspace in spaces.iterdir():
+        if workspace.is_symlink() or not workspace.is_dir():
+            raise RuntimeError("backup spaces contains unexpected entries")
+        actual_roots.add(workspace.name)
+    if actual_roots - required_roots:
+        raise RuntimeError("backup spaces contains retired or orphan workspace roots")
+    if required_roots - actual_roots:
+        raise RuntimeError("backup workspace layout is incomplete")
+    for root_name in required_roots:
         workspace = root / "spaces" / root_name
         if any(path.is_symlink() or not path.is_dir() for path in (workspace, workspace / "wiki", workspace / "raw")):
             raise RuntimeError(f"backup workspace layout is incomplete: {root_name}")
@@ -762,7 +827,7 @@ def _prepare_restore_stage(
     verify_backup(stage)
     platform_db = stage / ".platform" / "platform.sqlite3"
     with sqlite3.connect(platform_db) as db:
-        db.execute("DELETE FROM sessions")
+        _exercise_session_revocation(db, commit=True)
     sqlite_paths = _sqlite_paths(stage)
     for path in sqlite_paths:
         _check_sqlite(path, checkpoint=True)
@@ -879,6 +944,7 @@ def create_backup(project_root: Path, destination: Path) -> dict:
             _validate_tree(project_root / name, "wiki data")
         for path in _sqlite_paths(project_root):
             _check_sqlite(path, checkpoint=True)
+        _check_workspace_layout(project_root)
         try:
             stage.mkdir(mode=0o700, parents=True)
             _copy_source_data(project_root, stage)
