@@ -2093,7 +2093,7 @@ class PlatformStore(SquareMixin):
             tag_id, resolved = resolve(tag, "tag")
             if tag_id not in tag_ids:
                 tag_ids.append(tag_id)
-                decisions.append(resolved)
+            decisions.append(resolved)
         return category_id, tag_ids, {"version": 1, "resolutions": decisions}
 
     def create_preview(

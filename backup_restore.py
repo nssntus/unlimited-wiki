@@ -569,10 +569,13 @@ def _stored_taxonomy_item(db: sqlite3.Connection, item: object, kind: str) -> di
     table = "public_categories" if kind == "category" else "public_tags"
     if item.get("kind") == "existing" and set(item) == {"kind", "id", "name"}:
         item_id = item.get("id")
+        try:
+            taxonomy_normalized_key(item.get("name"))
+        except ValueError as exc:
+            raise RuntimeError("platform SQLite has invalid taxonomy proposal data") from exc
         if (
             not isinstance(item_id, str)
             or not re.fullmatch(r"[a-f0-9]{32}", item_id)
-            or not isinstance(item.get("name"), str)
             or db.execute(f"SELECT 1 FROM {table} WHERE id=?", (item_id,)).fetchone() is None
         ):
             raise RuntimeError("platform SQLite has invalid taxonomy proposal data")
@@ -640,18 +643,30 @@ def _check_taxonomy_storage(db: sqlite3.Connection) -> None:
     submission_columns = {str(row[1]) for row in db.execute('PRAGMA table_info("submissions")')}
     if "taxonomy_decision_json" not in submission_columns:
         return
-    for row in db.execute("SELECT id,taxonomy_decision_json FROM submissions WHERE taxonomy_decision_json IS NOT NULL"):
+    for row in db.execute("SELECT id,status,public_entry_id,taxonomy_decision_json FROM submissions"):
         proposal = proposals.get(row["id"])
+        decision_json = row["taxonomy_decision_json"]
+        if row["status"] != "approved":
+            if decision_json is not None:
+                raise RuntimeError("platform SQLite has inconsistent taxonomy decision data")
+            continue
+        if proposal is None:
+            if decision_json is not None:
+                raise RuntimeError("platform SQLite has invalid taxonomy decision data")
+            continue
+        if decision_json is None:
+            raise RuntimeError("platform SQLite has inconsistent taxonomy decision data")
         try:
-            decision = json.loads(row["taxonomy_decision_json"])
+            decision = json.loads(decision_json)
         except json.JSONDecodeError as exc:
             raise RuntimeError("platform SQLite has invalid taxonomy decision data") from exc
-        if proposal is None or not isinstance(decision, dict) or set(decision) != {"version", "resolutions"} or decision.get("version") != 1:
+        if not isinstance(decision, dict) or set(decision) != {"version", "resolutions"} or decision.get("version") != 1:
             raise RuntimeError("platform SQLite has invalid taxonomy decision data")
         expected_items = [proposal["category"], *proposal["tags"]]
         resolutions = decision.get("resolutions")
         if not isinstance(resolutions, list) or len(resolutions) != len(expected_items):
             raise RuntimeError("platform SQLite has invalid taxonomy decision data")
+        resolved_ids: list[str] = []
         for item, resolution, kind in zip(
             expected_items,
             resolutions,
@@ -662,14 +677,47 @@ def _check_taxonomy_storage(db: sqlite3.Connection) -> None:
             expected_keys = {"kind", "action", "id"} if item["kind"] == "existing" else {"kind", "action", "key", "id"}
             expected_actions = {"accept"} if item["kind"] == "existing" else {"create", "map", "reuse"}
             table = "public_categories" if kind == "category" else "public_tags"
+            target = db.execute(
+                f"SELECT id,normalized_name FROM {table} WHERE id=?", (resolution.get("id"),),
+            ).fetchone()
             if (
                 set(resolution) != expected_keys
                 or resolution.get("action") not in expected_actions
                 or (item["kind"] == "proposal" and resolution.get("key") != item["key"])
                 or not isinstance(resolution.get("id"), str)
-                or db.execute(f"SELECT 1 FROM {table} WHERE id=?", (resolution.get("id"),)).fetchone() is None
+                or target is None
+                or (item["kind"] == "existing" and resolution.get("id") != item["id"])
+                or (
+                    item["kind"] == "proposal"
+                    and resolution.get("action") in {"create", "reuse"}
+                    and target["normalized_name"] != item["normalized_name"]
+                )
             ):
                 raise RuntimeError("platform SQLite has invalid taxonomy decision data")
+            resolved_ids.append(resolution["id"])
+
+        revisions = db.execute(
+            "SELECT id,entry_id FROM public_revisions WHERE submission_id=?",
+            (row["id"],),
+        ).fetchall()
+        if len(revisions) != 1 or revisions[0]["entry_id"] != row["public_entry_id"]:
+            raise RuntimeError("platform SQLite has inconsistent taxonomy decision data")
+        revision_id = revisions[0]["id"]
+        frozen_category = db.execute(
+            "SELECT category_id FROM public_revision_taxonomy WHERE revision_id=?",
+            (revision_id,),
+        ).fetchone()
+        frozen_tags = db.execute(
+            "SELECT tag_id FROM public_revision_tags WHERE revision_id=? ORDER BY rowid",
+            (revision_id,),
+        ).fetchall()
+        frozen_ids = [
+            frozen_category["category_id"] if frozen_category is not None else None,
+            *(tag["tag_id"] for tag in frozen_tags),
+        ]
+        resolved_relation_ids = [resolved_ids[0], *dict.fromkeys(resolved_ids[1:])]
+        if resolved_relation_ids != frozen_ids:
+            raise RuntimeError("platform SQLite has inconsistent taxonomy decision data")
 
 
 def _check_application_schema(db: sqlite3.Connection, path: Path) -> list[str]:

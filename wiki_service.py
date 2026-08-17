@@ -1207,6 +1207,8 @@ class WikiService:
             if existing_target:
                 raise ValueError("canonical article already exists; use supplement")
             result_target = f"{directory}/{slugify(title)}.md"
+            if (self.root / "wiki" / result_target).exists():
+                raise ValueError("canonical article already exists; use supplement")
             raw_link = source_link(result_target, raw_path, raw["title"])
             seed_md = self._seed_markdown(raw["markdown"], category=directory, raw_link=raw_link)
             changes[f"wiki/{result_target}"] = dc.ensure_article_metadata(
@@ -1249,13 +1251,21 @@ class WikiService:
             changes[dc.REGISTRY_REL] = dc.dump_registry(registry)
         changes["wiki/index.md"] = render_index(self.root, changes)
         changes["wiki/log.md"] = append_log_text(log_path.read_text(encoding="utf-8") if log_path.exists() else "", operation_id=operation_id, kind="ingest", title=title)
-        manifest = self.files.commit(
-            changes,
-            kind="ingest",
-            metadata={"raw": raw_path, "target": result_target, "disposition": disposition},
-            operation_id=operation_id,
-            directories={f"wiki/{directory}": True} if disposition in {"seed", "new"} else None,
-        )
+        try:
+            manifest = self.files.commit(
+                changes,
+                kind="ingest",
+                metadata={"raw": raw_path, "target": result_target, "disposition": disposition},
+                operation_id=operation_id,
+                must_not_exist_paths=(
+                    {f"wiki/{result_target}"} if disposition in {"seed", "new"} else None
+                ),
+                directories={f"wiki/{directory}": True} if disposition in {"seed", "new"} else None,
+            )
+        except FileExistsError as exc:
+            if disposition in {"seed", "new"}:
+                raise ValueError("canonical article already exists; use supplement") from exc
+            raise
         self.state.record_raw(raw_path, item["byte_hash"], item["text_hash"], disposition, result_target, operation_id)
         article = self.read_article(result_target) if result_target else None
         task = None

@@ -142,6 +142,51 @@ def test_seed_rejects_existing_article_without_taxonomy_side_effects(service: Wi
     assert not any(row["path"] == "raw/local/existing-seed.md" for row in service.state.raw_records())
 
 
+def test_seed_rejects_physical_slug_collision_without_overwriting(service: WikiService):
+    target = service.root / "wiki" / "_inbox" / "Foo.md"
+    target.parent.mkdir(exist_ok=True)
+    target.write_text("# Different Title\n\nORIGINAL SENTINEL\n", encoding="utf-8")
+    raw = service.root / "raw" / "local" / "physical-collision.md"
+    raw.write_text("# Foo\n\nReplacement body.\n", encoding="utf-8")
+    before = {
+        "target": target.read_bytes(),
+        "registry": (service.root / dc.REGISTRY_REL).read_bytes(),
+        "index": (service.root / "wiki" / "index.md").read_bytes(),
+        "log": (service.root / "wiki" / "log.md").read_bytes(),
+        "history": {path.name for path in service.files.history_root.iterdir()},
+    }
+
+    with pytest.raises(ValueError, match="use supplement"):
+        service.ingest_commit("raw/local/physical-collision.md", "seed", title="Foo")
+
+    assert target.read_bytes() == before["target"]
+    assert (service.root / dc.REGISTRY_REL).read_bytes() == before["registry"]
+    assert (service.root / "wiki" / "index.md").read_bytes() == before["index"]
+    assert (service.root / "wiki" / "log.md").read_bytes() == before["log"]
+    assert {path.name for path in service.files.history_root.iterdir()} == before["history"]
+    assert not any(row["path"] == "raw/local/physical-collision.md" for row in service.state.raw_records())
+
+
+def test_seed_commit_rechecks_target_absence_under_file_lock(service: WikiService, monkeypatch: pytest.MonkeyPatch):
+    raw = service.root / "raw" / "local" / "seed-race.md"
+    raw.write_text("# Seed Race\n\nReplacement body.\n", encoding="utf-8")
+    target = service.root / "wiki" / "_inbox" / "Seed-Race.md"
+    target.parent.mkdir(exist_ok=True)
+    original_commit = service.files.commit
+
+    def create_target_before_commit(*args, **kwargs):
+        target.write_text("# Concurrent Writer\n\nRACE SENTINEL\n", encoding="utf-8")
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(service.files, "commit", create_target_before_commit)
+    with pytest.raises(ValueError, match="use supplement"):
+        service.ingest_commit("raw/local/seed-race.md", "seed", title="Seed Race")
+
+    assert "RACE SENTINEL" in target.read_text(encoding="utf-8")
+    assert not any(row["path"] == "raw/local/seed-race.md" for row in service.state.raw_records())
+    assert not any(path.name.startswith("ingest-") for path in service.files.history_root.iterdir())
+
+
 def test_ingest_file_failure_retries_with_next_operation_attempt(service: WikiService, monkeypatch: pytest.MonkeyPatch):
     raw = service.root / "raw" / "local" / "retry-ingest.md"
     raw.write_text("# Retry Ingest\n\nGrounded body.\n", encoding="utf-8")
