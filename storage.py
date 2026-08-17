@@ -18,6 +18,14 @@ from typing import Iterator
 _PROCESS_LOCK = threading.RLock()
 
 
+class TransactionTargetExistsError(FileExistsError):
+    pass
+
+
+class OperationExistsError(FileExistsError):
+    pass
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -134,11 +142,11 @@ class FileStore:
             raise ValueError("exclusive transaction target is not part of changes")
         with self.locked():
             if must_not_exist and any(self.resolve(rel).exists() for rel in normalized):
-                raise FileExistsError("transaction target already exists")
+                raise TransactionTargetExistsError("transaction target already exists")
             if any(self.resolve(rel).exists() for rel in exclusive_paths):
-                raise FileExistsError("transaction target already exists")
+                raise TransactionTargetExistsError("transaction target already exists")
             if op_dir.exists():
-                raise FileExistsError(f"operation already exists: {op_id}")
+                raise OperationExistsError(f"operation already exists: {op_id}")
             backups = op_dir / "before"
             backups.mkdir(parents=True)
             entries: list[dict] = []
@@ -243,6 +251,11 @@ class FileStore:
         if not path.is_file():
             raise FileNotFoundError(operation_id)
         return json.loads(path.read_text(encoding="utf-8"))
+
+    def operation_slot_exists(self, operation_id: str) -> bool:
+        if not operation_id or not re.fullmatch(r"[A-Za-z0-9-]+", operation_id):
+            raise ValueError("invalid operation id")
+        return (self.history_root / operation_id).exists()
 
     def rollback(self, operation_id: str) -> dict:
         with self.locked():

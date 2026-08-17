@@ -25,7 +25,7 @@ import wiki_ops
 from document_ingest import MAX_INPUT_BYTES, SUPPORTED_SUFFIXES, parse_document_cached
 from security import RemoteError, resolve_relative_file
 from state_store import StateStore
-from storage import FileStore
+from storage import FileStore, OperationExistsError, TransactionTargetExistsError
 
 STATUS_VALUES = {"词条", "草稿", "过时", "有争议"}
 META_LINE_RE = re.compile(r"^>\s*([A-Za-z]+):\s*(.*?)\s*$", re.M)
@@ -500,13 +500,10 @@ class WikiService:
     def _available_operation_id(self, operation_base: str) -> str:
         operation_id = operation_base
         attempt = 1
-        while True:
-            try:
-                self.files.operation(operation_id)
-            except FileNotFoundError:
-                return operation_id
+        while self.files.operation_slot_exists(operation_id):
             attempt += 1
             operation_id = f"{operation_base}-attempt-{attempt}"
+        return operation_id
 
     def articles(self) -> list[dict]:
         rows = []
@@ -1262,7 +1259,9 @@ class WikiService:
                 ),
                 directories={f"wiki/{directory}": True} if disposition in {"seed", "new"} else None,
             )
-        except FileExistsError as exc:
+        except OperationExistsError:
+            raise
+        except TransactionTargetExistsError as exc:
             if disposition in {"seed", "new"}:
                 raise ValueError("canonical article already exists; use supplement") from exc
             raise

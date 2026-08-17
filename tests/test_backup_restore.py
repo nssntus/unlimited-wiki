@@ -370,7 +370,7 @@ def test_backup_rejects_malformed_taxonomy_decision_json(tmp_path: Path):
     assert_backup_contract_rejects(source, tmp_path, "taxonomy decision data")
 
 
-def approve_taxonomy_proposal(platform: PlatformStore, user: dict) -> tuple[str, str]:
+def approve_taxonomy_proposal(platform: PlatformStore, user: dict, *, with_tag: bool = False) -> tuple[str, str, str | None]:
     _token, context = platform.create_session(user["id"])
     snapshot = {
         "title": "Taxonomy audit",
@@ -388,13 +388,13 @@ def approve_taxonomy_proposal(platform: PlatformStore, user: dict) -> tuple[str,
         snapshot,
         taxonomy_selection={
             "category": {"kind": "proposal", "name": "Audit category"},
-            "tags": [],
+            "tags": [{"kind": "proposal", "name": "Audit tag"}] if with_tag else [],
         },
     )
     submission = platform.submit_preview(context, preview["preview_id"])
     platform.ai_decide(submission["id"], "pass", {"summary": "pass", "issues": []})
     pending = platform.admin_get(context, submission["id"])
-    proposal = pending["taxonomy"]["category"]
+    proposal_items = [pending["taxonomy"]["category"], *pending["taxonomy"]["tags"]]
     approved = platform.admin_decide(
         context,
         submission["id"],
@@ -402,7 +402,7 @@ def approve_taxonomy_proposal(platform: PlatformStore, user: dict) -> tuple[str,
         "reviewed",
         taxonomy_decision={
             "version": 1,
-            "resolutions": {proposal["key"]: {"action": "create"}},
+            "resolutions": {item["key"]: {"action": "create"} for item in proposal_items},
         },
     )
     with platform.connect() as db:
@@ -411,14 +411,19 @@ def approve_taxonomy_proposal(platform: PlatformStore, user: dict) -> tuple[str,
             "JOIN public_revisions r ON r.id=rt.revision_id WHERE r.submission_id=?",
             (submission["id"],),
         ).fetchone()[0]
-    return submission["id"], category_id
+        tag_row = db.execute(
+            "SELECT tag_id FROM public_revision_tags rt "
+            "JOIN public_revisions r ON r.id=rt.revision_id WHERE r.submission_id=?",
+            (submission["id"],),
+        ).fetchone()
+    return submission["id"], category_id, tag_row[0] if tag_row is not None else None
 
 
 def test_backup_accepts_matching_taxonomy_decision_and_frozen_revision(tmp_path: Path):
     source = tmp_path / "source"
     source.mkdir()
     platform, user, _article, _raw = seed_instance(source)
-    submission_id, category_id = approve_taxonomy_proposal(platform, user)
+    submission_id, category_id, _tag_id = approve_taxonomy_proposal(platform, user)
     backup = tmp_path / "backup"
 
     create_backup(source, backup)
@@ -437,17 +442,98 @@ def test_backup_accepts_matching_taxonomy_decision_and_frozen_revision(tmp_path:
     assert decision["resolutions"][0]["id"] == category_id == revision_category
 
 
-@pytest.mark.parametrize("mutation", ["pending_with_decision", "approved_without_decision", "mismatched_revision"])
+def test_backup_accepts_taxonomy_renamed_after_approval(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    _submission_id, category_id, tag_id = approve_taxonomy_proposal(platform, user, with_tag=True)
+    _token, context = platform.create_session(user["id"])
+    platform.admin_upsert_category(
+        context, category_id, "renamed-after-approval", "Renamed After Approval", "", "active", 0,
+    )
+    platform.admin_upsert_tag(context, tag_id, "renamed-tag-after-approval", "Renamed Tag After Approval", "active")
+    backup = tmp_path / "backup"
+
+    create_backup(source, backup)
+    assert verify_backup(backup)["schema_version"] == 2
+    target = tmp_path / "restored"
+    restore_backup(backup, target)
+    restored = PlatformStore(target)
+    assert restored.public_categories()[0]["name"] == "Renamed After Approval"
+    assert restored.public_tags()[0]["name"] == "Renamed Tag After Approval"
+
+
+@pytest.mark.parametrize("kind", ["category", "tag"])
+def test_backup_rejects_taxonomy_decision_that_disagrees_with_frozen_name(tmp_path: Path, kind: str):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    submission_id, _category_id, _tag_id = approve_taxonomy_proposal(platform, user, with_tag=True)
+    with platform.connect() as db:
+        revision_id = db.execute(
+            "SELECT id FROM public_revisions WHERE submission_id=?", (submission_id,),
+        ).fetchone()[0]
+        if kind == "category":
+            db.execute(
+                "UPDATE public_revision_taxonomy SET category_name='Different frozen category' WHERE revision_id=?",
+                (revision_id,),
+            )
+        else:
+            db.execute(
+                "UPDATE public_revision_tags SET tag_name='Different frozen tag' WHERE revision_id=?",
+                (revision_id,),
+            )
+    assert_backup_contract_rejects(source, tmp_path, "invalid taxonomy decision data")
+
+
+def test_backup_accepts_legacy_approved_submission_without_taxonomy_proposal(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    _token, context = platform.create_session(user["id"])
+    snapshot = {
+        "title": "Legacy publication",
+        "category": "",
+        "content_status": "draft",
+        "markdown": "# Legacy publication\n\nPublic body.\n",
+    }
+    preview = platform.create_preview(
+        context, "_inbox/legacy-publication.md", "r1", "a" * 32,
+        snapshot_fingerprint(snapshot), snapshot,
+    )
+    submission = platform.submit_preview(context, preview["preview_id"])
+    platform.ai_decide(submission["id"], "pass", {"summary": "pass", "issues": []})
+    platform.admin_decide(context, submission["id"], "approve", "reviewed")
+
+    backup = tmp_path / "backup"
+    create_backup(source, backup)
+    assert verify_backup(backup)["schema_version"] == 2
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "pending_with_decision",
+        "pending_publication_without_decision",
+        "approved_without_decision",
+        "mismatched_revision",
+    ],
+)
 def test_backup_rejects_taxonomy_decision_that_disagrees_with_publication(
     tmp_path: Path, mutation: str,
 ):
     source = tmp_path / "source"
     source.mkdir()
     platform, user, _article, _raw = seed_instance(source)
-    submission_id, _category_id = approve_taxonomy_proposal(platform, user)
+    submission_id, _category_id, _tag_id = approve_taxonomy_proposal(platform, user)
     with platform.connect() as db:
         if mutation == "pending_with_decision":
             db.execute("UPDATE submissions SET status='pending_admin' WHERE id=?", (submission_id,))
+        elif mutation == "pending_publication_without_decision":
+            db.execute(
+                "UPDATE submissions SET status='pending_admin',taxonomy_decision_json=NULL WHERE id=?",
+                (submission_id,),
+            )
         elif mutation == "approved_without_decision":
             db.execute("UPDATE submissions SET taxonomy_decision_json=NULL WHERE id=?", (submission_id,))
         else:
@@ -476,7 +562,7 @@ def test_backup_rejects_empty_existing_taxonomy_snapshot_name(tmp_path: Path):
     source = tmp_path / "source"
     source.mkdir()
     platform, user, _article, _raw = seed_instance(source)
-    _submission_id, category_id = approve_taxonomy_proposal(platform, user)
+    _submission_id, category_id, _tag_id = approve_taxonomy_proposal(platform, user)
     _token, context = platform.create_session(user["id"])
     snapshot = {
         "title": "Existing taxonomy",

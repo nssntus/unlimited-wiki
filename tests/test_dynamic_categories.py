@@ -219,6 +219,46 @@ def test_ingest_file_failure_retries_with_next_operation_attempt(service: WikiSe
     assert result["article"]["path"] == "Retry-Category/Retry-Ingest.md"
 
 
+def test_ingest_pre_manifest_crash_retries_with_next_attempt(
+    service: WikiService, monkeypatch: pytest.MonkeyPatch,
+):
+    raw = service.root / "raw" / "local" / "orphan-operation.md"
+    raw.write_text("# Orphan Operation\n\nGrounded body.\n", encoding="utf-8")
+    preview = service.ingest_preview("raw/local/orphan-operation.md")
+    base = f"ingest-{preview['raw']['byte_hash'][:20]}-seed"
+    orphan = service.files.history_root / base
+    original_write_manifest = service.files._write_manifest
+    failed = False
+
+    def fail_before_manifest(directory: Path, manifest: dict):
+        nonlocal failed
+        if not failed and directory.name == base:
+            failed = True
+            raise OSError("injected pre-manifest crash")
+        return original_write_manifest(directory, manifest)
+
+    monkeypatch.setattr(service.files, "_write_manifest", fail_before_manifest)
+    with pytest.raises(OSError, match="pre-manifest"):
+        service.ingest_commit(
+            "raw/local/orphan-operation.md", "seed", title="Orphan Operation",
+        )
+    assert (orphan / "before").is_dir()
+    assert not (orphan / "manifest.json").exists()
+    assert not (service.root / "wiki" / "_inbox" / "Orphan-Operation.md").exists()
+    monkeypatch.setattr(service.files, "_write_manifest", original_write_manifest)
+
+    result = service.ingest_commit(
+        "raw/local/orphan-operation.md", "seed", title="Orphan Operation",
+    )
+
+    assert result["operation_id"] == f"{base}-attempt-2"
+    assert result["article"]["path"] == "_inbox/Orphan-Operation.md"
+    assert not (orphan / "manifest.json").exists()
+    assert service.files.operation(f"{base}-attempt-2")["status"] == "committed"
+    record = next(row for row in service.state.raw_records() if row["path"] == "raw/local/orphan-operation.md")
+    assert record["operation_id"] == f"{base}-attempt-2"
+
+
 def test_inline_create_does_not_adopt_unregistered_directory(service: WikiService):
     external = service.root / "wiki" / "External-Knowledge"
     external.mkdir()
