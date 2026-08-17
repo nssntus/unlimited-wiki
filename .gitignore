@@ -24,6 +24,8 @@ secrets*
 .wiki-state/
 .platform/
 .runtime/
+/.restore/
+/.restore-complete-*/
 spaces/
 viewer/node_modules/
 viewer/dist/

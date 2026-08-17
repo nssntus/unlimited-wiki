@@ -143,7 +143,7 @@ sudo python3 backup_restore.py restore /var/backups/unlimited-wiki/wiki-20260817
 sudo -u unlimited-wiki WIKI_DISABLE_REMOTE_WORKER=1 python3 serve.py
 ```
 
-备份、恢复和服务进程共用 `.runtime/instance.lock`。高权限恢复要求项目根由 root 管理且不能被服务账号、组或其他用户写入；恢复的 journal、staging 和待发布副本只放在恢复进程拥有的项目根 `.restore/`（`0700`）中，不放入服务账号可写的 `.runtime/`。恢复会校验 manifest、主密钥和 SQLite 完整性，撤销备份中的浏览器会话，并在未发布副本上通过 fd 锚定、不跟随符号链接、子项优先而根目录最后的方式应用 `--owner`；再次校验后才原子发布 `.platform/` 与 `spaces/`。最终数据发布完成后才把稳定的 `.runtime/` 和 `instance.lock` 交给服务账号，再原子移走并清理 `.restore/`。续做必须使用同一备份和 `--owner`；复制、校验或属主交接失败都会保留私有 journal，使用相同参数重试。服务会在 `.restore/` 存在时拒绝启动。完成只读冒烟检查后停止临时进程，再通过 systemd 正常启动。至少每季度在隔离目录进行一次恢复演练；没有经过恢复验证的备份不能视为可用。
+备份、恢复和服务进程共用 `.runtime/instance.lock`；备份取得锁后若发现 `.restore/` 会拒绝运行，不能从半恢复实例生成灾备副本。高权限恢复要求项目根由 root 管理且不能被服务账号、组或其他用户写入；恢复的 journal、staging 和待发布副本只放在恢复进程拥有的项目根 `.restore/`（`0700`）中，不放入服务账号可写的 `.runtime/`。恢复会校验 manifest、主密钥以及固定位置的平台/Workspace SQLite 数据库，撤销备份中的浏览器会话，并在未发布副本上通过 fd 锚定、不跟随符号链接、子项优先而根目录最后的方式应用 `--owner`；journal 同时绑定 owner 名称和解析后的 UID/GID，续做时任一项变化都会拒绝。再次校验后才原子发布 `.platform/` 与 `spaces/`。最终数据发布完成后才把稳定的 `.runtime/` 和 `instance.lock` 交给服务账号，再原子将 `.restore/` 标记为 `.restore-complete-*` 并清理。`.restore/` 表示恢复未完成并阻断服务和备份；`.restore-complete-*` 仅表示数据与属主均已发布、最后的清理被中断，不阻断服务或新备份，但目录仍含敏感副本，保持 root 私有且由运维在确认不存在 `.restore/` 后清除。两类目录均已从 Git 排除。复制、校验或属主交接失败会保留私有 journal，必须使用同一备份、owner 名称和 UID/GID 重试。完成只读冒烟检查后停止临时进程，再通过 systemd 正常启动。至少每季度在隔离目录进行一次恢复演练；没有经过恢复验证的备份不能视为可用。
 
 ## 前端开发
 

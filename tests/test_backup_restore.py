@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import stat
+import subprocess
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from backup_restore import (
     create_backup,
     instance_lock_path,
     restore_backup,
+    restore_in_progress,
     restore_journal_path,
     verify_backup,
 )
@@ -80,6 +82,7 @@ def test_backup_preserves_non_sqlite_files_with_wal_and_shm_suffixes(tmp_path: P
         workspace / "raw" / "ordinary-shm": b"raw shm content",
         workspace / "wiki" / "notes.sqlite3": b"not a sqlite database",
         workspace / "wiki" / "notes.sqlite3-wal": b"ordinary attachment",
+        workspace / "raw" / "manifest.json": b"user-authored manifest",
     }
     for path, content in expected.items():
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -99,6 +102,40 @@ def test_backup_preserves_non_sqlite_files_with_wal_and_shm_suffixes(tmp_path: P
         assert (target / path.relative_to(source)).read_bytes() == content
 
 
+@pytest.mark.parametrize("database_kind", ["platform", "workspace"])
+def test_backup_and_verify_reject_corrupt_known_sqlite_databases(tmp_path: Path, database_kind: str):
+    source = tmp_path / "source"
+    source.mkdir()
+    _platform, user, _article, _raw = seed_instance(source)
+
+    def database(root: Path) -> Path:
+        if database_kind == "platform":
+            return root / ".platform" / "platform.sqlite3"
+        return root / "spaces" / user["workspace_root_name"] / ".wiki-state" / "state.sqlite3"
+
+    database(source).write_bytes(b"truncated database")
+    with pytest.raises(sqlite3.DatabaseError):
+        create_backup(source, tmp_path / "corrupt-source-backup")
+
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    _clean_platform, clean_user, _clean_article, _clean_raw = seed_instance(clean)
+    user = clean_user
+    backup = tmp_path / "backup-001"
+    create_backup(clean, backup)
+    damaged = database(backup)
+    damaged.write_bytes(b"truncated backup database")
+    manifest_path = backup / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    relative = damaged.relative_to(backup).as_posix()
+    entry = next(item for item in manifest["files"] if item["path"] == relative)
+    entry["size"] = damaged.stat().st_size
+    entry["sha256"] = backup_restore._sha256(damaged)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(sqlite3.DatabaseError):
+        verify_backup(backup)
+
+
 def test_backup_refuses_running_instance_and_detects_tampering(tmp_path: Path):
     source = tmp_path / "source"
     source.mkdir()
@@ -116,6 +153,48 @@ def test_backup_refuses_running_instance_and_detects_tampering(tmp_path: Path):
     victim = backup / manifest["files"][0]["path"]
     victim.write_bytes(victim.read_bytes() + b"tampered")
     with pytest.raises(RuntimeError, match="checksum mismatch"):
+        verify_backup(backup)
+
+
+def test_backup_refuses_unfinished_restore_with_partial_published_data(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    seed_instance(source)
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    target = tmp_path / "target"
+    target.mkdir()
+    real_replace = os.replace
+
+    def interrupt_spaces(source_path, target_path):
+        if Path(target_path) == target / "spaces":
+            raise OSError("interrupt after platform publish")
+        return real_replace(source_path, target_path)
+
+    monkeypatch.setattr(os, "replace", interrupt_spaces)
+    with pytest.raises(OSError, match="interrupt"):
+        restore_backup(backup, target)
+    assert (target / ".platform").is_dir()
+    assert not (target / "spaces").exists()
+    assert restore_journal_path(target).is_file()
+
+    partial_backup = tmp_path / "partial-backup"
+    with pytest.raises(RuntimeError, match="unfinished restore"):
+        create_backup(target, partial_backup)
+    assert not partial_backup.exists()
+
+
+def test_verify_rejects_unlisted_directory_symlink(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    _platform, user, _article, _raw = seed_instance(source)
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = backup / "spaces" / user["workspace_root_name"] / "wiki" / "linked-directory"
+    link.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="symbolic links"):
         verify_backup(backup)
 
 
@@ -310,7 +389,7 @@ def test_fd_owner_handoff_rejects_symlink_replacement(tmp_path: Path, monkeypatc
 
     monkeypatch.setattr(backup_restore, "_apply_fd_owner", replace_later)
     with pytest.raises(RuntimeError, match="symbolic links"):
-        backup_restore._set_owner(root, owner)
+        backup_restore._set_owner(root, backup_restore._owner_ids(owner))
     assert outside.read_text(encoding="utf-8") == "outside"
 
 
@@ -347,6 +426,39 @@ def test_restore_rejects_changing_owner_during_resume(tmp_path: Path, monkeypatc
     assert stage.is_dir()
 
 
+def test_restore_rejects_changed_numeric_identity_for_same_owner(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    seed_instance(source)
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    target = tmp_path / "target"
+    target.mkdir()
+    current_uid = 1234
+
+    monkeypatch.setattr(
+        backup_restore.pwd, "getpwnam",
+        lambda _owner: SimpleNamespace(pw_uid=current_uid, pw_gid=4321),
+    )
+    monkeypatch.setattr(
+        backup_restore.grp, "getgrnam", lambda _owner: SimpleNamespace(gr_gid=5678),
+    )
+    monkeypatch.setattr(
+        backup_restore, "_copy_restore_directory",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("injected interruption")),
+    )
+    with pytest.raises(OSError, match="injected"):
+        restore_backup(backup, target, owner="wiki-service")
+    journal = json.loads(restore_journal_path(target).read_text(encoding="utf-8"))
+    assert (journal["owner_uid"], journal["owner_gid"]) == (1234, 5678)
+
+    current_uid = 2234
+    with pytest.raises(RuntimeError, match="owner identity does not match"):
+        restore_backup(backup, target, owner="wiki-service")
+    unchanged = json.loads(restore_journal_path(target).read_text(encoding="utf-8"))
+    assert (unchanged["owner_uid"], unchanged["owner_gid"]) == (1234, 5678)
+
+
 def test_owner_repair_failure_keeps_resumable_journal(tmp_path: Path, monkeypatch):
     source = tmp_path / "source"
     source.mkdir()
@@ -359,12 +471,12 @@ def test_owner_repair_failure_keeps_resumable_journal(tmp_path: Path, monkeypatc
     real_set_owner = backup_restore._set_owner
     failed = False
 
-    def fail_once(root: Path, selected_owner: str | None):
+    def fail_once(root: Path, selected_identity: tuple[int, int] | None):
         nonlocal failed
         if Path(root).name.startswith("install-.platform-") and not failed:
             failed = True
             raise PermissionError("injected chown failure")
-        return real_set_owner(root, selected_owner)
+        return real_set_owner(root, selected_identity)
 
     monkeypatch.setattr(backup_restore, "_set_owner", fail_once)
     with pytest.raises(PermissionError, match="injected chown"):
@@ -469,8 +581,8 @@ def test_restore_rejects_install_replacement_after_owner_handoff(tmp_path: Path,
     owner = backup_restore.pwd.getpwuid(os.getuid()).pw_name
     real_set_owner = backup_restore._set_owner
 
-    def replace_install(root: Path, selected_owner: str | None):
-        real_set_owner(root, selected_owner)
+    def replace_install(root: Path, selected_identity: tuple[int, int] | None):
+        real_set_owner(root, selected_identity)
         if root.name.startswith("install-.platform-"):
             shutil_target = root.with_name(f"{root.name}-original")
             os.replace(root, shutil_target)
@@ -483,3 +595,42 @@ def test_restore_rejects_install_replacement_after_owner_handoff(tmp_path: Path,
     assert restore_journal_path(target).is_file()
     assert not (target / ".platform").exists()
     assert not (target / "spaces").exists()
+
+
+def test_completed_restore_residue_is_safe_to_backup_and_ignored_by_git(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    seed_instance(source)
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    target = tmp_path / "target"
+    target.mkdir()
+    real_rmtree = backup_restore.shutil.rmtree
+
+    def preserve_completed(path, *args, **kwargs):
+        if Path(path).name.startswith(".restore-complete-"):
+            raise OSError("cleanup interrupted")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(backup_restore.shutil, "rmtree", preserve_completed)
+    with pytest.raises(OSError, match="cleanup interrupted"):
+        restore_backup(backup, target)
+    residues = list(target.glob(".restore-complete-*"))
+    assert len(residues) == 1
+    assert not restore_in_progress(target)
+    assert (target / ".platform").is_dir()
+    assert (target / "spaces").is_dir()
+
+    completed_backup = tmp_path / "completed-backup"
+    create_backup(target, completed_backup)
+    verify_backup(completed_backup)
+
+    repository = Path(__file__).resolve().parents[1]
+    ignored = subprocess.run(
+        [
+            "git", "check-ignore", "--no-index",
+            ".restore/master.key", ".restore-complete-deadbeef/master.key",
+        ],
+        cwd=repository, text=True, capture_output=True, check=True,
+    ).stdout.splitlines()
+    assert ignored == [".restore/master.key", ".restore-complete-deadbeef/master.key"]
