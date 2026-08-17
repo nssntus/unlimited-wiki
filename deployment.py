@@ -18,6 +18,10 @@ class DeploymentConfig:
     max_concurrent_requests: int = 64
     request_timeout_seconds: int = 30
     min_free_bytes: int = 512 * 1024 * 1024
+    review_provider: str = ""
+    review_base_url: str = ""
+    review_api_key: str = ""
+    review_model: str = ""
 
     def __post_init__(self) -> None:
         if self.registration_mode not in REGISTRATION_MODES:
@@ -66,6 +70,15 @@ class DeploymentConfig:
     @property
     def cookie_name(self) -> str:
         return "__Host-wiki_session" if self.lan_mode else "wiki_session"
+
+    @property
+    def review_settings(self) -> dict[str, str]:
+        return {
+            "provider": self.review_provider,
+            "base_url": self.review_base_url,
+            "api_key": self.review_api_key,
+            "model": self.review_model,
+        }
 
     @property
     def trusted_proxy_networks(self):
@@ -128,4 +141,8 @@ def config_from_environment(getenv) -> DeploymentConfig:
         max_concurrent_requests=integer("WIKI_MAX_CONCURRENT_REQUESTS", 64),
         request_timeout_seconds=integer("WIKI_REQUEST_TIMEOUT_SECONDS", 30),
         min_free_bytes=integer("WIKI_MIN_FREE_BYTES", 512 * 1024 * 1024),
+        review_provider=getenv("WIKI_REVIEW_PROVIDER", "openai-compatible").strip(),
+        review_base_url=getenv("WIKI_REVIEW_BASE_URL", "").strip(),
+        review_api_key=getenv("WIKI_REVIEW_API_KEY", "").strip(),
+        review_model=getenv("WIKI_REVIEW_MODEL", "").strip(),
     )

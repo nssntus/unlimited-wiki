@@ -710,6 +710,56 @@ class WikiService:
         self.files.commit(changes, kind="edit", metadata={"path": rel}, operation_id=operation_id)
         return {"conflict": False, "operation_id": operation_id, "article": self.read_article(rel)}
 
+    def import_public_article(self, intent: dict) -> dict:
+        """Materialize one reserved public revision as an independent private draft."""
+        with self._intent_lock:
+            rel = str(intent["private_path"])
+            article_id = str(intent["private_article_id"])
+            entry_id = str(intent["public_entry_id"])
+            revision_id = str(intent["public_revision_id"])
+            operation_id = f"public-import-{intent['id']}"
+            target = self.root / "wiki" / rel
+            if target.is_file():
+                article = self.read_article(rel)
+                if article.get("article_id") != article_id:
+                    raise RuntimeError("public import target is occupied")
+                return {"operation_id": operation_id, "article": article, "replay": True}
+            snapshot = intent["snapshot"]
+            markdown = str(snapshot.get("markdown") or "")
+            if not kw.parse_title(markdown):
+                raise ValueError("public revision has no title")
+            markdown = dc.ensure_article_metadata(
+                markdown, category_id=None, status="pending", article_uuid=article_id,
+            )
+            markdown = replace_meta(markdown, "Category", "_inbox")
+            markdown = replace_meta(markdown, "Status", "草稿")
+            markdown = replace_meta(markdown, "Public-Entry", entry_id)
+            markdown = replace_meta(markdown, "Public-Revision", revision_id)
+            markdown = replace_meta(markdown, "Public-Attribution", str(snapshot.get("attribution") or "匿名用户")[:120])
+            markdown = replace_meta(
+                markdown, "Public-Reuse-Policy", str(intent["policy_version"]),
+            )
+            title = kw.parse_title(markdown) or "公开词条"
+            log_path = self.root / "wiki" / "log.md"
+            changes = {
+                f"wiki/{rel}": markdown,
+                "wiki/index.md": render_index(self.root, {f"wiki/{rel}": markdown}),
+                "wiki/log.md": append_log_text(
+                    log_path.read_text(encoding="utf-8") if log_path.exists() else "",
+                    operation_id=operation_id, kind="public-import", title=title,
+                ),
+            }
+            try:
+                self.files.commit(
+                    changes, kind="public-import", operation_id=operation_id,
+                    metadata={"public_entry_id": entry_id, "public_revision_id": revision_id},
+                )
+            except FileExistsError:
+                if target.is_file() and self.read_article(rel).get("article_id") == article_id:
+                    return {"operation_id": operation_id, "article": self.read_article(rel), "replay": True}
+                raise
+            return {"operation_id": operation_id, "article": self.read_article(rel), "replay": False}
+
     @staticmethod
     def _canonical_text_hash(text: str) -> str:
         text = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")

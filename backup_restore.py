@@ -96,6 +96,48 @@ PLATFORM_OPTIONAL_SCHEMA = {
         "id", "token_hash", "email", "status", "expires_at", "created_at", "used_at",
     },
     "rate_limits": {"scope_hash", "window_started", "request_count", "updated_at"},
+    "public_categories": {
+        "id", "slug", "name", "description", "status", "sort_order", "created_by", "created_at", "updated_at",
+    },
+    "public_tags": {"id", "slug", "name", "status", "created_at", "updated_at"},
+    "public_entry_tags": {"entry_id", "tag_id"},
+    "public_category_mappings": {"private_label", "category_id", "status", "mapped_by", "updated_at"},
+    "public_category_slug_redirects": {"slug", "category_id", "created_at"},
+    "public_reuse_permissions": {"entry_id", "permission", "granted_by", "granted_at", "revoked_at", "policy_version"},
+    "public_imports": {
+        "id", "user_id", "workspace_id", "public_entry_id", "public_revision_id", "private_article_id",
+        "private_path", "status", "imported_at", "created_at", "updated_at", "policy_version",
+    },
+    "public_subscriptions": {"user_id", "public_entry_id", "status", "created_at", "updated_at"},
+    "correction_suggestions": {
+        "id", "submitter_id", "entry_id", "revision_id", "kind", "detail", "evidence_url", "status",
+        "author_response", "resolved_at", "created_at", "updated_at",
+    },
+    "public_profiles": {"id", "user_id", "display_name", "bio", "status", "created_at", "updated_at"},
+    "public_collections": {
+        "id", "slug", "title", "description", "status", "curator_id", "published_at", "created_at", "updated_at",
+    },
+    "public_collection_items": {"collection_id", "entry_id", "sort_order", "curator_note"},
+    "curation_records": {
+        "id", "object_type", "object_id", "curator_id", "action", "reason", "sort_order", "created_at",
+    },
+    "public_search_documents": {
+        "entry_id", "revision_id", "title", "summary", "body_text", "public_category_id", "category_name",
+        "public_tags", "attribution", "first_published_at", "updated_at", "status",
+    },
+    "public_index_jobs": {"entry_id", "status", "attempts", "last_error", "updated_at"},
+    "public_revision_sources": {"revision_id", "position", "label", "url", "kind"},
+    "public_revision_reviews": {
+        "revision_id", "ai_policy_version", "ai_model", "ai_rules_version", "ai_report_json",
+        "admin_reason", "reviewed_by", "reviewed_at",
+    },
+    "public_revision_taxonomy": {"revision_id", "category_id", "attribution", "change_summary"},
+    "public_revision_tags": {"revision_id", "tag_id"},
+    "submission_review_attempts": {
+        "submission_id", "attempt", "status", "policy_version", "provider", "model", "rules_version",
+        "report_json", "started_at", "completed_at",
+    },
+    "public_search_fts": {"entry_id", "title", "summary", "body_text", "category_name", "public_tags", "attribution"},
 }
 WORKSPACE_OPTIONAL_SCHEMA = {
     "classification_suggestions": {
@@ -147,6 +189,27 @@ PLATFORM_OPTIONAL_PRIMARY_KEYS = {
     "platform_idempotency": ("scope", "endpoint", "key"),
     "account_registration_invites": ("id",),
     "rate_limits": ("scope_hash",),
+    "public_categories": ("id",),
+    "public_tags": ("id",),
+    "public_entry_tags": ("entry_id", "tag_id"),
+    "public_category_mappings": ("private_label",),
+    "public_category_slug_redirects": ("slug",),
+    "public_reuse_permissions": ("entry_id",),
+    "public_imports": ("id",),
+    "public_subscriptions": ("user_id", "public_entry_id"),
+    "correction_suggestions": ("id",),
+    "public_profiles": ("id",),
+    "public_collections": ("id",),
+    "public_collection_items": ("collection_id", "entry_id"),
+    "curation_records": ("id",),
+    "public_search_documents": ("entry_id",),
+    "public_index_jobs": ("entry_id",),
+    "public_revision_sources": ("revision_id", "position"),
+    "public_revision_reviews": ("revision_id",),
+    "public_revision_taxonomy": ("revision_id",),
+    "public_revision_tags": ("revision_id", "tag_id"),
+    "submission_review_attempts": ("submission_id", "attempt"),
+    "public_search_fts": (),
 }
 WORKSPACE_OPTIONAL_PRIMARY_KEYS = {
     "classification_suggestions": ("article_id", "article_revision", "taxonomy_revision"),
@@ -158,6 +221,11 @@ WORKSPACE_OPTIONAL_PRIMARY_KEYS = {
 PLATFORM_OPTIONAL_UNIQUE_KEYS = {
     "organizations": {("personal_owner_id",)},
     "account_registration_invites": {("token_hash",)},
+    "public_categories": {("slug",)},
+    "public_tags": {("slug",)},
+    "public_imports": {("workspace_id", "public_revision_id")},
+    "public_profiles": {("user_id",)},
+    "public_collections": {("slug",)},
 }
 WORKSPACE_OPTIONAL_UNIQUE_KEYS = {"reconciliation_items": {("fingerprint",)}}
 LEGACY_PLATFORM_IDEMPOTENCY_COLUMNS = {
@@ -185,6 +253,25 @@ PLATFORM_TEXT_IDENTITY_COLUMNS = {
     "platform_idempotency": {"scope", "endpoint", "key"},
     "account_registration_invites": {"id", "token_hash", "email"},
     "rate_limits": {"scope_hash"},
+    "public_categories": {"id", "slug", "created_by"},
+    "public_tags": {"id", "slug"},
+    "public_entry_tags": {"entry_id", "tag_id"},
+    "public_category_mappings": {"private_label", "category_id", "mapped_by"},
+    "public_category_slug_redirects": {"slug", "category_id"},
+    "public_reuse_permissions": {"entry_id", "granted_by"},
+    "public_imports": {"id", "user_id", "workspace_id", "public_entry_id", "public_revision_id", "private_article_id"},
+    "public_subscriptions": {"user_id", "public_entry_id"},
+    "correction_suggestions": {"id", "submitter_id", "entry_id", "revision_id"},
+    "public_profiles": {"id", "user_id"},
+    "public_collections": {"id", "slug", "curator_id"},
+    "public_collection_items": {"collection_id", "entry_id"},
+    "curation_records": {"id", "object_id", "curator_id"},
+    "public_search_documents": {"entry_id", "revision_id", "public_category_id"},
+    "public_revision_sources": {"revision_id"},
+    "public_revision_reviews": {"revision_id", "reviewed_by"},
+    "public_revision_taxonomy": {"revision_id", "category_id"},
+    "public_revision_tags": {"revision_id", "tag_id"},
+    "submission_review_attempts": {"submission_id"},
 }
 WORKSPACE_TEXT_IDENTITY_COLUMNS = {
     "idempotency": {"endpoint", "key"},

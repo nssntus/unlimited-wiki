@@ -22,6 +22,7 @@ const UNCOMMITTED_SWITCH_STATUSES = new Set([400, 403, 404, 422])
 export function SessionProvider({ children }: { children: ReactNode }) {
   const client = useQueryClient()
   const navigate = useNavigate()
+  const location = useLocation()
   const switchingRef = useRef(false)
   const [switchState, setSwitchState] = useState<SwitchState>({ kind: "idle" })
   const query = useQuery({ queryKey: queryKeys.session, queryFn: () => apiGet<Session>("/api/auth/session"), retry: false, staleTime: 0 })
@@ -140,7 +141,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     ? switchState.kind === "error"
       ? <WorkspaceSwitchGate error={switchState.message} onRetry={retryWorkspaceConfirmation} />
       : <WorkspaceSwitchGate />
-    : query.data?.authenticated && (!query.data.workspace || query.data.workspace_selection_required)
+    : query.data?.authenticated && (!query.data.workspace || query.data.workspace_selection_required) && !location.pathname.startsWith("/square")
       ? <WorkspaceSelectionGate onSwitch={switchWorkspace} onLifecycle={changeWorkspaceLifecycle} onSignOut={signOut} />
       : children
   return <SessionContext.Provider value={value}>{content}</SessionContext.Provider>

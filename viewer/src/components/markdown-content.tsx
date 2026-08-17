@@ -82,7 +82,7 @@ export function MarkdownContent({ markdown, fromPath, className, keywords = [], 
           a({ href = "", children, ...props }) {
             const internal = resolveInternal(fromPath, href)
             if (internal) return publicMode ? <span>{children}</span> : <Link to={internal}>{children}</Link>
-            if (/^https?:/i.test(href)) return <a href={href} rel="noopener noreferrer" {...props}>{children}</a>
+            if (/^https?:/i.test(href)) return <a href={href} target={publicMode ? "_blank" : undefined} rel="noopener noreferrer" {...props}>{children}{publicMode && <span className="sr-only">（外部来源，平台未核验）</span>}</a>
             if (href.startsWith("#")) {
               const id = decodeURIComponent(href.slice(1))
               return <button type="button" className="inline text-link underline underline-offset-4" onClick={() => scrollToHeading(id)}>{children}</button>

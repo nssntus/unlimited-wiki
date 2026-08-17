@@ -47,6 +47,7 @@ from platform_store import (
 )
 from platform_review import PlatformReviewWorker
 from publication import public_markdown, snapshot_fingerprint
+from square_v2 import REUSE_POLICY_VERSION, canonical_public_url
 from state_store import StateStore
 from wiki_service import LLMConfig, WikiService, article_summary
 
@@ -150,7 +151,9 @@ class WikiApp:
             self.diagnostics = DiagnosticCache(self.service)
         if self.platform is not None:
             self._reconcile_workspace_storage_states()
-        self.review_worker = PlatformReviewWorker(self.platform, self.platform_reviewer) if self.platform is not None and self.start_worker else None
+        self.review_worker = PlatformReviewWorker(
+            self.platform, self.platform_reviewer, self.deployment.review_settings,
+        ) if self.platform is not None and self.start_worker else None
 
     @property
     def multi_user(self) -> bool:
@@ -835,6 +838,21 @@ def make_handler(app: WikiApp):
             except PlatformIdempotencyError as exc:
                 raise ApiError(409, str(exc)) from exc
 
+        def _anonymous_platform_idempotency(self, data: dict, action, *, purpose: str):
+            if app.platform is None:
+                raise ApiError(404, "not found")
+            key = self.headers.get("Idempotency-Key", "")
+            if not key or len(key) > 128 or not key.isascii() or any(ord(ch) < 33 for ch in key):
+                raise ApiError(422, "a printable ASCII Idempotency-Key is required")
+            endpoint = urlparse(self.path).path
+            remote_hash = hashlib.sha256(self._client_ip().encode("utf-8")).hexdigest()
+            try:
+                return app.platform.run_platform_idempotent(
+                    f"anonymous:{purpose}:{remote_hash}", endpoint, key, data, action,
+                )
+            except PlatformIdempotencyError as exc:
+                raise ApiError(409, str(exc)) from exc
+
         def _serve_static(self, path: str) -> None:
             dist = app.dist_dir
             if not dist.is_dir():
@@ -904,15 +922,101 @@ def make_handler(app: WikiApp):
                 if self.context is None:
                     raise ApiError(401, "authentication required")
                 return self._json(200, app.platform.list_workspace_members(self.context))
+            if path.startswith("/api/public/") and self.account_context is None and app.platform is not None:
+                self._rate_limit(
+                    f"square-read:ip:{self._client_ip()}", limit=1200, window_seconds=3600,
+                )
             if path == "/api/public/entries":
                 if app.platform is None:
                     return self._json(200, [])
+                self._rate_limit(f"square-read:ip:{self._client_ip()}", limit=600, window_seconds=3600)
                 return self._json(200, app.platform.list_public(_single_query(parsed, "q"), _single_query(parsed, "category")))
+            if path == "/api/public/home":
+                if app.platform is None:
+                    return self._json(200, {"categories": [], "tags": [], "featured": [], "latest": [], "updated": [], "collections": []})
+                self._rate_limit(f"square-read:ip:{self._client_ip()}", limit=600, window_seconds=3600)
+                return self._json(200, app.platform.public_home())
+            if path == "/api/public/search":
+                if app.platform is None:
+                    return self._json(200, {"items": [], "next_cursor": None})
+                self._rate_limit(f"square-search:ip:{self._client_ip()}", limit=300, window_seconds=3600)
+                raw_limit = _single_query(parsed, "limit") or "24"
+                if not raw_limit.isdecimal():
+                    raise ApiError(400, "invalid limit")
+                return self._json(200, app.platform.search_public(
+                    query=_single_query(parsed, "q"), category=_single_query(parsed, "category"),
+                    tag=_single_query(parsed, "tag"), sort=_single_query(parsed, "sort") or "relevance",
+                    cursor=_single_query(parsed, "cursor") or None, limit=int(raw_limit),
+                ))
+            if path == "/api/public/categories":
+                return self._json(200, app.platform.public_categories() if app.platform else [])
+            match = re.fullmatch(r"/api/public/categories/([a-z0-9-]{1,64})", path)
+            if match:
+                if app.platform is None: raise ApiError(404, "not found")
+                return self._json(200, app.platform.resolve_public_category(match.group(1)))
+            if path == "/api/public/tags":
+                return self._json(200, app.platform.public_tags() if app.platform else [])
+            if path == "/api/public/collections":
+                return self._json(200, app.platform.list_public_collections() if app.platform else [])
+            match = re.fullmatch(r"/api/public/collections/([a-z0-9-]{1,64})", path)
+            if match:
+                if app.platform is None: raise ApiError(404, "not found")
+                return self._json(200, app.platform.get_public_collection(match.group(1)))
+            match = re.fullmatch(r"/api/public/authors/([a-f0-9]{32})", path)
+            if match:
+                if app.platform is None: raise ApiError(404, "not found")
+                try:
+                    result = app.platform.get_public_profile(match.group(1))
+                except FileNotFoundError:
+                    tombstone = app.platform.public_profile_tombstone(match.group(1))
+                    if tombstone is not None:
+                        raise ApiError(410, tombstone["error"], details={"code": tombstone["code"]})
+                    raise
+                return self._json(200, result)
+            match = re.fullmatch(r"/api/public/entries/([a-f0-9]{32})/versions", path)
+            if match:
+                if app.platform is None: raise ApiError(404, "not found")
+                return self._json(200, app.platform.public_versions(match.group(1)))
+            match = re.fullmatch(r"/api/public/entries/([a-f0-9]{32})/versions/(\d+)", path)
+            if match:
+                if app.platform is None: raise ApiError(404, "not found")
+                return self._json(200, app.platform.get_public_version(match.group(1), int(match.group(2))))
+            match = re.fullmatch(r"/api/public/entries/([a-f0-9]{32})/diff", path)
+            if match:
+                if app.platform is None: raise ApiError(404, "not found")
+                before, after = _single_query(parsed, "from"), _single_query(parsed, "to")
+                if not before.isdecimal() or not after.isdecimal(): raise ApiError(400, "invalid versions")
+                return self._json(200, app.platform.public_diff(match.group(1), int(before), int(after)))
+            match = re.fullmatch(r"/api/public/entries/([a-f0-9]{32})/corrections", path)
+            if match:
+                if self.account_context is None: raise ApiError(401, "authentication required")
+                return self._json(200, app.platform.list_entry_corrections(
+                    self.context or self.account_context, match.group(1),
+                ))
             match = re.fullmatch(r"/api/public/entries/([a-f0-9]{32})", path)
             if match:
                 if app.platform is None:
                     raise ApiError(404, "not found")
-                return self._json(200, app.platform.get_public(match.group(1)))
+                try:
+                    result = app.platform.get_public_v2(
+                        match.group(1), self.account_context.user_id if self.account_context else None,
+                        self.context.workspace_id if self.context else None,
+                    )
+                except FileNotFoundError:
+                    tombstone = app.platform.public_entry_tombstone(match.group(1))
+                    if tombstone is not None:
+                        raise ApiError(410, tombstone["error"], details={"code": tombstone["code"]})
+                    raise
+                return self._json(200, result)
+            if path == "/api/public/me/reports":
+                if self.account_context is None: raise ApiError(401, "authentication required")
+                return self._json(200, app.platform.my_reports(self.context or self.account_context))
+            if path == "/api/public/me/corrections":
+                if self.account_context is None: raise ApiError(401, "authentication required")
+                return self._json(200, app.platform.list_my_corrections(self.context or self.account_context))
+            if path == "/api/public/me/library":
+                if self.account_context is None: raise ApiError(401, "authentication required")
+                return self._json(200, app.platform.my_square_library(self.context or self.account_context))
             if not path.startswith("/api/"):
                 return self._serve_static(path)
 
@@ -1002,6 +1106,13 @@ def make_handler(app: WikiApp):
                 return self._json(200, app.platform.admin_public_entries(
                     self.context, _single_query(parsed, "status") or "published",
                 ))
+            match = re.fullmatch(r"/api/admin/public-entries/([a-f0-9]{32})/revisions", path)
+            if match:
+                self._require_role("admin")
+                return self._json(200, app.platform.admin_public_versions(self.context, match.group(1)))
+            if path == "/api/admin/square":
+                self._require_role("admin")
+                return self._json(200, app.platform.admin_square_state(self.context))
             return self._serve_static(path)
 
         def _dispatch_post(self) -> None:
@@ -1085,11 +1196,146 @@ def make_handler(app: WikiApp):
                     raise ApiError(404, "not found")
                 self._rate_limit(f"report:ip:{self._client_ip()}", limit=30, window_seconds=3600)
                 _fields(data, {"reason_code", "detail"}, {"reason_code"})
-                response = app.platform.report_public(
+                reason_code = _string(data, "reason_code", maximum=40, required=True)
+                response, replay = self._anonymous_platform_idempotency(data, lambda: app.platform.report_public(
                     match.group(1), self.account_context.user_id if self.account_context else None,
-                    _string(data, "reason_code", maximum=40, required=True), _string(data, "detail", maximum=1000),
-                )
-                return self._json(201, response)
+                    "other" if reason_code == "content_concern" else reason_code,
+                    _string(data, "detail", maximum=2000),
+                ), purpose="report")
+                return self._json(200 if replay else 201, response)
+
+            match = re.fullmatch(r"/api/public/entries/([a-f0-9]{32})/(?P<action>subscribe|unsubscribe)", path)
+            if match:
+                _fields(data, set())
+                response, _ = self._platform_idempotency(data, lambda: app.platform.set_subscription(
+                    self.context or self.account_context, match.group(1), match.group("action") == "subscribe",
+                ), scope=f"account:{self.account_context.user_id}")
+                return self._json(200, response)
+            match = re.fullmatch(r"/api/public/entries/([a-f0-9]{32})/corrections", path)
+            if match:
+                _fields(data, {"kind", "detail", "evidence_url"}, {"kind", "detail"})
+                self._rate_limit(f"correction:user:{self.account_context.user_id}", limit=20, window_seconds=86400)
+                response, replay = self._platform_idempotency(data, lambda: app.platform.create_correction(
+                    self.context or self.account_context, match.group(1),
+                    _string(data, "kind", maximum=30, required=True),
+                    _string(data, "detail", maximum=4000, required=True),
+                    _string(data, "evidence_url", maximum=1000),
+                ), scope=f"account:{self.account_context.user_id}")
+                return self._json(200 if replay else 201, response)
+            if path == "/api/public/profile":
+                _fields(data, {"enabled", "display_name", "bio"}, {"enabled", "display_name"})
+                enabled = data.get("enabled")
+                if not isinstance(enabled, bool): raise ApiError(422, "enabled must be boolean")
+                response, _ = self._platform_idempotency(data, lambda: app.platform.set_public_profile(
+                    self.context or self.account_context, enabled,
+                    _string(data, "display_name", maximum=80, required=True), _string(data, "bio", maximum=1000),
+                ), scope=f"account:{self.account_context.user_id}")
+                return self._json(200, response)
+            match = re.fullmatch(r"/api/public/entries/([a-f0-9]{32})/reuse", path)
+            if match:
+                _fields(data, {"permission", "policy_version", "acknowledged"}, {"permission"})
+                response, _ = self._platform_idempotency(data, lambda: app.platform.set_reuse_permission(
+                    self.context or self.account_context, match.group(1),
+                    _string(data, "permission", maximum=40, required=True),
+                    policy_version=_string(data, "policy_version", maximum=80) or None,
+                    acknowledged=data.get("acknowledged") is True,
+                ), scope=f"account:{self.account_context.user_id}")
+                return self._json(200, response)
+            match = re.fullmatch(r"/api/public/entries/([a-f0-9]{32})/withdraw", path)
+            if match:
+                _fields(data, {"reason"}, {"reason"})
+                response, _ = self._platform_idempotency(data, lambda: app.platform.author_withdraw_public(
+                    self.context or self.account_context, match.group(1), _string(data, "reason", maximum=1000, required=True),
+                ), scope=f"account:{self.account_context.user_id}")
+                return self._json(200, response)
+            match = re.fullmatch(r"/api/public/corrections/([a-f0-9]{32})/decision", path)
+            if match:
+                _fields(data, {"status", "response"}, {"status", "response"})
+                response, _ = self._platform_idempotency(data, lambda: app.platform.decide_correction(
+                    self.context or self.account_context, match.group(1),
+                    _string(data, "status", maximum=30, required=True),
+                    _string(data, "response", maximum=2000, required=True),
+                ), scope=f"account:{self.account_context.user_id}")
+                return self._json(200, response)
+
+            if path == "/api/admin/public-categories":
+                self._require_role("admin")
+                _fields(data, {"id", "slug", "name", "description", "status", "sort_order"}, {"slug", "name", "status"})
+                sort_order = data.get("sort_order", 0)
+                if not isinstance(sort_order, int): raise ApiError(422, "sort_order must be integer")
+                response, _ = self._platform_idempotency(data, lambda: app.platform.admin_upsert_category(
+                    self.context, _string(data, "id", maximum=32) or None,
+                    _string(data, "slug", maximum=64, required=True), _string(data, "name", maximum=80, required=True),
+                    _string(data, "description", maximum=1000), _string(data, "status", maximum=20, required=True), sort_order,
+                ))
+                return self._json(200, response)
+            if path == "/api/admin/public-tags":
+                self._require_role("admin")
+                _fields(data, {"id", "slug", "name", "status"}, {"slug", "name", "status"})
+                response, _ = self._platform_idempotency(data, lambda: app.platform.admin_upsert_tag(
+                    self.context, _string(data, "id", maximum=32) or None,
+                    _string(data, "slug", maximum=64, required=True), _string(data, "name", maximum=50, required=True),
+                    _string(data, "status", maximum=20, required=True),
+                ))
+                return self._json(200, response)
+            if path == "/api/admin/public-category-mappings":
+                self._require_role("admin")
+                _fields(data, {"private_label", "category_id"}, {"private_label", "category_id"})
+                response, _ = self._platform_idempotency(data, lambda: app.platform.admin_map_category(
+                    self.context, _string(data, "private_label", maximum=120, required=True),
+                    _string(data, "category_id", maximum=32, required=True),
+                ))
+                return self._json(200, response)
+            match = re.fullmatch(r"/api/admin/public-categories/([a-f0-9]{32})/merge", path)
+            if match:
+                self._require_role("admin")
+                _fields(data, {"target_id", "reason"}, {"target_id", "reason"})
+                response, _ = self._platform_idempotency(data, lambda: app.platform.admin_merge_category(
+                    self.context, match.group(1), _string(data, "target_id", maximum=32, required=True),
+                    _string(data, "reason", maximum=1000, required=True),
+                ))
+                return self._json(200, response)
+            match = re.fullmatch(r"/api/admin/public-entries/([a-f0-9]{32})/taxonomy", path)
+            if match:
+                self._require_role("admin")
+                _fields(data, {"category_id", "tag_ids"})
+                tags = data.get("tag_ids", [])
+                if not isinstance(tags, list) or not all(isinstance(value, str) for value in tags): raise ApiError(422, "tag_ids must be strings")
+                response, _ = self._platform_idempotency(data, lambda: app.platform.admin_set_entry_taxonomy(
+                    self.context, match.group(1), _string(data, "category_id", maximum=32) or None, tags,
+                ))
+                return self._json(200, response)
+            match = re.fullmatch(r"/api/admin/public-entries/([a-f0-9]{32})/featured", path)
+            if match:
+                self._require_role("admin")
+                _fields(data, {"featured", "reason", "sort_order"}, {"featured", "reason"})
+                if not isinstance(data.get("featured"), bool) or not isinstance(data.get("sort_order", 0), int): raise ApiError(422, "invalid featured options")
+                response, _ = self._platform_idempotency(data, lambda: app.platform.admin_set_featured(
+                    self.context, match.group(1), data["featured"],
+                    _string(data, "reason", maximum=1000, required=True), data.get("sort_order", 0),
+                ))
+                return self._json(200, response)
+            if path == "/api/admin/public-collections":
+                self._require_role("admin")
+                _fields(data, {"id", "slug", "title", "description", "status", "items", "reason"}, {"slug", "title", "status", "reason"})
+                items = data.get("items", [])
+                if not isinstance(items, list) or not all(isinstance(value, dict) for value in items): raise ApiError(422, "items must be objects")
+                response, _ = self._platform_idempotency(data, lambda: app.platform.admin_upsert_collection(
+                    self.context, _string(data, "id", maximum=32) or None,
+                    _string(data, "slug", maximum=64, required=True), _string(data, "title", maximum=120, required=True),
+                    _string(data, "description", maximum=2000), _string(data, "status", maximum=20, required=True),
+                    items, _string(data, "reason", maximum=1000, required=True),
+                ))
+                return self._json(200, response)
+            match = re.fullmatch(r"/api/admin/public-entries/([a-f0-9]{32})/revisions/([a-f0-9]{32})/(?P<action>isolate|restore)", path)
+            if match:
+                self._require_role("admin")
+                _fields(data, {"reason"}, {"reason"})
+                response, _ = self._platform_idempotency(data, lambda: app.platform.admin_isolate_revision(
+                    self.context, match.group(1), match.group(2), match.group("action") == "isolate",
+                    _string(data, "reason", maximum=1000, required=True),
+                ))
+                return self._json(200, response)
 
             if path == "/api/workspaces":
                 _fields(data, {"display_name"}, {"display_name"})
@@ -1202,6 +1448,7 @@ def make_handler(app: WikiApp):
                 "/api/categories/commit", "/api/reconciliation/scan", "/api/reconciliation/preview",
                 "/api/reconciliation/commit", "/api/governance", "/api/article/save", "/api/ingest/commit",
                 "/api/ingest/upload", "/api/merge/commit", "/api/share-previews", "/api/submissions",
+                "/api/public/import",
             }
             if path in {"/api/settings/models", "/api/settings/model"}:
                 self._require_workspace_permission("model.manage")
@@ -1232,6 +1479,43 @@ def make_handler(app: WikiApp):
                 safe_data = {"provider": provider, "base_url": base_url, "model": model, "api_key_fingerprint": fingerprint}
                 response, _ = self._idempotency(safe_data, lambda: app.save_model_settings(service, self.context, provider, base_url, api_key, model))
                 return self._json(200, response)
+            if path == "/api/public/import":
+                _fields(
+                    data, {"entry_id", "revision_id", "subscribe", "policy_version", "acknowledged"},
+                    {"entry_id", "revision_id", "policy_version", "acknowledged"},
+                )
+                subscribe = data.get("subscribe", True)
+                if not isinstance(subscribe, bool): raise ApiError(422, "subscribe must be boolean")
+                def import_action():
+                    intent = app.platform.begin_public_import(
+                        self.context, _string(data, "entry_id", maximum=32, required=True),
+                        _string(data, "revision_id", maximum=32, required=True),
+                        expected_policy_version=_string(data, "policy_version", maximum=80, required=True),
+                        acknowledged=data.get("acknowledged") is True,
+                    )
+                    if intent.get("existing"):
+                        imported = {
+                            "article": service.read_article(intent["private_path"]),
+                            "operation_id": f"public-import-{intent['id']}", "replay": True,
+                        }
+                        response = intent
+                    else:
+                        imported = service.import_public_article(intent)
+                        try:
+                            response = app.platform.finish_public_import(self.context, intent["id"], subscribe=subscribe)
+                        except BaseException:
+                            try:
+                                service.rollback(imported["operation_id"])
+                            finally:
+                                app.platform.abandon_public_import(self.context, intent["id"])
+                            raise
+                    self.diagnostics.refresh()
+                    return {
+                        **response, "article": imported["article"], "operation_id": imported["operation_id"],
+                    }
+
+                response, replay = self._idempotency(data, import_action)
+                return self._json(200 if replay or response.get("existing") else 201, response)
             if path == "/api/generate/preflight":
                 _fields(data, {"keyword", "from_path", "heading", "passage"}, {"keyword"})
                 result = service.preflight_generate(
@@ -1384,7 +1668,10 @@ def make_handler(app: WikiApp):
                 self.diagnostics.refresh()
                 return self._json(200, response)
             if path == "/api/share-previews":
-                _fields(data, {"article_path", "source_revision", "attribution"}, {"article_path", "source_revision", "attribution"})
+                _fields(data, {
+                    "article_path", "source_revision", "attribution", "public_category_id", "tag_ids",
+                    "reuse_permission", "reuse_policy_version", "reuse_policy_acknowledged", "link_public_profile", "source_urls",
+                }, {"article_path", "source_revision", "attribution"})
                 article_path = _string(data, "article_path", maximum=512, required=True)
                 source_revision = _string(data, "source_revision", maximum=128, required=True)
                 attribution = _string(data, "attribution", maximum=80, required=True)
@@ -1400,12 +1687,51 @@ def make_handler(app: WikiApp):
                     raise ApiError(409, "article already has a submission in review")
                 if attribution not in {"nickname", "anonymous"}:
                     raise ApiError(422, "invalid attribution")
+                category_id = _string(data, "public_category_id", maximum=32) or None
+                tag_ids = data.get("tag_ids", [])
+                source_urls = data.get("source_urls", [])
+                reuse_permission = _string(data, "reuse_permission", maximum=40) or "view_only"
+                reuse_policy_version = _string(data, "reuse_policy_version", maximum=80) or None
+                reuse_acknowledged = data.get("reuse_policy_acknowledged", False)
+                link_profile = data.get("link_public_profile", False)
+                if (
+                    not isinstance(tag_ids, list) or not all(isinstance(value, str) for value in tag_ids)
+                    or not isinstance(source_urls, list) or not all(isinstance(value, str) for value in source_urls)
+                    or not isinstance(link_profile, bool)
+                    or not isinstance(reuse_acknowledged, bool)
+                    or reuse_permission not in {"view_only", "allow_private_copy"}
+                    or (reuse_permission == "allow_private_copy" and (
+                        not reuse_acknowledged or reuse_policy_version != REUSE_POLICY_VERSION
+                    ))
+                ):
+                    raise ApiError(422, "invalid Square publication options")
+                available_sources = [str(value) for value in article.get("sources", [])]
+                available_by_url: dict[str, str] = {}
+                for value in available_sources:
+                    match = re.search(r"https?://[^\s<>]+", value)
+                    if match:
+                        available_by_url.setdefault(match.group(0), value)
+                public_sources = []
+                for url in source_urls:
+                    canonical = canonical_public_url(url)
+                    if canonical is None or url not in available_by_url:
+                        raise ApiError(422, "public sources must be selected HTTP(S) article sources")
+                    public_sources.append({
+                        "label": urlparse(canonical).hostname or "外部来源",
+                        "url": canonical, "kind": "reference",
+                    })
                 projected_markdown = public_markdown(article["markdown"])
                 snapshot = {
                     "title": article["title"], "category": article["category"], "content_status": article["content_status"],
                     "markdown": projected_markdown, "summary": article_summary(projected_markdown),
                     "attribution": self.context.nickname if attribution == "nickname" else "匿名用户",
-                    "source_summaries": [str(value)[:240] for value in article.get("sources", [])],
+                    "source_summaries": [], "public_sources": public_sources,
+                    "square": {
+                        "public_category_id": category_id, "tag_ids": tag_ids,
+                        "reuse_permission": reuse_permission, "link_public_profile": link_profile,
+                        "reuse_policy_version": REUSE_POLICY_VERSION,
+                        "reuse_policy_acknowledged": reuse_acknowledged,
+                    },
                 }
                 fingerprint = snapshot_fingerprint(snapshot)
                 response, _ = self._idempotency(data, lambda: app.platform.create_preview(
@@ -1432,9 +1758,15 @@ def make_handler(app: WikiApp):
             match = re.fullmatch(r"/api/admin/submissions/([a-f0-9]{32})/decision", path)
             if match:
                 self._require_role("admin")
-                _fields(data, {"decision", "reason"}, {"decision", "reason"})
+                _fields(data, {"decision", "reason", "public_category_id", "tag_ids", "duplicate_action"}, {"decision", "reason"})
+                tag_ids = data.get("tag_ids", [])
+                if not isinstance(tag_ids, list) or not all(isinstance(value, str) for value in tag_ids):
+                    raise ApiError(422, "tag_ids must be an array of ids")
                 response, _ = self._idempotency(data, lambda: app.platform.admin_decide(
                     self.context, match.group(1), _string(data, "decision", maximum=40, required=True), _string(data, "reason", maximum=1000, required=True),
+                    public_category_id=_string(data, "public_category_id", maximum=32) or None,
+                    tag_ids=tag_ids,
+                    duplicate_action=_string(data, "duplicate_action", maximum=40) or "independent",
                 ))
                 return self._json(200, response)
             match = re.fullmatch(r"/api/admin/public-entries/([a-f0-9]{32})/remove", path)
@@ -1495,9 +1827,11 @@ def make_handler(app: WikiApp):
                 self._validate_host()
                 self._validate_origin()
                 path = urlparse(self.path).path
-                public = path in {"/api/auth/register", "/api/auth/login", "/api/auth/recover"} or path.startswith("/api/public/entries/")
-                self._prepare_context(required=app.multi_user and not public)
-                if app.multi_user and not public:
+                anonymous_public = path in {"/api/auth/register", "/api/auth/login", "/api/auth/recover"} or bool(
+                    re.fullmatch(r"/api/public/entries/[a-f0-9]{32}/reports", path)
+                )
+                self._prepare_context(required=app.multi_user and not anonymous_public)
+                if app.multi_user and not anonymous_public:
                     self._require_csrf()
                 if self.service is not None:
                     self.service.set_request_actor(self.context.user_id if self.context else None)

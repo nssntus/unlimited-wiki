@@ -22,6 +22,13 @@ from pathlib import Path
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from publication import FINGERPRINT_VERSION, article_id_from_markdown, normalize_text, snapshot_fingerprint
+from square_v2 import (
+    REPORT_REASONS,
+    REUSE_PERMISSIONS,
+    REUSE_POLICY_VERSION,
+    SquareMixin,
+    initialize_square_schema,
+)
 
 
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -207,7 +214,7 @@ class _BorrowedConnection:
         return getattr(self._db, name)
 
 
-class PlatformStore:
+class PlatformStore(SquareMixin):
     def __init__(self, project_root: Path):
         self.project_root = project_root.resolve()
         self.state_root = self.project_root / ".platform"
@@ -368,6 +375,7 @@ class PlatformStore:
                     status TEXT NOT NULL, manifest_json TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                 );
             """)
+            initialize_square_schema(db)
             workspace_columns = {row["name"] for row in db.execute("PRAGMA table_info(workspaces)").fetchall()}
             if "organization_id" not in workspace_columns:
                 db.execute("ALTER TABLE workspaces ADD COLUMN organization_id TEXT REFERENCES organizations(id)")
@@ -448,7 +456,19 @@ class PlatformStore:
                 WHERE source_workspace_id IS NOT NULL AND source_article_id IS NOT NULL
             """)
             db.execute("UPDATE submissions SET status='ai_queued',updated_at=? WHERE status='ai_reviewing'", (now_iso(),))
+            self._backfill_square_v2(db)
         os.chmod(self.db_path, 0o600)
+
+    def _backfill_square_v2(self, db: sqlite3.Connection) -> None:
+        """Populate derived Square state without changing immutable revision bytes."""
+        entries = db.execute("""
+            SELECT e.id,e.first_published_at existing_first,MIN(r.published_at) earliest
+            FROM public_entries e LEFT JOIN public_revisions r ON r.entry_id=e.id GROUP BY e.id
+        """).fetchall()
+        for entry in entries:
+            if not entry["existing_first"] and entry["earliest"]:
+                db.execute("UPDATE public_entries SET first_published_at=? WHERE id=?", (entry["earliest"], entry["id"]))
+            self._refresh_square_entry(db, entry["id"])
 
     @staticmethod
     def _backfill_publication_metadata(db: sqlite3.Connection) -> None:
@@ -1812,7 +1832,42 @@ class PlatformStore:
                     WHERE other.workspace_id=w.id AND other.user_id<>? AND other.status='active'
                   )
             """, (context.user_id, context.user_id)).fetchall()
-            db.execute("UPDATE public_entries SET status='withdrawn_by_author',updated_at=? WHERE author_id=? AND status='published'", (now, context.user_id))
+            withdrawn_entries = db.execute("""
+                SELECT id,current_revision_id FROM public_entries
+                WHERE author_id=? AND status IN ('published','removed_by_admin')
+            """, (context.user_id,)).fetchall()
+            db.execute("""
+                UPDATE public_entries
+                SET status='withdrawn_by_author',updated_at=?,moderation_reason='account_deleted',
+                    moderated_by=NULL,moderated_at=?
+                WHERE author_id=? AND status IN ('published','removed_by_admin')
+            """, (now, now, context.user_id))
+            db.execute("UPDATE public_profiles SET status='disabled',updated_at=? WHERE user_id=?", (now, context.user_id))
+            db.execute("""
+                UPDATE public_reuse_permissions SET permission='view_only',revoked_at=?
+                WHERE entry_id IN (SELECT id FROM public_entries WHERE author_id=?)
+            """, (now, context.user_id))
+            db.execute("UPDATE public_subscriptions SET status='inactive',updated_at=? WHERE user_id=?", (now, context.user_id))
+            db.execute("""
+                UPDATE submissions SET status='withdrawn',reason='account_deleted',updated_at=?
+                WHERE owner_id=? AND status IN (
+                    'ai_queued','ai_reviewing','ai_failed','needs_revision','pending_admin','admin_changes_requested'
+                )
+            """, (now, context.user_id))
+            db.execute("DELETE FROM share_previews WHERE owner_id=?", (context.user_id,))
+            for entry in withdrawn_entries:
+                for subscriber in db.execute("""
+                    SELECT user_id FROM public_subscriptions
+                    WHERE public_entry_id=? AND status='active' AND user_id<>?
+                """, (entry["id"], context.user_id)).fetchall():
+                    self._notify(
+                        db, subscriber["user_id"], "public_withdrawn", "public_entry", entry["id"],
+                        "订阅的公开词条已撤回", "该公开词条现已不可访问；你的私人副本不会被删除。",
+                    )
+                self._refresh_square_entry(db, entry["id"])
+                self._audit(db, context.user_id, "public.withdraw", "public_entry", entry["id"], {
+                    "reason": "account_deleted", "revision_id": entry["current_revision_id"],
+                })
             for workspace in cleanup:
                 db.execute("DELETE FROM model_settings WHERE workspace_id=?", (workspace["id"],))
             db.execute("DELETE FROM sessions WHERE user_id=?", (context.user_id,))
@@ -1916,6 +1971,12 @@ class PlatformStore:
             raise ValueError("article has no stable identity")
         if publication_fingerprint != snapshot_fingerprint(snapshot):
             raise ValueError("publication fingerprint does not match snapshot")
+        square = snapshot.get("square") if isinstance(snapshot.get("square"), dict) else {}
+        if square.get("reuse_permission") == "allow_private_copy" and (
+            square.get("reuse_policy_version") != REUSE_POLICY_VERSION
+            or square.get("reuse_policy_acknowledged") is not True
+        ):
+            raise ValueError("current reuse policy must be acknowledged")
         preview_id = uuid.uuid4().hex
         canonical = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         content_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -1970,6 +2031,21 @@ class PlatformStore:
                 row["content_hash"], None, None, None, None, now, now, row["article_id"],
                 row["article_path"], row["source_revision"], row["publication_fingerprint"],
             ))
+            preview_snapshot = json.loads(row["snapshot_json"])
+            square = preview_snapshot.get("square") if isinstance(preview_snapshot.get("square"), dict) else {}
+            category_id = square.get("public_category_id")
+            tags = square.get("tag_ids") if isinstance(square.get("tag_ids"), list) else []
+            permission = square.get("reuse_permission", "view_only")
+            if category_id is not None and not re.fullmatch(r"[a-f0-9]{32}", str(category_id)):
+                db.rollback(); raise ValueError("invalid public category")
+            if permission not in REUSE_PERMISSIONS or len(tags) > 12 or any(
+                not re.fullmatch(r"[a-f0-9]{32}", str(tag)) for tag in tags
+            ):
+                db.rollback(); raise ValueError("invalid Square options")
+            db.execute("""
+                UPDATE submissions SET proposed_public_category_id=?,proposed_tags_json=?,
+                  reuse_permission=?,link_public_profile=? WHERE id=?
+            """, (category_id, json.dumps(tags), permission, 1 if square.get("link_public_profile") else 0, submission_id))
             db.execute("DELETE FROM share_previews WHERE id=?", (preview_id,))
             saved = db.execute("SELECT * FROM submissions WHERE id=?", (submission_id,)).fetchone()
             self._audit(
@@ -1986,6 +2062,10 @@ class PlatformStore:
             "content_hash": row["content_hash"], "ai_report": json.loads(row["ai_report_json"]) if row["ai_report_json"] else None,
             "reason": row["reason"], "public_entry_id": row["public_entry_id"],
             "created_at": row["created_at"], "updated_at": row["updated_at"],
+            "proposed_public_category_id": row["proposed_public_category_id"],
+            "proposed_tags": json.loads(row["proposed_tags_json"] or "[]"),
+            "reuse_permission": row["reuse_permission"], "link_public_profile": bool(row["link_public_profile"]),
+            "duplicate_candidates": json.loads(row["duplicate_candidates_json"] or "[]"),
         }
         if admin:
             result["owner_id"] = row["owner_id"]
@@ -2167,7 +2247,7 @@ class PlatformStore:
             "moderated_at": public["moderated_at"] if public else None,
         }
 
-    def ai_decide(self, submission_id: str, decision: str, report: dict) -> dict:
+    def ai_decide(self, submission_id: str, decision: str, report: dict, *, expected_attempt: int | None = None) -> dict:
         mapping = {"pass": "pending_admin", "needs_revision": "needs_revision", "reject": "ai_rejected", "failed": "ai_failed"}
         if decision not in mapping:
             raise ValueError("invalid AI review decision")
@@ -2176,13 +2256,33 @@ class PlatformStore:
             row = db.execute("SELECT * FROM submissions WHERE id=?", (submission_id,)).fetchone()
             if row is None:
                 db.rollback(); raise FileNotFoundError(submission_id)
+            if expected_attempt is not None and (
+                row["status"] != "ai_reviewing" or row["review_attempt"] != expected_attempt
+            ):
+                db.rollback()
+                return {"id": submission_id, "status": row["status"], "stale": True}
             if row["status"] not in {"ai_queued", "ai_reviewing", "ai_failed"}:
                 db.rollback(); raise RuntimeError("submission is not awaiting AI review")
             db.execute("UPDATE submissions SET status=?,ai_report_json=?,updated_at=? WHERE id=?", (
                 mapping[decision], json.dumps({**report, "decision": decision}, ensure_ascii=False), now_iso(), submission_id,
             ))
+            db.execute("""
+                UPDATE submissions SET ai_policy_version=?,ai_model=?,ai_rules_version=? WHERE id=?
+            """, (report.get("policy_version"), report.get("model"), report.get("rules_version"), submission_id))
+            attempt = expected_attempt if expected_attempt is not None else row["review_attempt"]
+            db.execute("""
+                UPDATE submission_review_attempts
+                SET status=?,policy_version=?,provider=?,model=?,rules_version=?,report_json=?,completed_at=?
+                WHERE submission_id=? AND attempt=? AND status='running'
+            """, (
+                mapping[decision], report.get("policy_version"), report.get("provider"), report.get("model"),
+                report.get("rules_version"), json.dumps({**report, "decision": decision}, ensure_ascii=False),
+                now_iso(), submission_id, attempt,
+            ))
+            self._audit(db, None, "submission.ai_review", "submission", submission_id, {
+                "decision": decision, "attempt": attempt,
+            })
             db.commit()
-        self.audit(None, "submission.ai_review", "submission", submission_id, {"decision": decision})
         return {"id": submission_id, "status": mapping[decision]}
 
     def claim_ai_submission(self) -> dict | None:
@@ -2192,13 +2292,30 @@ class PlatformStore:
             if row is None:
                 db.commit()
                 return None
-            changed = db.execute("UPDATE submissions SET status='ai_reviewing',updated_at=? WHERE id=? AND status='ai_queued'", (now_iso(), row["id"])).rowcount
+            changed = db.execute("""
+                UPDATE submissions SET status='ai_reviewing',review_attempt=review_attempt+1,updated_at=?
+                WHERE id=? AND status='ai_queued'
+            """, (now_iso(), row["id"])).rowcount
+            claimed = db.execute("SELECT * FROM submissions WHERE id=?", (row["id"],)).fetchone() if changed else None
+            if claimed is not None:
+                db.execute("""
+                    INSERT INTO submission_review_attempts(
+                        submission_id,attempt,status,started_at
+                    ) VALUES(?,?,'running',?)
+                """, (claimed["id"], claimed["review_attempt"], now_iso()))
             db.commit()
         if not changed:
             return None
+        snapshot = json.loads(claimed["snapshot_json"])
+        candidates = self.duplicate_candidates(snapshot)
+        with self.connect() as db:
+            db.execute("UPDATE submissions SET duplicate_candidates_json=? WHERE id=? AND review_attempt=?", (
+                json.dumps(candidates, ensure_ascii=False), claimed["id"], claimed["review_attempt"],
+            ))
         return {
-            "id": row["id"], "workspace_id": row["workspace_id"],
-            "snapshot": json.loads(row["snapshot_json"]), "content_hash": row["content_hash"],
+            "id": claimed["id"], "attempt": claimed["review_attempt"], "snapshot": snapshot,
+            "review_input": {"snapshot": snapshot, "duplicate_candidates": candidates},
+            "content_hash": claimed["content_hash"],
         }
 
     def retry_ai(self, context: SessionContext, submission_id: str) -> dict:
@@ -2227,6 +2344,7 @@ class PlatformStore:
         return self._submission_public(saved)
 
     def withdraw(self, context: SessionContext, submission_id: str) -> dict:
+        """Cancel an unapproved submission; never mutate an existing public entry."""
         self.authorize_workspace(context.user_id, context.workspace_id, "wiki.write")
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -2241,11 +2359,11 @@ class PlatformStore:
                 db.rollback(); raise FileNotFoundError(submission_id)
             if row["status"] == "withdrawn":
                 db.commit(); return self._submission_public(row)
-            if row["status"] == "approved" and row["public_entry_id"]:
-                db.execute("UPDATE public_entries SET status='withdrawn_by_author',updated_at=? WHERE id=?", (now_iso(), row["public_entry_id"]))
+            if row["status"] in {"approved", "admin_rejected", "ai_rejected"}:
+                db.rollback(); raise RuntimeError("decided submissions cannot be cancelled")
             db.execute("UPDATE submissions SET status='withdrawn',updated_at=? WHERE id=?", (now_iso(), submission_id))
             saved = db.execute("SELECT * FROM submissions WHERE id=?", (submission_id,)).fetchone()
-            self._audit(db, context.user_id, "submission.withdraw", "submission", submission_id)
+            self._audit(db, context.user_id, "submission.cancel", "submission", submission_id)
             db.commit()
         return self._submission_public(saved)
 
@@ -2267,11 +2385,22 @@ class PlatformStore:
             raise FileNotFoundError(submission_id)
         return self._submission_public(row, admin=True)
 
-    def admin_decide(self, context: SessionContext, submission_id: str, decision: str, reason: str) -> dict:
+    def admin_decide(
+        self, context: SessionContext, submission_id: str, decision: str, reason: str,
+        *, public_category_id: str | None = None, tag_ids: list[str] | None = None,
+        duplicate_action: str = "independent",
+    ) -> dict:
         if context.role != "admin":
             raise PermissionError("admin role required")
         if decision not in {"approve", "request_changes", "reject"} or not reason.strip():
             raise ValueError("a valid decision and reason are required")
+        if duplicate_action not in {"independent", "request_changes", "reject_duplicate"}:
+            raise ValueError("invalid duplicate decision")
+        effective_decision = decision
+        if decision == "approve" and duplicate_action == "request_changes":
+            effective_decision = "request_changes"
+        elif decision == "approve" and duplicate_action == "reject_duplicate":
+            effective_decision = "reject"
         now = now_iso()
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -2281,8 +2410,11 @@ class PlatformStore:
                 db.rollback(); raise FileNotFoundError(submission_id)
             if row["status"] != "pending_admin":
                 db.rollback(); raise RuntimeError("submission has already been decided")
+            owner = db.execute("SELECT status FROM users WHERE id=?", (row["owner_id"],)).fetchone()
+            if owner is None or owner["status"] != "active":
+                db.rollback(); raise FileNotFoundError(submission_id)
             self_review = row["owner_id"] == context.user_id
-            if decision == "approve":
+            if effective_decision == "approve":
                 entry_id = None
                 version = 1
                 snapshot = json.loads(row["snapshot_json"])
@@ -2316,6 +2448,9 @@ class PlatformStore:
                 if selected is not None:
                     entry_id, version = selected["id"], selected["version"] + 1
                     previous_public_status = selected["status"]
+                    if previous_public_status == "withdrawn_by_author":
+                        db.rollback()
+                        raise RuntimeError("author-withdrawn entries require a new explicit publication flow")
                 revision_id = uuid.uuid4().hex
                 if entry_id is None:
                     entry_id = uuid.uuid4().hex
@@ -2328,6 +2463,7 @@ class PlatformStore:
                         entry_id, row["owner_id"], "published", revision_id, now, now,
                         row["workspace_id"], article_id,
                     ))
+                    db.execute("UPDATE public_entries SET first_published_at=? WHERE id=?", (now, entry_id))
                 else:
                     db.execute("""
                         UPDATE public_entries SET status='published',current_revision_id=?,updated_at=?,
@@ -2353,73 +2489,133 @@ class PlatformStore:
                         f"《{snapshot.get('title', '词条')}》已重新上架",
                         "你修改后提交的版本已通过审核并重新发布到 Wiki 广场。",
                     )
+                snapshot_sources = self._safe_public_sources(snapshot)
+                for position, source in enumerate(snapshot_sources):
+                    db.execute("INSERT INTO public_revision_sources VALUES(?,?,?,?,?)", (
+                        revision_id, position, source["label"], source["url"], source["kind"],
+                    ))
+                db.execute("""
+                    INSERT INTO public_revision_reviews VALUES(?,?,?,?,?,?,?,?)
+                """, (revision_id, row["ai_policy_version"], row["ai_model"], row["ai_rules_version"],
+                      row["ai_report_json"], reason.strip(), context.user_id, now))
+                effective_category = public_category_id or row["proposed_public_category_id"]
+                if effective_category and db.execute(
+                    "SELECT 1 FROM public_categories WHERE id=? AND status='active'", (effective_category,),
+                ).fetchone() is None:
+                    db.rollback(); raise FileNotFoundError(effective_category)
+                db.execute("UPDATE public_entries SET public_category_id=? WHERE id=?", (effective_category, entry_id))
+                db.execute("DELETE FROM public_entry_tags WHERE entry_id=?", (entry_id,))
+                effective_tags = tag_ids if tag_ids is not None else json.loads(row["proposed_tags_json"] or "[]")
+                if len(effective_tags) > 12:
+                    db.rollback(); raise ValueError("too many public tags")
+                for tag_id in dict.fromkeys(effective_tags):
+                    if db.execute("SELECT 1 FROM public_tags WHERE id=? AND status='active'", (tag_id,)).fetchone() is None:
+                        db.rollback(); raise FileNotFoundError(tag_id)
+                    db.execute("INSERT INTO public_entry_tags VALUES(?,?)", (entry_id, tag_id))
+                db.execute("""
+                    INSERT INTO public_revision_taxonomy(
+                        revision_id,category_id,attribution,change_summary
+                    ) VALUES(?,?,?,?)
+                """, (
+                    revision_id, effective_category, str(snapshot.get("attribution") or "匿名用户")[:120],
+                    "首次发布" if version == 1 else "公开版本更新",
+                ))
+                for tag_id in dict.fromkeys(effective_tags):
+                    db.execute("INSERT INTO public_revision_tags VALUES(?,?)", (revision_id, tag_id))
+                if version == 1:
+                    permission = row["reuse_permission"] if row["reuse_permission"] in REUSE_PERMISSIONS else "view_only"
+                    db.execute("""
+                        INSERT INTO public_reuse_permissions VALUES(?,?,?,?,?,?)
+                    """, (entry_id, permission, row["owner_id"], now if permission == "allow_private_copy" else None,
+                          now if permission == "view_only" else None, REUSE_POLICY_VERSION))
+                if row["link_public_profile"] and snapshot.get("attribution") != "匿名用户":
+                    profile = db.execute("SELECT id FROM public_profiles WHERE user_id=? AND status='active'", (row["owner_id"],)).fetchone()
+                    if profile:
+                        db.execute("UPDATE public_entries SET public_profile_id=? WHERE id=?", (profile["id"], entry_id))
+                if version > 1:
+                    subscribers = db.execute("SELECT user_id FROM public_subscriptions WHERE public_entry_id=? AND status='active'", (entry_id,)).fetchall()
+                    for subscriber in subscribers:
+                        self._notify(db, subscriber["user_id"], "public_revision_published", "public_entry", entry_id,
+                                     f"《{snapshot.get('title', '公开词条')}》发布了新版本", f"版本 {version} 已公开；私人副本不会自动更新。")
+                self._refresh_square_entry(db, entry_id)
             else:
-                status = "admin_changes_requested" if decision == "request_changes" else "admin_rejected"
+                status = "admin_changes_requested" if effective_decision == "request_changes" else "admin_rejected"
                 entry_id = None
                 db.execute("UPDATE submissions SET status=?,reason=?,reviewer_id=?,updated_at=? WHERE id=?", (
                     status, reason.strip(), context.user_id, now, submission_id,
                 ))
-            self._audit(db, context.user_id, f"submission.{decision}", "submission", submission_id, {
-                "reason": reason.strip(), "self_review": self_review,
+            self._audit(db, context.user_id, f"submission.{effective_decision}", "submission", submission_id, {
+                "reason": reason.strip(), "self_review": self_review, "duplicate_action": duplicate_action,
+                "requested_decision": decision,
             })
             db.commit()
         return {"id": submission_id, "status": status, "public_entry_id": entry_id}
 
     def list_public(self, query: str = "", category: str = "") -> list[dict]:
-        with self.connect() as db:
-            rows = db.execute("""
-                SELECT e.id,e.status,e.author_id,r.id revision_id,r.version,r.snapshot_json,r.content_hash,r.published_at,u.nickname
-                FROM public_entries e JOIN public_revisions r ON r.id=e.current_revision_id JOIN users u ON u.id=e.author_id
-                WHERE e.status='published' ORDER BY r.published_at DESC
-            """).fetchall()
-        result = []
-        needle = query.strip().casefold()
-        for row in rows:
-            snapshot = json.loads(row["snapshot_json"])
-            if category and snapshot.get("category") != category:
-                continue
-            if needle and needle not in (snapshot.get("title", "") + " " + snapshot.get("markdown", "")).casefold():
-                continue
-            result.append({
-                "id": row["id"], "revision_id": row["revision_id"], "version": row["version"],
-                "title": snapshot.get("title"), "category": snapshot.get("category"), "attribution": snapshot.get("attribution") or row["nickname"],
-                "summary": snapshot.get("summary", ""), "published_at": row["published_at"], "content_hash": row["content_hash"],
-            })
-        return result
+        """Compatibility wrapper for old clients; all filtering remains indexed."""
+        return self.search_public(query=query, category=category, limit=50)["items"]
 
     def get_public(self, entry_id: str) -> dict:
-        with self.connect() as db:
-            row = db.execute("""
-                SELECT e.id,r.id revision_id,r.version,r.snapshot_json,r.content_hash,r.published_at,u.nickname
-                FROM public_entries e JOIN public_revisions r ON r.id=e.current_revision_id JOIN users u ON u.id=e.author_id
-                WHERE e.id=? AND e.status='published'
-            """, (entry_id,)).fetchone()
-        if row is None:
-            raise FileNotFoundError(entry_id)
-        snapshot = json.loads(row["snapshot_json"])
-        return {
-            "id": row["id"], "revision_id": row["revision_id"], "version": row["version"],
-            "snapshot": snapshot, "attribution": snapshot.get("attribution") or row["nickname"],
-            "published_at": row["published_at"], "content_hash": row["content_hash"],
-        }
+        return self.get_public_v2(entry_id)
 
     def report_public(self, entry_id: str, reporter_id: str | None, reason_code: str, detail: str) -> dict:
-        if not reason_code.strip() or len(reason_code) > 40 or len(detail) > 1000:
+        if reason_code not in REPORT_REASONS or len(detail) > 2000:
             raise ValueError("invalid report")
-        self.get_public(entry_id)
         report_id, now = uuid.uuid4().hex, now_iso()
-        with self.connect() as db:
-            db.execute("INSERT INTO reports VALUES(?,?,?,?,?,'open',NULL,NULL,?,?)", (
-                report_id, entry_id, reporter_id, reason_code.strip(), detail.strip(), now, now,
-            ))
-        self.audit(reporter_id, "public.report", "public_entry", entry_id, {"report_id": report_id})
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if reporter_id:
+                self._authorize_active_user_in_transaction(db, reporter_id)
+            entry = db.execute("SELECT current_revision_id FROM public_entries WHERE id=? AND status='published'", (entry_id,)).fetchone()
+            if entry is None:
+                db.rollback(); raise FileNotFoundError(entry_id)
+            if reporter_id:
+                existing = db.execute("""
+                    SELECT id,status FROM reports WHERE entry_id=? AND revision_id=? AND reporter_id=?
+                      AND status IN ('open','reviewing') ORDER BY created_at DESC LIMIT 1
+                """, (entry_id, entry["current_revision_id"], reporter_id)).fetchone()
+                if existing:
+                    db.commit(); return {"id": existing["id"], "status": existing["status"], "merged": True}
+            db.execute("""
+                INSERT INTO reports(
+                    id,entry_id,reporter_id,reason_code,detail,status,resolution,resolved_by,
+                    created_at,updated_at,revision_id,resolution_detail
+                ) VALUES(?,?,?,?,?,'open',NULL,NULL,?,?,?,NULL)
+            """, (report_id, entry_id, reporter_id, reason_code, detail.strip(), now, now, entry["current_revision_id"]))
+            self._audit(db, reporter_id, "public.report", "public_entry", entry_id, {"report_id": report_id, "revision_id": entry["current_revision_id"], "reason_code": reason_code})
+            db.commit()
         return {"id": report_id, "status": "open"}
+
+    def my_reports(self, context: SessionContext) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute("""
+                SELECT id,entry_id,revision_id,reason_code,status,resolution,resolution_detail,created_at,updated_at
+                FROM reports WHERE reporter_id=? ORDER BY created_at DESC
+            """, (context.user_id,)).fetchall()
+        return [dict(row) for row in rows]
 
     def admin_reports(self, context: SessionContext) -> list[dict]:
         if context.role != "admin":
             raise PermissionError("admin role required")
         with self.connect() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM reports WHERE status='open' ORDER BY created_at").fetchall()]
+            rows = db.execute("""
+                SELECT reports.*,r.snapshot_json,r.content_hash,r.version,e.status entry_status
+                FROM reports JOIN public_entries e ON e.id=reports.entry_id
+                JOIN public_revisions r ON r.id=reports.revision_id
+                WHERE reports.status IN ('open','reviewing') ORDER BY reports.created_at
+            """).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["snapshot"] = self._public_snapshot(json.loads(item.pop("snapshot_json")))
+            with self.connect() as source_db:
+                stored_sources = [dict(source) for source in source_db.execute("""
+                    SELECT label,url,kind FROM public_revision_sources
+                    WHERE revision_id=? ORDER BY position
+                """, (item["revision_id"],)).fetchall()]
+                item["sources"] = self._safe_public_sources({"public_sources": stored_sources})
+            result.append(item)
+        return result
 
     def admin_public_entries(self, context: SessionContext, status: str) -> list[dict]:
         if context.role != "admin":
@@ -2428,7 +2624,7 @@ class PlatformStore:
             raise ValueError("invalid public entry status")
         with self.connect() as db:
             rows = db.execute("""
-                SELECT e.id,e.status,e.author_id,e.moderation_reason,e.moderated_at,
+                SELECT e.id,e.status,e.author_id,e.moderation_reason,e.moderated_at,e.featured_order,
                        r.id revision_id,r.version,r.snapshot_json,r.content_hash,r.published_at,u.nickname
                 FROM public_entries e JOIN public_revisions r ON r.id=e.current_revision_id
                 JOIN users u ON u.id=e.author_id WHERE e.status=? ORDER BY e.updated_at DESC
@@ -2439,9 +2635,10 @@ class PlatformStore:
             result.append({
                 "id": row["id"], "status": row["status"], "author_id": row["author_id"],
                 "author_nickname": row["nickname"], "revision_id": row["revision_id"],
-                "version": row["version"], "snapshot": snapshot, "content_hash": row["content_hash"],
+                "version": row["version"], "snapshot": self._public_snapshot(snapshot), "content_hash": row["content_hash"],
                 "published_at": row["published_at"], "moderation_reason": row["moderation_reason"],
-                "moderated_at": row["moderated_at"],
+                "moderated_at": row["moderated_at"], "featured": row["featured_order"] is not None,
+                "featured_order": row["featured_order"],
             })
         return result
 
@@ -2471,10 +2668,18 @@ class PlatformStore:
                 f"《{title}》已从 Wiki 广场下架",
                 f"处理理由：{reason.strip()}。请修改私有正本后申请重新上架。",
             )
+            for subscriber in db.execute(
+                "SELECT user_id FROM public_subscriptions WHERE public_entry_id=? AND status='active'",
+                (entry_id,),
+            ).fetchall():
+                if subscriber["user_id"] != row["author_id"]:
+                    self._notify(db, subscriber["user_id"], "public_removed", "public_entry", entry_id,
+                                 f"《{title}》已从 Wiki 广场下架", "公开内容当前不可访问；你的私人副本不会被修改。")
             self._audit(
                 db, context.user_id, "public.remove", "public_entry", entry_id,
                 {"reason": reason.strip()},
             )
+            self._refresh_square_entry(db, entry_id)
             db.commit()
         return {"id": entry_id, "status": "removed_by_admin"}
 
@@ -2508,6 +2713,7 @@ class PlatformStore:
                 db, context.user_id, "public.relist", "public_entry", entry_id,
                 {"reason": reason.strip()},
             )
+            self._refresh_square_entry(db, entry_id)
             db.commit()
         return {"id": entry_id, "status": "published"}
 
@@ -2520,7 +2726,7 @@ class PlatformStore:
             row = db.execute("""
                 SELECT reports.*,e.author_id,e.status AS entry_status,r.snapshot_json FROM reports
                 JOIN public_entries e ON e.id=reports.entry_id
-                JOIN public_revisions r ON r.id=e.current_revision_id
+                JOIN public_revisions r ON r.id=reports.revision_id AND r.entry_id=e.id
                 WHERE reports.id=? AND reports.status='open'
             """, (report_id,)).fetchone()
             if row is None:
@@ -2539,9 +2745,23 @@ class PlatformStore:
                     f"《{title}》因举报处理被下架",
                     f"处理理由：{reason.strip()}。请修改私有正本后申请重新上架。",
                 )
-            db.execute("UPDATE reports SET status='resolved',resolution=?,resolved_by=?,updated_at=? WHERE id=?", (
-                f"{action}: {reason.strip()}", context.user_id, now_iso(), report_id,
+                for subscriber in db.execute(
+                    "SELECT user_id FROM public_subscriptions WHERE public_entry_id=? AND status='active'",
+                    (row["entry_id"],),
+                ).fetchall():
+                    if subscriber["user_id"] != row["author_id"]:
+                        self._notify(
+                            db, subscriber["user_id"], "public_removed", "public_entry", row["entry_id"],
+                            f"《{title}》已从 Wiki 广场下架", "公开内容当前不可访问；你的私人副本不会被修改。",
+                        )
+            db.execute("UPDATE reports SET status='resolved',resolution=?,resolution_detail=?,resolved_by=?,updated_at=? WHERE id=?", (
+                action, reason.strip(), context.user_id, now_iso(), report_id,
             ))
+            if row["reporter_id"]:
+                self._notify(db, row["reporter_id"], "report_resolved", "report", report_id,
+                             "公开内容举报已有处理结果", reason.strip()[:500])
+            if action == "remove":
+                self._refresh_square_entry(db, row["entry_id"])
             self._audit(
                 db, context.user_id, f"report.{action}", "report", report_id,
                 {"reason": reason.strip()},

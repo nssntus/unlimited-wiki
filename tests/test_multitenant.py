@@ -106,6 +106,37 @@ def test_private_routes_require_session_and_static_login_shell_is_public(multi_s
     assert anonymous.request("GET", "/api/public/entries")[1] == []
 
 
+def test_share_preview_rejects_private_or_unselected_public_sources(multi_server):
+    app, base = multi_server
+    author = Client(base)
+    assert author.register("source-author@example.com", "Source Author")[0] == 201
+    path, _revision = seed_article(app, author, "Source selection")
+    context = context_for(app, author)
+    article_path = app.platform.workspace_root(context.workspace_root_name) / "wiki" / path
+    markdown = article_path.read_text(encoding="utf-8")
+    markdown = markdown.replace(
+        "> Status: 词条",
+        "> Status: 词条\n> Sources: https://example.com/public; http://127.0.0.1/private",
+    )
+    article_path.write_text(markdown, encoding="utf-8")
+    article = app.workspace_service(context).read_article(path)
+    base_payload = {
+        "article_path": path, "source_revision": article["revision"], "attribution": "nickname",
+        "source_urls": ["http://127.0.0.1/private"],
+    }
+    status, _ = author.request("POST", "/api/share-previews", base_payload, key="private-source")
+    assert status == 422
+    status, _ = author.request("POST", "/api/share-previews", {
+        **base_payload, "source_urls": ["https://example.com/not-selected"],
+    }, key="unselected-source")
+    assert status == 422
+    status, preview = author.request("POST", "/api/share-previews", {
+        **base_payload, "source_urls": ["https://example.com/public"],
+    }, key="public-source")
+    assert status == 201
+    assert preview["snapshot"]["public_sources"][0]["url"] == "https://example.com/public"
+
+
 def test_two_users_isolate_files_tasks_idempotency_and_model_secrets(multi_server):
     app, base = multi_server
     alice, bob = Client(base), Client(base)
@@ -277,8 +308,8 @@ def test_snapshot_ai_admin_publish_with_self_review_and_idor_guards(multi_server
     }, key="duplicate-published-preview")
     assert duplicate_status == 409
 
-    assert alice.request("POST", f"/api/submissions/{next_submission['id']}/withdraw", {}, key="withdraw")[1]["status"] == "withdrawn"
-    assert Client(base).request("GET", f"/api/public/entries/{public_id}")[0] == 404
+    assert alice.request("POST", f"/api/submissions/{next_submission['id']}/withdraw", {}, key="withdraw")[0] == 409
+    assert Client(base).request("GET", f"/api/public/entries/{public_id}")[0] == 200
 
 
 def test_takedown_notifications_author_reapply_and_admin_relist(multi_server):
@@ -427,7 +458,7 @@ def test_platform_ai_worker_reads_snapshot_only_and_recovers_to_admin_queue(tmp_
         worker.close()
 
 
-def test_platform_ai_uses_submitter_encrypted_model_without_cross_tenant_access(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_platform_ai_uses_platform_model_without_private_workspace_access(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     platform = PlatformStore(tmp_path)
     alice, _ = platform.register("alice@example.com", "Alice", "correct-horse-123")
     bob, _ = platform.register("bob@example.com", "Bob", "correct-horse-123")
@@ -447,16 +478,23 @@ def test_platform_ai_uses_submitter_encrypted_model_without_cross_tenant_access(
         return {"decision": "pass", "summary": "accepted"}
 
     monkeypatch.setattr(platform_review, "default_reviewer", fake_review)
-    worker = PlatformReviewWorker(platform)
+    platform_settings = {
+        "provider": "openai-compatible", "base_url": "https://review.example/v1",
+        "api_key": "platform-review-key", "model": "platform-review-model",
+    }
+    worker = PlatformReviewWorker(platform, settings=platform_settings)
     try:
         deadline = time.time() + 2
         while time.time() < deadline and platform.get_submission(bob_context, submission["id"])["status"] != "pending_admin":
             time.sleep(0.02)
         assert platform.get_submission(bob_context, submission["id"])["status"] == "pending_admin"
-        assert captured["snapshot"] == snapshot
-        assert captured["settings"]["api_key"] == "bob-key"
-        assert captured["settings"]["model"] == "bob-model"
-        assert "alice-key" not in json.dumps(captured, ensure_ascii=False)
+        assert captured["snapshot"]["snapshot"] == snapshot
+        assert captured["snapshot"]["duplicate_candidates"] == []
+        assert captured["settings"]["api_key"] == "platform-review-key"
+        assert captured["settings"]["model"] == "platform-review-model"
+        serialized = json.dumps(captured, ensure_ascii=False)
+        assert "alice-key" not in serialized and "bob-key" not in serialized
+        assert "private/bob.md" not in serialized and bob_context.workspace_id not in serialized
     finally:
         worker.close()
 

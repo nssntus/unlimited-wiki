@@ -38,17 +38,17 @@ def parse_review_result(content: str) -> ReviewResult:
 def review_failure(exc: Exception) -> ReviewResult:
     name = type(exc).__name__
     if name in {"APITimeoutError", "TimeoutError"}:
-        code, summary = "timeout", "The personal review model timed out. Retry is available."
+        code, summary = "timeout", "The platform review model timed out. Retry is available."
     elif name in {"AuthenticationError", "PermissionDeniedError"}:
-        code, summary = "authentication_error", "The personal review model rejected its credentials or permissions."
+        code, summary = "authentication_error", "The platform review model rejected its credentials or permissions."
     elif name in {"APIConnectionError", "ConnectionError"}:
-        code, summary = "connection_error", "The personal review model could not be reached."
+        code, summary = "connection_error", "The platform review model could not be reached."
     elif name == "RateLimitError":
-        code, summary = "rate_limit", "The personal review model is rate limited. Retry later."
+        code, summary = "rate_limit", "The platform review model is rate limited. Retry later."
     elif isinstance(exc, ValueError):
-        code, summary = "invalid_response", "The personal review model returned an invalid review format."
+        code, summary = "invalid_response", "The platform review model returned an invalid review format."
     else:
-        code, summary = "model_error", "The personal review model request failed."
+        code, summary = "model_error", "The platform review model request failed."
     return {
         "decision": "failed",
         "summary": summary,
@@ -64,7 +64,7 @@ def default_reviewer(snapshot: dict, settings: dict) -> ReviewResult:
     if not base_url or not model:
         return {
             "decision": "failed",
-            "summary": "The personal review model is not configured.",
+            "summary": "The platform review model is not configured.",
             "issues": [{"code": "not_configured", "location": "model_settings"}],
             "policy_version": REVIEW_POLICY_VERSION,
         }
@@ -97,9 +97,10 @@ def default_reviewer(snapshot: dict, settings: dict) -> ReviewResult:
 
 
 class PlatformReviewWorker:
-    def __init__(self, store: PlatformStore, reviewer: Callable[[dict], ReviewResult] | None = None):
+    def __init__(self, store: PlatformStore, reviewer: Callable[[dict], ReviewResult] | None = None, settings: dict | None = None):
         self.store = store
         self.reviewer = reviewer
+        self.settings = dict(settings or {})
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="platform-review-worker", daemon=True)
@@ -123,10 +124,15 @@ class PlatformReviewWorker:
             if self.reviewer is not None:
                 result = self.reviewer(row["snapshot"])
             else:
-                # workspace_id comes from the trusted submission row, never from snapshot or request data.
-                result = default_reviewer(row["snapshot"], self.store.load_model(row["workspace_id"]))
+                result = default_reviewer(row["review_input"], self.settings)
+            result = {
+                **result,
+                "provider": str(self.settings.get("provider") or "injected"),
+                "model": str(self.settings.get("model") or "injected-reviewer"),
+                "rules_version": REVIEW_POLICY_VERSION,
+            }
             decision = result.get("decision") if isinstance(result, dict) else "failed"
             if decision not in {"pass", "needs_revision", "reject", "failed"}:
                 decision = "failed"
                 result = {"decision": "failed", "summary": "Platform reviewer returned an invalid decision."}
-            self.store.ai_decide(row["id"], decision, result)
+            self.store.ai_decide(row["id"], decision, result, expected_attempt=row["attempt"])

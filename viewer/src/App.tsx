@@ -21,6 +21,18 @@ const TodoPage = lazy(() => import("@/pages/todo-page").then((module) => ({ defa
 const AuthPage = lazy(() => import("@/pages/auth-page").then((module) => ({ default: module.AuthPage })))
 const SquarePage = lazy(() => import("@/pages/square-page").then((module) => ({ default: module.SquarePage })))
 const PublicEntryPage = lazy(() => import("@/pages/square-page").then((module) => ({ default: module.PublicEntryPage })))
+const SquareSearchPage = lazy(() => import("@/pages/square-page").then((module) => ({ default: module.SquareSearchPage })))
+const PublicCategoriesPage = lazy(() => import("@/pages/square-page").then((module) => ({ default: module.PublicCategoriesPage })))
+const PublicCategoryPage = lazy(() => import("@/pages/square-page").then((module) => ({ default: module.PublicCategoryPage })))
+const PublicTagPage = lazy(() => import("@/pages/square-page").then((module) => ({ default: module.PublicTagPage })))
+const PublicVersionPage = lazy(() => import("@/pages/square-page").then((module) => ({ default: module.PublicVersionPage })))
+const PublicVersionsPage = lazy(() => import("@/pages/square-page").then((module) => ({ default: module.PublicVersionsPage })))
+const PublicDiffPage = lazy(() => import("@/pages/square-page").then((module) => ({ default: module.PublicDiffPage })))
+const PublicCollectionsPage = lazy(() => import("@/pages/square-page").then((module) => ({ default: module.PublicCollectionsPage })))
+const PublicCollectionPage = lazy(() => import("@/pages/square-page").then((module) => ({ default: module.PublicCollectionPage })))
+const PublicProfilePage = lazy(() => import("@/pages/square-page").then((module) => ({ default: module.PublicProfilePage })))
+const SquareLibraryPage = lazy(() => import("@/pages/square-page").then((module) => ({ default: module.SquareLibraryPage })))
+const SquareCorrectionsPage = lazy(() => import("@/pages/square-page").then((module) => ({ default: module.SquareCorrectionsPage })))
 const SharePage = lazy(() => import("@/pages/share-page").then((module) => ({ default: module.SharePage })))
 const SubmissionsPage = lazy(() => import("@/pages/submissions-page").then((module) => ({ default: module.SubmissionsPage })))
 const SubmissionDetailPage = lazy(() => import("@/pages/submissions-page").then((module) => ({ default: module.SubmissionDetailPage })))
@@ -33,6 +45,7 @@ const AdminReviewsPage = lazy(() => import("@/pages/admin-page").then((module) =
 const AdminReviewDetailPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminReviewDetailPage })))
 const AdminReportsPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminReportsPage })))
 const AdminContentPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminContentPage })))
+const AdminSquarePage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminSquarePage })))
 
 export function App() {
   return (
@@ -45,6 +58,19 @@ export function App() {
             <Route path="/recover" element={<AuthPage mode="recover" />} />
             <Route element={<PublicShell />}>
               <Route path="/square" element={<SquarePage />} />
+              <Route path="/square/search" element={<SquareSearchPage />} />
+              <Route path="/square/categories" element={<PublicCategoriesPage />} />
+              <Route path="/square/categories/:slug" element={<PublicCategoryPage />} />
+              <Route path="/square/tags/:slug" element={<PublicTagPage />} />
+              <Route path="/square/entries/:id" element={<PublicEntryPage />} />
+              <Route path="/square/entries/:id/versions" element={<PublicVersionsPage />} />
+              <Route path="/square/entries/:id/versions/:version" element={<PublicVersionPage />} />
+              <Route path="/square/entries/:id/diff" element={<PublicDiffPage />} />
+              <Route path="/square/collections" element={<PublicCollectionsPage />} />
+              <Route path="/square/collections/:slug" element={<PublicCollectionPage />} />
+              <Route path="/square/authors/:id" element={<PublicProfilePage />} />
+              <Route path="/square/library" element={<RequireSession><SquareLibraryPage /></RequireSession>} />
+              <Route path="/square/corrections" element={<RequireSession><SquareCorrectionsPage /></RequireSession>} />
               <Route path="/square/:id" element={<PublicEntryPage />} />
               <Route path="/forbidden" element={<main className="mx-auto max-w-xl px-4 py-20"><h1 className="text-2xl font-semibold">没有访问权限</h1><p className="mt-3 text-muted-foreground">当前账号没有执行此操作所需的角色。</p></main>} />
             </Route>
@@ -74,6 +100,9 @@ export function App() {
               <Route path="/admin/reviews/:id" element={<AdminReviewDetailPage />} />
               <Route path="/admin/reports" element={<AdminReportsPage />} />
               <Route path="/admin/content" element={<AdminContentPage />} />
+              <Route path="/admin/square" element={<AdminSquarePage />} />
+              <Route path="/admin/curation" element={<AdminSquarePage />} />
+              <Route path="/admin/public-taxonomy" element={<AdminSquarePage />} />
             </Route>
           </Routes>
         </Suspense>
