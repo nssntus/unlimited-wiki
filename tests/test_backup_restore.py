@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import backup_restore
 from backup_restore import (
     InstanceLock,
     create_backup,
@@ -166,3 +167,52 @@ def test_restore_uses_same_stable_instance_lock_as_service(tmp_path: Path):
     finally:
         lock.release()
     assert not (target / ".platform").exists()
+
+
+def test_restore_rejects_forged_journal_paths_pending_and_tampered_stage(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    seed_instance(source)
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    target = tmp_path / "target"
+    target.mkdir()
+
+    def interrupt_before_install(*_args, **_kwargs):
+        raise OSError("injected before install")
+
+    monkeypatch.setattr(backup_restore, "_copy_restore_directory", interrupt_before_install)
+    with pytest.raises(OSError, match="injected"):
+        restore_backup(backup, target)
+    journal_path = restore_journal_path(target)
+    original = json.loads(journal_path.read_text(encoding="utf-8"))
+    stage = Path(original["stage"])
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+
+    forged = {**original, "stage": str(outside)}
+    journal_path.write_text(json.dumps(forged), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="stage"):
+        restore_backup(backup, target)
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+    forged = {**original, "pending": ["spaces", "../outside"]}
+    journal_path.write_text(json.dumps(forged), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="journal is invalid"):
+        restore_backup(backup, target)
+    assert stage.is_dir()
+
+    forged = {**original, "pending": ["spaces"]}
+    journal_path.write_text(json.dumps(forged), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="inconsistent for .platform"):
+        restore_backup(backup, target)
+    assert not (target / ".platform").exists()
+
+    journal_path.write_text(json.dumps(original), encoding="utf-8")
+    victim = next(path for path in stage.rglob("*") if path.is_file() and path.name != "manifest.json")
+    victim.write_bytes(victim.read_bytes() + b"tampered")
+    with pytest.raises(RuntimeError, match="checksum mismatch"):
+        restore_backup(backup, target)
+    assert stage.is_dir()

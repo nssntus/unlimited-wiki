@@ -12,6 +12,10 @@
 {$WIKI_DOMAIN} {
 	tls internal
 	encode zstd gzip
+	log {
+		output stdout
+		format json
+	}
 
 	request_body {
 		max_size 64MB

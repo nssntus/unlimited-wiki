@@ -15,6 +15,7 @@ import sys
 import uuid
 import grp
 import pwd
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,6 +26,7 @@ DATA_DIRECTORIES = (".platform", "spaces")
 RUNTIME_DIRECTORY = ".runtime"
 INSTANCE_LOCK_NAME = "instance.lock"
 RESTORE_JOURNAL_NAME = "restore.json"
+RESTORE_JOURNAL_SCHEMA = 1
 
 
 def instance_lock_path(project_root: Path) -> Path:
@@ -191,6 +193,108 @@ def _set_owner(root: Path, owner: str | None) -> None:
         os.chown(path, account.pw_uid, group_id)
 
 
+def _load_restore_journal(path: Path, runtime: Path, backup_root: Path) -> tuple[dict, Path]:
+    try:
+        journal = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("restore journal is invalid") from exc
+    expected_keys = {
+        "schema_version", "backup_manifest_sha256", "stage_manifest_sha256", "stage", "pending",
+    }
+    pending = journal.get("pending")
+    if (
+        set(journal) != expected_keys
+        or journal.get("schema_version") != RESTORE_JOURNAL_SCHEMA
+        or not isinstance(journal.get("backup_manifest_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", journal["backup_manifest_sha256"])
+        or not isinstance(journal.get("stage_manifest_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", journal["stage_manifest_sha256"])
+        or not isinstance(journal.get("stage"), str)
+        or not isinstance(pending, list)
+        or any(not isinstance(item, str) for item in pending)
+        or len(pending) != len(set(pending))
+        or not set(pending).issubset(DATA_DIRECTORIES)
+    ):
+        raise RuntimeError("restore journal is invalid")
+    stage_literal = Path(journal["stage"])
+    if (
+        not stage_literal.is_absolute()
+        or not re.fullmatch(r"restore-[0-9a-f]{32}", stage_literal.name)
+        or stage_literal.is_symlink()
+        or not stage_literal.is_dir()
+    ):
+        raise RuntimeError("restore journal stage is invalid")
+    try:
+        stage = stage_literal.resolve(strict=True)
+        runtime_resolved = runtime.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("restore journal stage is invalid") from exc
+    if stage.parent != runtime_resolved:
+        raise RuntimeError("restore journal stage is outside the instance runtime directory")
+    if journal["backup_manifest_sha256"] != _sha256(backup_root / MANIFEST_NAME):
+        raise RuntimeError("an unfinished restore exists for a different backup")
+    stage_manifest = stage / MANIFEST_NAME
+    if stage_manifest.is_symlink() or journal["stage_manifest_sha256"] != _sha256(stage_manifest):
+        raise RuntimeError("restore journal stage manifest is invalid")
+    verify_backup(stage)
+    return journal, stage
+
+
+def _copy_restore_directory(source: Path, target: Path, runtime: Path) -> None:
+    temporary = runtime / f"install-{target.name}-{uuid.uuid4().hex}"
+    try:
+        shutil.copytree(source, temporary, symlinks=True)
+        _fsync_tree(temporary)
+        os.replace(temporary, target)
+        _fsync_directory(target.parent)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+
+def _directory_matches(source: Path, target: Path) -> bool:
+    if target.is_symlink() or not target.is_dir():
+        return False
+    if any(path.is_symlink() for path in target.rglob("*")):
+        return False
+    source_files = {
+        path.relative_to(source).as_posix(): path
+        for path in source.rglob("*") if path.is_file() and not path.is_symlink()
+    }
+    target_files = {
+        path.relative_to(target).as_posix(): path
+        for path in target.rglob("*") if path.is_file() and not path.is_symlink()
+    }
+    if set(source_files) != set(target_files):
+        return False
+    return all(
+        source_files[name].stat().st_size == target_files[name].stat().st_size
+        and _sha256(source_files[name]) == _sha256(target_files[name])
+        for name in source_files
+    )
+
+
+def _prepare_restore_stage(
+    backup_root: Path, project_root: Path, stage: Path, owner: str | None,
+) -> dict:
+    stage.mkdir(mode=0o700)
+    shutil.copy2(backup_root / MANIFEST_NAME, stage / MANIFEST_NAME)
+    _copy_data(backup_root, stage)
+    # Verify the private copy before applying the documented session revocation.
+    verify_backup(stage)
+    platform_db = stage / ".platform" / "platform.sqlite3"
+    with sqlite3.connect(platform_db) as db:
+        db.execute("DELETE FROM sessions")
+    for path in _sqlite_paths(stage):
+        _check_sqlite(path, checkpoint=True)
+    manifest = _manifest(stage, project_root)
+    _write_json_atomic(stage / MANIFEST_NAME, manifest)
+    verify_backup(stage)
+    _set_owner(stage, owner)
+    _fsync_tree(stage)
+    return manifest
+
+
 def verify_backup(backup_root: Path) -> dict:
     if backup_root.is_symlink():
         raise RuntimeError("backup root must not be a symbolic link")
@@ -275,36 +379,49 @@ def restore_backup(backup_root: Path, project_root: Path, *, owner: str | None =
     project_root = project_root.resolve()
     project_root.mkdir(parents=True, exist_ok=True)
     runtime = project_root / RUNTIME_DIRECTORY
+    if runtime.is_symlink():
+        raise RuntimeError("instance runtime directory must not be a symbolic link")
     runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock = InstanceLock(instance_lock_path(project_root))
     journal_path = restore_journal_path(project_root)
     with lock:
         if journal_path.exists():
-            journal = json.loads(journal_path.read_text(encoding="utf-8"))
-            if journal.get("backup_manifest_sha256") != _sha256(backup_root / MANIFEST_NAME):
-                raise RuntimeError("an unfinished restore exists for a different backup")
-            stage = Path(journal["stage"])
-            manifest = json.loads((stage / MANIFEST_NAME).read_text(encoding="utf-8"))
+            if journal_path.is_symlink():
+                raise RuntimeError("restore journal is invalid")
+            journal, old_stage = _load_restore_journal(journal_path, runtime, backup_root)
+            pending = set(journal["pending"])
+            for name in DATA_DIRECTORIES:
+                if name in pending:
+                    continue
+                source = old_stage / name
+                target = project_root / name
+                if (
+                    not source.is_dir()
+                    or source.is_symlink()
+                    or not _directory_matches(source, target)
+                ):
+                    raise RuntimeError(f"restore state is inconsistent for {name}")
+            stage = runtime / f"restore-{uuid.uuid4().hex}"
+            try:
+                manifest = _prepare_restore_stage(backup_root, project_root, stage, owner)
+                journal["stage"] = str(stage)
+                journal["stage_manifest_sha256"] = _sha256(stage / MANIFEST_NAME)
+                _write_json_atomic(journal_path, journal)
+                shutil.rmtree(old_stage)
+                _fsync_directory(runtime)
+            except BaseException:
+                shutil.rmtree(stage, ignore_errors=True)
+                raise
         else:
             if any((project_root / name).exists() for name in DATA_DIRECTORIES):
                 raise RuntimeError("restore target already contains wiki platform data")
             stage = runtime / f"restore-{uuid.uuid4().hex}"
             try:
-                stage.mkdir(mode=0o700)
-                shutil.copy2(backup_root / MANIFEST_NAME, stage / MANIFEST_NAME)
-                _copy_data(backup_root, stage)
-                # Verify the private copy, closing the source verification/copy race.
-                manifest = verify_backup(stage)
-                platform_db = stage / ".platform" / "platform.sqlite3"
-                with sqlite3.connect(platform_db) as db:
-                    db.execute("DELETE FROM sessions")
-                for path in _sqlite_paths(stage):
-                    _check_sqlite(path, checkpoint=True)
-                _set_owner(stage, owner)
-                _fsync_tree(stage)
+                manifest = _prepare_restore_stage(backup_root, project_root, stage, owner)
                 journal = {
-                    "schema_version": 1,
+                    "schema_version": RESTORE_JOURNAL_SCHEMA,
                     "backup_manifest_sha256": _sha256(backup_root / MANIFEST_NAME),
+                    "stage_manifest_sha256": _sha256(stage / MANIFEST_NAME),
                     "stage": str(stage),
                     "pending": list(DATA_DIRECTORIES),
                 }
@@ -316,10 +433,11 @@ def restore_backup(backup_root: Path, project_root: Path, *, owner: str | None =
         for name in list(journal["pending"]):
             source = stage / name
             target = project_root / name
-            if source.exists() and not target.exists():
-                os.replace(source, target)
-                _fsync_directory(project_root)
-            elif source.exists() or not target.exists():
+            if not source.is_dir() or source.is_symlink():
+                raise RuntimeError(f"restore state is inconsistent for {name}")
+            if not target.exists():
+                _copy_restore_directory(source, target, runtime)
+            elif not _directory_matches(source, target):
                 raise RuntimeError(f"restore state is inconsistent for {name}")
             journal["pending"].remove(name)
             _write_json_atomic(journal_path, journal)

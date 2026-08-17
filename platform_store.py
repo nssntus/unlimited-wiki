@@ -311,10 +311,12 @@ class PlatformStore:
                 CREATE TABLE IF NOT EXISTS login_attempts (
                     scope_hash TEXT PRIMARY KEY, failures INTEGER NOT NULL, blocked_until TEXT, updated_at TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_login_attempts_updated ON login_attempts(updated_at);
                 CREATE TABLE IF NOT EXISTS rate_limits (
                     scope_hash TEXT PRIMARY KEY, window_started INTEGER NOT NULL,
                     request_count INTEGER NOT NULL, updated_at TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_rate_limits_window ON rate_limits(window_started);
                 CREATE TABLE IF NOT EXISTS model_settings (
                     workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
                     provider TEXT NOT NULL, base_url_enc TEXT NOT NULL, api_key_enc TEXT NOT NULL,
@@ -670,6 +672,9 @@ class PlatformStore:
             if first_user_only and existing_users != 0:
                 db.rollback()
                 raise PermissionError("registration is closed")
+            if invite_token and existing_users == 0:
+                db.rollback()
+                raise PermissionError("administrator bootstrap is required before invitation registration")
             invite = None
             if invite_token:
                 invite = db.execute(
@@ -777,8 +782,14 @@ class PlatformStore:
             raise ValueError("rate limit and window must be positive")
         timestamp = int(time.time()) if now is None else int(now)
         scope_hash = hash_token(scope)
+        retention_seconds = 7 * 24 * 60 * 60
+        cutoff_iso = datetime.fromtimestamp(
+            timestamp - retention_seconds, timezone.utc,
+        ).isoformat(timespec="seconds")
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            db.execute("DELETE FROM rate_limits WHERE window_started<?", (timestamp - retention_seconds,))
+            db.execute("DELETE FROM login_attempts WHERE updated_at<?", (cutoff_iso,))
             row = db.execute(
                 "SELECT window_started,request_count FROM rate_limits WHERE scope_hash=?",
                 (scope_hash,),

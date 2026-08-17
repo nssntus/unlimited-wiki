@@ -210,7 +210,7 @@ def test_registration_invite_is_email_bound_hashed_and_single_use(tmp_path: Path
         )
 
 
-def test_capacity_rejection_and_server_close_wait_for_active_request():
+def test_capacity_rejection_and_server_close_wait_for_active_request(capsys):
     started = threading.Event()
     release = threading.Event()
 
@@ -228,6 +228,7 @@ def test_capacity_rejection_and_server_close_wait_for_active_request():
 
     server = BoundedThreadingHTTPServer(
         ("127.0.0.1", 0), BlockingHandler, max_concurrent=1, request_timeout=5,
+        strict_transport_security=True,
     )
     server.daemon_threads = False
     server.block_on_close = True
@@ -251,6 +252,8 @@ def test_capacity_rejection_and_server_close_wait_for_active_request():
     response = second.getresponse()
     assert response.status == 503
     assert response.getheader("Retry-After") == "1"
+    assert len(response.getheader("X-Request-ID")) == 32
+    assert response.getheader("Strict-Transport-Security") == "max-age=31536000"
     response.read()
     second.close()
 
@@ -265,3 +268,48 @@ def test_capacity_rejection_and_server_close_wait_for_active_request():
     closing.join(timeout=2)
     assert first_result == [200]
     assert not closing.is_alive()
+    assert '"event": "capacity_rejected"' in capsys.readouterr().out
+
+
+def test_empty_database_invitation_cannot_create_first_admin_even_concurrently(tmp_path: Path):
+    store = PlatformStore(tmp_path)
+    _invite, token = store.create_registration_invite("member@example.com", hours=24)
+    barrier = threading.Barrier(3)
+    results: list[str] = []
+
+    def register():
+        barrier.wait()
+        try:
+            store.register(
+                "member@example.com", "Member", "correct-horse-123", invite_token=token,
+            )
+            results.append("created")
+        except PermissionError as exc:
+            results.append(str(exc))
+
+    threads = [threading.Thread(target=register) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=3)
+    assert results == ["administrator bootstrap is required before invitation registration"] * 2
+    assert store.user_count() == 0
+    with store.connect() as db:
+        assert db.execute("SELECT status FROM account_registration_invites").fetchone()[0] == "pending"
+
+
+def test_security_rate_limit_rows_are_pruned_after_retention(tmp_path: Path):
+    store = PlatformStore(tmp_path)
+    now = int(time.time())
+    with store.connect() as db:
+        db.execute("INSERT INTO rate_limits VALUES('stale-rate',?,1,'2000-01-01T00:00:00+00:00')", (now - 8 * 86400,))
+        db.execute("INSERT INTO rate_limits VALUES('fresh-rate',?,1,'2999-01-01T00:00:00+00:00')", (now,))
+        db.execute("INSERT INTO login_attempts VALUES('stale-login',1,NULL,'2000-01-01T00:00:00+00:00')")
+        db.execute("INSERT INTO login_attempts VALUES('fresh-login',1,NULL,'2999-01-01T00:00:00+00:00')")
+    assert store.consume_rate_limit("maintenance-trigger", limit=5, window_seconds=60, now=now) == 0
+    with store.connect() as db:
+        assert db.execute("SELECT scope_hash FROM rate_limits WHERE scope_hash='stale-rate'").fetchone() is None
+        assert db.execute("SELECT scope_hash FROM login_attempts WHERE scope_hash='stale-login'").fetchone() is None
+        assert db.execute("SELECT scope_hash FROM rate_limits WHERE scope_hash='fresh-rate'").fetchone() is not None
+        assert db.execute("SELECT scope_hash FROM login_attempts WHERE scope_hash='fresh-login'").fetchone() is not None

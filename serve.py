@@ -1535,9 +1535,13 @@ def make_handler(app: WikiApp):
 
 
 class BoundedThreadingHTTPServer(ThreadingHTTPServer):
-    def __init__(self, server_address, handler, *, max_concurrent: int, request_timeout: int):
+    def __init__(
+        self, server_address, handler, *, max_concurrent: int, request_timeout: int,
+        strict_transport_security: bool = False,
+    ):
         self._capacity = threading.BoundedSemaphore(max_concurrent)
         self._request_timeout = request_timeout
+        self._strict_transport_security = strict_transport_security
         super().__init__(server_address, handler)
 
     def get_request(self):
@@ -1547,15 +1551,25 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
 
     def process_request(self, request, client_address) -> None:
         if not self._capacity.acquire(blocking=False):
+            request_id = uuid.uuid4().hex
             try:
-                request.sendall(
+                headers = (
                     b"HTTP/1.1 503 Service Unavailable\r\n"
                     b"Content-Type: application/json\r\n"
                     b"Content-Length: 33\r\n"
                     b"Retry-After: 1\r\n"
-                    b"Connection: close\r\n\r\n"
-                    b'{"error":"server is at capacity"}'
+                    + f"X-Request-ID: {request_id}\r\n".encode("ascii")
+                    + (b"Strict-Transport-Security: max-age=31536000\r\n" if self._strict_transport_security else b"")
+                    + b"Connection: close\r\n\r\n"
                 )
+                request.sendall(headers + b'{"error":"server is at capacity"}')
+                print(json.dumps({
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "request_id": request_id,
+                    "client_ip": client_address[0],
+                    "event": "capacity_rejected",
+                    "status": 503,
+                }, ensure_ascii=True), flush=True)
             finally:
                 self.shutdown_request(request)
             return
@@ -1575,6 +1589,7 @@ def create_server(app: WikiApp, host: str = HOST, port: int = PORT) -> Threading
         (host, port), make_handler(app),
         max_concurrent=app.deployment.max_concurrent_requests,
         request_timeout=app.deployment.request_timeout_seconds,
+        strict_transport_security=app.deployment.lan_mode,
     )
     server.daemon_threads = False
     server.block_on_close = True

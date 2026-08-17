@@ -9,7 +9,34 @@ import json
 import os
 import statistics
 import time
+import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def request_once(url: str, *, cookie: str = "", timeout: float = 10) -> tuple[int, float]:
+    if cookie and urlsplit(url).scheme != "https":
+        raise ValueError("WIKI_CAPACITY_COOKIE requires an HTTPS target")
+    headers = {"Accept": "application/json"}
+    if cookie:
+        headers["Cookie"] = cookie
+    request = urllib.request.Request(url, headers=headers)
+    opener = urllib.request.build_opener(NoRedirectHandler())
+    started = time.monotonic()
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            response.read()
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+    except Exception as exc:
+        status = getattr(exc, "code", 0)
+    return status, (time.monotonic() - started) * 1000
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -30,20 +57,11 @@ def main() -> int:
     if args.requests < 1 or args.concurrency < 1 or args.concurrency > 500:
         parser.error("requests and concurrency must be positive; concurrency must not exceed 500")
     cookie = os.environ.get("WIKI_CAPACITY_COOKIE", "")
+    if cookie and urlsplit(args.url).scheme != "https":
+        parser.error("WIKI_CAPACITY_COOKIE requires an HTTPS target")
 
     def one(_index: int) -> tuple[int, float]:
-        headers = {"Accept": "application/json"}
-        if cookie:
-            headers["Cookie"] = cookie
-        request = urllib.request.Request(args.url, headers=headers)
-        started = time.monotonic()
-        try:
-            with urllib.request.urlopen(request, timeout=args.timeout) as response:
-                response.read()
-                status = response.status
-        except Exception as exc:
-            status = getattr(exc, "code", 0)
-        return status, (time.monotonic() - started) * 1000
+        return request_once(args.url, cookie=cookie, timeout=args.timeout)
 
     started = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:

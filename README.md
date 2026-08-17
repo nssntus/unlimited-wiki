@@ -83,6 +83,8 @@ python3 account_invites.py create --project-root . --email member@example.com --
 
 通过受控渠道把令牌交给对应用户，用户在注册页输入相同邮箱和令牌。令牌只以 SHA-256 摘要保存，明文只在创建时输出一次。所有公司账号建立完成后可将模式设为 `closed`；当前没有企业 SSO 或邮件开户流程。账号创建后，团队 Owner 再发送 Workspace 邀请。
 
+空数据库不能通过邀请注册创建首位管理员，即使部署机提前生成了邀请令牌也会拒绝；必须先在 `bootstrap` 模式完成管理员初始化。匿名安全限流记录保留 7 天，并在后续限流请求中自动清理。
+
 仓库提供 `deploy/Caddyfile.example` 和 `deploy/systemd/` 模板。将域名替换为公司内网域名，确保所有客户端信任代理签发证书的内部 CA，然后安装并启动：
 
 ```bash
@@ -98,7 +100,9 @@ sudo systemctl enable --now unlimited-wiki.service
 sudo systemctl enable --now unlimited-wiki-backup.timer
 ```
 
-`GET /healthz` 是无认证存活探针；`GET /readyz` 只返回前端、存储、数据库、主密钥和磁盘余量的布尔检查，不会创建 Workspace service 或泄露路径。请求日志以 JSON Lines 输出到 stdout，包含 `request_id`、规范化路径、状态码、耗时、响应大小和经过受信代理解析的客户端 IP，可由 journald 收集：
+systemd 模板为 SIGTERM 排空保留最多 10 分钟，高于 Caddy 的 60 秒请求窗口；正常停止会先停止接收新请求，并等待已进入后端的请求线程退出，再关闭 Workspace worker 和释放实例锁。离线备份只有在 `systemctl stop` 完成后才开始复制数据。
+
+`GET /healthz` 是无认证存活探针；`GET /readyz` 只返回前端、存储、数据库、主密钥和磁盘余量的布尔检查，不会创建 Workspace service 或泄露路径。请求日志以 JSON Lines 输出到 stdout，包含 `request_id`、规范化路径、状态码、耗时、响应大小和经过受信代理解析的客户端 IP，可由 journald 收集。后端容量拒绝会单独记录 `capacity_rejected`，Caddy 模板也启用 JSON access log：
 
 ```bash
 curl http://127.0.0.1:8765/healthz
@@ -112,7 +116,7 @@ sudo journalctl -u unlimited-wiki.service -f
 python3 capacity_check.py https://wiki.intra.example/healthz --requests 1000 --concurrency 50
 ```
 
-健康探针只验证入口。正式容量验收还应为测试账号设置临时 `WIKI_CAPACITY_COOKIE`，分别检查文章列表、搜索和读取端点；测试完成后立即 `unset WIKI_CAPACITY_COOKIE`。出现任何非 `200` 状态时工具返回非零退出码。
+健康探针只验证入口。正式容量验收还应为测试账号设置临时 `WIKI_CAPACITY_COOKIE`，分别检查文章列表、搜索和读取端点；测试完成后立即 `unset WIKI_CAPACITY_COOKIE`。携带 Cookie 时工具只接受初始 HTTPS URL，并且不会跟随任何重定向，避免会话被转发到其他 Origin 或降级地址。出现任何非 `200` 状态时工具返回非零退出码。
 
 ### 备份与恢复
 
@@ -125,7 +129,7 @@ sudo -u unlimited-wiki python3 backup_restore.py verify /var/backups/unlimited-w
 sudo systemctl start unlimited-wiki.service
 ```
 
-备份会先取得实例锁、checkpoint 并检查所有 SQLite 数据库，再生成逐文件 SHA-256 manifest，并以原子目录改名发布。备份目录应位于非 Web 根目录、权限为 `0700` 的加密磁盘；TLS 私钥和 `/etc/unlimited-wiki.env` 需通过公司的秘密备份流程另行保管。定时单元调用 `deploy/offline-backup.sh`，备份保留清理由运维平台完成，不会自动删除唯一副本。
+备份会先取得实例锁、checkpoint 并检查所有 SQLite 数据库，再生成逐文件 SHA-256 manifest，并以原子目录改名发布。备份目录应位于非 Web 根目录、权限为 `0700` 的加密磁盘；TLS 私钥和 `/etc/unlimited-wiki.env` 需通过公司的秘密备份流程另行保管。定时单元调用 `deploy/offline-backup.sh`：它只会重启脚本实际停止的服务，重启失败会让备份 unit 失败。备份保留清理由运维平台完成，不会自动删除唯一副本。
 
 恢复必须在停服状态下进行，并且目标不能已有 `.platform/` 或 `spaces/`。先把旧数据目录移动到隔离位置，再执行：
 
@@ -136,7 +140,7 @@ sudo python3 backup_restore.py restore /var/backups/unlimited-wiki/wiki-20260817
 sudo -u unlimited-wiki WIKI_DISABLE_REMOTE_WORKER=1 python3 serve.py
 ```
 
-备份、恢复和服务进程共用 `.runtime/instance.lock`。恢复会先复制到私有 staging，再校验 manifest、主密钥和 SQLite 完整性，撤销备份中的浏览器会话，并按 `--owner` 修复数据属主。安装期间会保留可恢复 journal；若进程或机器中断，服务会拒绝在半恢复状态启动，使用同一备份重复执行 restore 即可继续。完成只读冒烟检查后停止临时进程，再通过 systemd 正常启动。至少每季度在隔离目录进行一次恢复演练；没有经过恢复验证的备份不能视为可用。
+备份、恢复和服务进程共用 `.runtime/instance.lock`。恢复会先复制到本实例 `.runtime/restore-*` 私有 staging，再校验 manifest、主密钥和 SQLite 完整性，撤销备份中的浏览器会话，并按 `--owner` 修复数据属主。安装期间会保留严格校验、不可跨目录引用的恢复 journal；每次续做都会重新验证完整 staging。若进程或机器中断，服务会拒绝在半恢复状态启动，使用同一备份重复执行 restore 即可继续。完成只读冒烟检查后停止临时进程，再通过 systemd 正常启动。至少每季度在隔离目录进行一次恢复演练；没有经过恢复验证的备份不能视为可用。
 
 ## 前端开发
 
@@ -229,6 +233,7 @@ viewer/                             前端源码与构建配置
 ## 安全边界
 
 - 后端只允许绑定 `127.0.0.1`、`localhost` 或 `::1`。LAN 模式精确校验外部 HTTPS Host、Origin 和受信代理协议，转发头仅在 socket peer 命中明确 CIDR 时使用。
+- 回环 TCP 代理假设同一主机上的本地进程属于同一信任域：任何能连接后端端口的本地进程都可能伪造 `X-Forwarded-For`。不要在存在不可信本地账号或容器的主机上使用该模板；此类环境需要改用带文件权限的 Unix socket 或独立网络命名空间后才能上线。
 - 多用户写请求使用会话、CSRF 和幂等保护；团队管理操作按账号、会话或当前空间隔离幂等作用域，并与平台数据变更在同一事务提交。密码使用 scrypt 派生。
 - 私有 API 每次请求都从服务端会话重新验证当前空间成员关系；客户端提交的 Workspace、Owner 或角色字段不能形成授权。
 - 团队空间只允许 Owner 管理成员。Owner 可邀请 Editor 或 Viewer、调整角色、移除成员并把 Owner 转移给现有活跃成员；最后一个 Owner 不能被直接移除或降级。个人空间不能邀请成员或转移 Owner。
