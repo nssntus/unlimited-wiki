@@ -33,7 +33,7 @@ import categories as cats
 import keywords as kw
 import websearch
 import wiki_ops
-from backup_restore import InstanceLock, instance_lock_path, restore_journal_path
+from backup_restore import InstanceLock, instance_lock_path, restore_work_path
 from document_ingest import MAX_INPUT_BYTES
 from deployment import DeploymentConfig, config_from_environment
 from model_settings import build_config, load_model_settings, public_model_settings, save_model_settings
@@ -1612,7 +1612,7 @@ def main() -> None:
         raise SystemExit(str(exc)) from exc
     app = None
     try:
-        if restore_journal_path(ROOT).exists():
+        if restore_work_path(ROOT).exists():
             raise SystemExit("an unfinished restore exists; rerun backup_restore.py restore before starting")
         app = create_app(
             load_environment=True,

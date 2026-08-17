@@ -143,7 +143,7 @@ sudo python3 backup_restore.py restore /var/backups/unlimited-wiki/wiki-20260817
 sudo -u unlimited-wiki WIKI_DISABLE_REMOTE_WORKER=1 python3 serve.py
 ```
 
-备份、恢复和服务进程共用 `.runtime/instance.lock`。恢复会先复制到本实例 `.runtime/restore-*` 私有 staging，再校验 manifest、主密钥和 SQLite 完整性，撤销备份中的浏览器会话，并按 `--owner` 统一修复最终 `.platform/` 与 `spaces/` 全树属主。staging 在最终发布前始终由恢复进程私有，每个安装副本发布前会再次校验。安装期间会保留严格校验、不可跨目录引用且绑定 owner 的恢复 journal；续做必须使用相同 `--owner`，属主修复失败也会保留 journal，使用同一备份和 owner 重试即可恢复。若进程或机器中断，服务会拒绝在半恢复状态启动。完成只读冒烟检查后停止临时进程，再通过 systemd 正常启动。至少每季度在隔离目录进行一次恢复演练；没有经过恢复验证的备份不能视为可用。
+备份、恢复和服务进程共用 `.runtime/instance.lock`。高权限恢复要求项目根由 root 管理且不能被服务账号、组或其他用户写入；恢复的 journal、staging 和待发布副本只放在恢复进程拥有的项目根 `.restore/`（`0700`）中，不放入服务账号可写的 `.runtime/`。恢复会校验 manifest、主密钥和 SQLite 完整性，撤销备份中的浏览器会话，并在未发布副本上通过 fd 锚定、不跟随符号链接、子项优先而根目录最后的方式应用 `--owner`；再次校验后才原子发布 `.platform/` 与 `spaces/`。最终数据发布完成后才把稳定的 `.runtime/` 和 `instance.lock` 交给服务账号，再原子移走并清理 `.restore/`。续做必须使用同一备份和 `--owner`；复制、校验或属主交接失败都会保留私有 journal，使用相同参数重试。服务会在 `.restore/` 存在时拒绝启动。完成只读冒烟检查后停止临时进程，再通过 systemd 正常启动。至少每季度在隔离目录进行一次恢复演练；没有经过恢复验证的备份不能视为可用。
 
 ## 前端开发
 

@@ -51,7 +51,7 @@ def test_backup_verify_and_restore_round_trip(tmp_path: Path):
 
     manifest = create_backup(source, backup)
     assert manifest["schema_version"] == 1
-    assert all(not item["path"].endswith(("-wal", "-shm")) for item in manifest["files"])
+    assert all(not item["path"].endswith((".sqlite3-wal", ".sqlite3-shm")) for item in manifest["files"])
     assert verify_backup(backup)["files"] == manifest["files"]
     assert (backup / ".platform" / "master.key").stat().st_size == 32
 
@@ -68,6 +68,35 @@ def test_backup_verify_and_restore_round_trip(tmp_path: Path):
         assert db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
         assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert db.execute("PRAGMA foreign_key_check").fetchone() is None
+
+
+def test_backup_preserves_non_sqlite_files_with_wal_and_shm_suffixes(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    _platform, user, _article, _raw = seed_instance(source)
+    workspace = source / "spaces" / user["workspace_root_name"]
+    expected = {
+        workspace / "wiki" / "ordinary-wal": b"wiki wal content",
+        workspace / "raw" / "ordinary-shm": b"raw shm content",
+        workspace / "wiki" / "notes.sqlite3": b"not a sqlite database",
+        workspace / "wiki" / "notes.sqlite3-wal": b"ordinary attachment",
+    }
+    for path, content in expected.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+    backup = tmp_path / "backup-001"
+    manifest = create_backup(source, backup)
+    manifest_paths = {item["path"] for item in manifest["files"]}
+    for path, content in expected.items():
+        relative = path.relative_to(source).as_posix()
+        assert relative in manifest_paths
+        assert (backup / relative).read_bytes() == content
+
+    target = tmp_path / "restored"
+    restore_backup(backup, target)
+    for path, content in expected.items():
+        assert (target / path.relative_to(source)).read_bytes() == content
 
 
 def test_backup_refuses_running_instance_and_detects_tampering(tmp_path: Path):
@@ -222,7 +251,7 @@ def test_restore_rejects_forged_journal_paths_pending_and_tampered_stage(tmp_pat
     assert stage.is_dir()
 
 
-def test_restore_applies_owner_to_final_data_trees_not_private_stage(tmp_path: Path, monkeypatch):
+def test_restore_hands_off_unpublished_trees_and_runtime_bottom_up(tmp_path: Path, monkeypatch):
     source = tmp_path / "source"
     source.mkdir()
     seed_instance(source)
@@ -240,21 +269,49 @@ def test_restore_applies_owner_to_final_data_trees_not_private_stage(tmp_path: P
         backup_restore.grp, "getgrnam", lambda _owner: SimpleNamespace(gr_gid=5678),
     )
     monkeypatch.setattr(
-        backup_restore.os, "chown",
-        lambda path, uid, gid: chowned.append((Path(path), uid, gid)),
+        backup_restore, "_apply_fd_owner",
+        lambda _descriptor, path, uid, gid: chowned.append((Path(path), uid, gid)),
     )
 
     restore_backup(backup, target, owner="wiki-service")
 
-    expected = {
-        path
-        for root in (target / ".platform", target / "spaces")
-        for path in (root, *root.rglob("*"))
-    }
-    assert {path for path, _uid, _gid in chowned} == expected
+    install_paths = [path for path, _uid, _gid in chowned if "install-" in path.as_posix()]
+    install_roots = [path for path in install_paths if path.parent.name == ".restore"]
+    assert len(install_roots) == 2
+    for root in install_roots:
+        assert install_paths.index(root) > max(
+            install_paths.index(path) for path in install_paths if path != root and root in path.parents
+        )
     assert all((uid, gid) == (1234, 5678) for _path, uid, gid in chowned)
-    assert all("restore-" not in path.as_posix() for path, _uid, _gid in chowned)
-    assert all(path.stat().st_mode & stat.S_IWUSR for path in expected)
+    assert all("/restore-" not in path.as_posix() for path, _uid, _gid in chowned)
+    assert target / ".runtime" in {path for path, _uid, _gid in chowned}
+    assert instance_lock_path(target) in {path for path, _uid, _gid in chowned}
+    assert all(path.stat().st_mode & stat.S_IWUSR for root in (target / ".platform", target / "spaces") for path in (root, *root.rglob("*")))
+    assert not (target / ".restore").exists()
+
+
+def test_fd_owner_handoff_rejects_symlink_replacement(tmp_path: Path, monkeypatch):
+    root = tmp_path / "install"
+    root.mkdir()
+    first = root / "a"
+    later = root / "z"
+    outside = tmp_path / "outside"
+    first.write_text("first", encoding="utf-8")
+    later.write_text("later", encoding="utf-8")
+    outside.write_text("outside", encoding="utf-8")
+    owner = backup_restore.pwd.getpwuid(os.getuid()).pw_name
+    real_apply = backup_restore._apply_fd_owner
+
+    def replace_later(descriptor: int, path: Path, uid: int, gid: int):
+        real_apply(descriptor, path, uid, gid)
+        if path == first:
+            later.unlink()
+            later.symlink_to(outside)
+
+    monkeypatch.setattr(backup_restore, "_apply_fd_owner", replace_later)
+    with pytest.raises(RuntimeError, match="symbolic links"):
+        backup_restore._set_owner(root, owner)
+    assert outside.read_text(encoding="utf-8") == "outside"
 
 
 def test_restore_rejects_changing_owner_during_resume(tmp_path: Path, monkeypatch):
@@ -304,7 +361,7 @@ def test_owner_repair_failure_keeps_resumable_journal(tmp_path: Path, monkeypatc
 
     def fail_once(root: Path, selected_owner: str | None):
         nonlocal failed
-        if Path(root) == target / ".platform" and not failed:
+        if Path(root).name.startswith("install-.platform-") and not failed:
             failed = True
             raise PermissionError("injected chown failure")
         return real_set_owner(root, selected_owner)
@@ -314,16 +371,48 @@ def test_owner_repair_failure_keeps_resumable_journal(tmp_path: Path, monkeypatc
         restore_backup(backup, target, owner=owner)
     journal_path = restore_journal_path(target)
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
-    assert journal["pending"] == []
+    assert journal["pending"] == [".platform", "spaces"]
     assert Path(journal["stage"]).is_dir()
-    assert (target / ".platform").is_dir()
-    assert (target / "spaces").is_dir()
+    assert not (target / ".platform").exists()
+    assert not (target / "spaces").exists()
+    assert not list((target / ".restore").glob("install-*"))
 
     monkeypatch.setattr(backup_restore, "_set_owner", real_set_owner)
     restore_backup(backup, target, owner=owner)
     assert not journal_path.exists()
     assert (target / ".platform").stat().st_uid == os.getuid()
     assert (target / "spaces").stat().st_uid == os.getuid()
+
+
+def test_runtime_owner_failure_keeps_journal_and_retry_restores_lock_access(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    seed_instance(source)
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    target = tmp_path / "target"
+    target.mkdir()
+    owner = backup_restore.pwd.getpwuid(os.getuid()).pw_name
+    real_runtime_owner = backup_restore._set_runtime_owner
+
+    monkeypatch.setattr(
+        backup_restore, "_set_runtime_owner",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("runtime handoff failed")),
+    )
+    with pytest.raises(PermissionError, match="runtime handoff"):
+        restore_backup(backup, target, owner=owner)
+    journal = json.loads(restore_journal_path(target).read_text(encoding="utf-8"))
+    assert journal["pending"] == []
+    assert (target / ".platform").is_dir()
+    assert (target / "spaces").is_dir()
+
+    monkeypatch.setattr(backup_restore, "_set_runtime_owner", real_runtime_owner)
+    restore_backup(backup, target, owner=owner)
+    assert not restore_journal_path(target).exists()
+    assert (target / ".runtime").stat().st_uid == os.getuid()
+    assert instance_lock_path(target).stat().st_uid == os.getuid()
+    with InstanceLock(instance_lock_path(target)):
+        pass
 
 
 def test_restore_rejects_stage_mutation_before_target_publish(tmp_path: Path, monkeypatch):
@@ -365,5 +454,32 @@ def test_restore_rejects_stage_mutation_before_target_publish(tmp_path: Path, mo
     assert journal_path.is_file()
     assert mutated_stage == [Path(json.loads(journal_path.read_text(encoding="utf-8"))["stage"])]
     assert mutated_stage[0].is_dir()
+    assert not (target / ".platform").exists()
+    assert not (target / "spaces").exists()
+
+
+def test_restore_rejects_install_replacement_after_owner_handoff(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    seed_instance(source)
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    target = tmp_path / "target"
+    target.mkdir()
+    owner = backup_restore.pwd.getpwuid(os.getuid()).pw_name
+    real_set_owner = backup_restore._set_owner
+
+    def replace_install(root: Path, selected_owner: str | None):
+        real_set_owner(root, selected_owner)
+        if root.name.startswith("install-.platform-"):
+            shutil_target = root.with_name(f"{root.name}-original")
+            os.replace(root, shutil_target)
+            root.mkdir()
+            (root / "attacker.txt").write_text("replacement", encoding="utf-8")
+
+    monkeypatch.setattr(backup_restore, "_set_owner", replace_install)
+    with pytest.raises(RuntimeError, match="installation changed"):
+        restore_backup(backup, target, owner=owner)
+    assert restore_journal_path(target).is_file()
     assert not (target / ".platform").exists()
     assert not (target / "spaces").exists()

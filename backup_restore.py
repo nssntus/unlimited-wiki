@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import uuid
@@ -24,9 +25,10 @@ MANIFEST_NAME = "manifest.json"
 SCHEMA_VERSION = 1
 DATA_DIRECTORIES = (".platform", "spaces")
 RUNTIME_DIRECTORY = ".runtime"
+RESTORE_WORK_DIRECTORY = ".restore"
 INSTANCE_LOCK_NAME = "instance.lock"
 RESTORE_JOURNAL_NAME = "restore.json"
-RESTORE_JOURNAL_SCHEMA = 2
+RESTORE_JOURNAL_SCHEMA = 3
 
 
 def instance_lock_path(project_root: Path) -> Path:
@@ -34,7 +36,11 @@ def instance_lock_path(project_root: Path) -> Path:
 
 
 def restore_journal_path(project_root: Path) -> Path:
-    return project_root.resolve() / RUNTIME_DIRECTORY / RESTORE_JOURNAL_NAME
+    return restore_work_path(project_root) / RESTORE_JOURNAL_NAME
+
+
+def restore_work_path(project_root: Path) -> Path:
+    return project_root.resolve() / RESTORE_WORK_DIRECTORY
 
 
 class InstanceLock:
@@ -77,11 +83,25 @@ def _sha256(path: Path) -> str:
 
 
 def _sqlite_paths(root: Path) -> list[Path]:
-    return sorted(path for path in root.rglob("*.sqlite3") if path.is_file() and not path.is_symlink())
+    return sorted(path for path in root.rglob("*.sqlite3") if _is_sqlite_database(path))
+
+
+def _is_sqlite_database(path: Path) -> bool:
+    if path.suffix != ".sqlite3" or path.is_symlink() or not path.is_file():
+        return False
+    try:
+        with path.open("rb") as handle:
+            return handle.read(16) == b"SQLite format 3\x00"
+    except OSError:
+        return False
 
 
 def _is_sqlite_sidecar(path: Path) -> bool:
-    return path.name.endswith("-wal") or path.name.endswith("-shm")
+    for suffix in ("-wal", "-shm"):
+        if path.name.endswith(suffix):
+            database = path.with_name(path.name[:-len(suffix)])
+            return _is_sqlite_database(database)
+    return False
 
 
 def _check_sqlite(path: Path, *, checkpoint: bool) -> None:
@@ -103,10 +123,10 @@ def _check_sqlite(path: Path, *, checkpoint: bool) -> None:
 
 
 def _copy_data(source: Path, destination: Path) -> None:
-    def ignore(_directory, names):
+    def ignore(directory, names):
         return {
             name for name in names
-            if name.endswith("-wal") or name.endswith("-shm")
+            if _is_sqlite_sidecar(Path(directory) / name)
         }
 
     for name in DATA_DIRECTORIES:
@@ -194,18 +214,86 @@ def _owner_ids(owner: str | None) -> tuple[int, int] | None:
     return account.pw_uid, group_id
 
 
+def _apply_fd_owner(descriptor: int, _path: Path, user_id: int, group_id: int) -> None:
+    os.fchown(descriptor, user_id, group_id)
+
+
 def _set_owner(root: Path, owner: str | None) -> None:
     identity = _owner_ids(owner)
     if identity is None:
         return
     user_id, group_id = identity
-    for path in [root, *root.rglob("*")]:
-        if path.is_symlink():
-            raise RuntimeError("restore data must not contain symbolic links")
-        os.chown(path, user_id, group_id)
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+    def walk(descriptor: int, logical_path: Path) -> None:
+        for name in sorted(os.listdir(descriptor)):
+            before = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            child_path = logical_path / name
+            if stat.S_ISLNK(before.st_mode):
+                raise RuntimeError("restore data must not contain symbolic links")
+            if stat.S_ISDIR(before.st_mode):
+                flags = directory_flags
+            elif stat.S_ISREG(before.st_mode):
+                flags = file_flags
+            else:
+                raise RuntimeError("restore data contains an unsupported file type")
+            child = os.open(name, flags, dir_fd=descriptor)
+            try:
+                opened = os.fstat(child)
+                if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                    raise RuntimeError("restore data changed during ownership handoff")
+                if stat.S_ISDIR(opened.st_mode):
+                    walk(child, child_path)
+                _apply_fd_owner(child, child_path, user_id, group_id)
+            finally:
+                os.close(child)
+
+    root_descriptor = os.open(root, directory_flags)
+    try:
+        walk(root_descriptor, root)
+        _apply_fd_owner(root_descriptor, root, user_id, group_id)
+    finally:
+        os.close(root_descriptor)
 
 
-def _load_restore_journal(path: Path, runtime: Path, backup_root: Path) -> tuple[dict, Path]:
+def _set_runtime_owner(runtime: Path, lock_path: Path, owner: str | None) -> None:
+    identity = _owner_ids(owner)
+    if identity is None:
+        return
+    user_id, group_id = identity
+    file_descriptor = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        _apply_fd_owner(file_descriptor, lock_path, user_id, group_id)
+    finally:
+        os.close(file_descriptor)
+    runtime_descriptor = os.open(
+        runtime, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    try:
+        _apply_fd_owner(runtime_descriptor, runtime, user_id, group_id)
+    finally:
+        os.close(runtime_descriptor)
+
+
+def _ensure_private_restore_root(project_root: Path, owner: str | None) -> Path:
+    work_root = restore_work_path(project_root)
+    identity = _owner_ids(owner)
+    if os.geteuid() == 0 and identity is not None and identity[0] != 0:
+        project_mode = project_root.stat().st_mode
+        if project_root.stat().st_uid == identity[0] or project_mode & 0o022:
+            raise RuntimeError("restore project root must not be writable by the service account")
+    if work_root.is_symlink():
+        raise RuntimeError("restore work directory must not be a symbolic link")
+    work_root.mkdir(mode=0o700, exist_ok=True)
+    info = work_root.stat()
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise RuntimeError("restore work directory must be private to the restore process")
+    return work_root
+
+
+def _load_restore_journal(path: Path, work_root: Path, backup_root: Path) -> tuple[dict, Path]:
     try:
         journal = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -240,11 +328,11 @@ def _load_restore_journal(path: Path, runtime: Path, backup_root: Path) -> tuple
         raise RuntimeError("restore journal stage is invalid")
     try:
         stage = stage_literal.resolve(strict=True)
-        runtime_resolved = runtime.resolve(strict=True)
+        work_root_resolved = work_root.resolve(strict=True)
     except OSError as exc:
         raise RuntimeError("restore journal stage is invalid") from exc
-    if stage.parent != runtime_resolved:
-        raise RuntimeError("restore journal stage is outside the instance runtime directory")
+    if stage.parent != work_root_resolved:
+        raise RuntimeError("restore journal stage is outside the private restore directory")
     if journal["backup_manifest_sha256"] != _sha256(backup_root / MANIFEST_NAME):
         raise RuntimeError("an unfinished restore exists for a different backup")
     _verify_restore_stage(stage, journal["stage_manifest_sha256"])
@@ -264,15 +352,19 @@ def _verify_restore_stage(stage: Path, expected_manifest_sha256: str) -> None:
 
 
 def _copy_restore_directory(
-    source: Path, target: Path, runtime: Path, *,
-    stage: Path, stage_manifest_sha256: str,
+    source: Path, target: Path, work_root: Path, *,
+    stage: Path, stage_manifest_sha256: str, owner: str | None,
 ) -> None:
-    temporary = runtime / f"install-{target.name}-{uuid.uuid4().hex}"
+    temporary = work_root / f"install-{target.name}-{uuid.uuid4().hex}"
     try:
         shutil.copytree(source, temporary, symlinks=True)
         if not _directory_matches(source, temporary):
             raise RuntimeError("restore staging changed during installation")
         _fsync_tree(temporary)
+        _verify_restore_stage(stage, stage_manifest_sha256)
+        _set_owner(temporary, owner)
+        if not _directory_matches(source, temporary):
+            raise RuntimeError("restore installation changed during ownership handoff")
         _verify_restore_stage(stage, stage_manifest_sha256)
         os.replace(temporary, target)
         _fsync_directory(target.parent)
@@ -414,10 +506,15 @@ def restore_backup(backup_root: Path, project_root: Path, *, owner: str | None =
     lock = InstanceLock(instance_lock_path(project_root))
     journal_path = restore_journal_path(project_root)
     with lock:
+        if not journal_path.exists() and any((project_root / name).exists() for name in DATA_DIRECTORIES):
+            raise RuntimeError("restore target already contains wiki platform data")
+        work_root = _ensure_private_restore_root(project_root, owner)
+        if not journal_path.exists() and any(work_root.iterdir()):
+            raise RuntimeError("restore work directory contains no valid journal")
         if journal_path.exists():
             if journal_path.is_symlink():
                 raise RuntimeError("restore journal is invalid")
-            journal, old_stage = _load_restore_journal(journal_path, runtime, backup_root)
+            journal, old_stage = _load_restore_journal(journal_path, work_root, backup_root)
             if journal["owner"] != owner:
                 raise RuntimeError("restore owner does not match the unfinished restore")
             pending = set(journal["pending"])
@@ -432,21 +529,19 @@ def restore_backup(backup_root: Path, project_root: Path, *, owner: str | None =
                     or not _directory_matches(source, target)
                 ):
                     raise RuntimeError(f"restore state is inconsistent for {name}")
-            stage = runtime / f"restore-{uuid.uuid4().hex}"
+            stage = work_root / f"restore-{uuid.uuid4().hex}"
             try:
                 manifest = _prepare_restore_stage(backup_root, project_root, stage)
                 journal["stage"] = str(stage)
                 journal["stage_manifest_sha256"] = _sha256(stage / MANIFEST_NAME)
                 _write_json_atomic(journal_path, journal)
                 shutil.rmtree(old_stage)
-                _fsync_directory(runtime)
+                _fsync_directory(work_root)
             except BaseException:
                 shutil.rmtree(stage, ignore_errors=True)
                 raise
         else:
-            if any((project_root / name).exists() for name in DATA_DIRECTORIES):
-                raise RuntimeError("restore target already contains wiki platform data")
-            stage = runtime / f"restore-{uuid.uuid4().hex}"
+            stage = work_root / f"restore-{uuid.uuid4().hex}"
             try:
                 manifest = _prepare_restore_stage(backup_root, project_root, stage)
                 journal = {
@@ -460,6 +555,8 @@ def restore_backup(backup_root: Path, project_root: Path, *, owner: str | None =
                 _write_json_atomic(journal_path, journal)
             except BaseException:
                 shutil.rmtree(stage, ignore_errors=True)
+                if not any(work_root.iterdir()):
+                    work_root.rmdir()
                 raise
 
         for name in list(journal["pending"]):
@@ -469,21 +566,22 @@ def restore_backup(backup_root: Path, project_root: Path, *, owner: str | None =
                 raise RuntimeError(f"restore state is inconsistent for {name}")
             if not target.exists():
                 _copy_restore_directory(
-                    source, target, runtime,
+                    source, target, work_root,
                     stage=stage,
                     stage_manifest_sha256=journal["stage_manifest_sha256"],
+                    owner=owner,
                 )
             elif not _directory_matches(source, target):
                 raise RuntimeError(f"restore state is inconsistent for {name}")
             journal["pending"].remove(name)
             _write_json_atomic(journal_path, journal)
 
-        for name in DATA_DIRECTORIES:
-            _set_owner(project_root / name, owner)
-
-        journal_path.unlink()
-        _fsync_directory(runtime)
-        shutil.rmtree(stage, ignore_errors=True)
+        _set_runtime_owner(runtime, instance_lock_path(project_root), owner)
+        completed = project_root / f".restore-complete-{uuid.uuid4().hex}"
+        os.replace(work_root, completed)
+        _fsync_directory(project_root)
+        shutil.rmtree(completed, ignore_errors=True)
+        _fsync_directory(project_root)
         return manifest
 
 
