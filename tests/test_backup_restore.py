@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import stat
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -49,6 +51,7 @@ def test_backup_verify_and_restore_round_trip(tmp_path: Path):
 
     manifest = create_backup(source, backup)
     assert manifest["schema_version"] == 1
+    assert all(not item["path"].endswith(("-wal", "-shm")) for item in manifest["files"])
     assert verify_backup(backup)["files"] == manifest["files"]
     assert (backup / ".platform" / "master.key").stat().st_size == 32
 
@@ -211,8 +214,156 @@ def test_restore_rejects_forged_journal_paths_pending_and_tampered_stage(tmp_pat
     assert not (target / ".platform").exists()
 
     journal_path.write_text(json.dumps(original), encoding="utf-8")
-    victim = next(path for path in stage.rglob("*") if path.is_file() and path.name != "manifest.json")
+    stage_manifest = json.loads((stage / "manifest.json").read_text(encoding="utf-8"))
+    victim = stage / stage_manifest["files"][0]["path"]
     victim.write_bytes(victim.read_bytes() + b"tampered")
     with pytest.raises(RuntimeError, match="checksum mismatch"):
         restore_backup(backup, target)
     assert stage.is_dir()
+
+
+def test_restore_applies_owner_to_final_data_trees_not_private_stage(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    seed_instance(source)
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    target = tmp_path / "target"
+    target.mkdir()
+    chowned: list[tuple[Path, int, int]] = []
+
+    monkeypatch.setattr(
+        backup_restore.pwd, "getpwnam",
+        lambda _owner: SimpleNamespace(pw_uid=1234, pw_gid=4321),
+    )
+    monkeypatch.setattr(
+        backup_restore.grp, "getgrnam", lambda _owner: SimpleNamespace(gr_gid=5678),
+    )
+    monkeypatch.setattr(
+        backup_restore.os, "chown",
+        lambda path, uid, gid: chowned.append((Path(path), uid, gid)),
+    )
+
+    restore_backup(backup, target, owner="wiki-service")
+
+    expected = {
+        path
+        for root in (target / ".platform", target / "spaces")
+        for path in (root, *root.rglob("*"))
+    }
+    assert {path for path, _uid, _gid in chowned} == expected
+    assert all((uid, gid) == (1234, 5678) for _path, uid, gid in chowned)
+    assert all("restore-" not in path.as_posix() for path, _uid, _gid in chowned)
+    assert all(path.stat().st_mode & stat.S_IWUSR for path in expected)
+
+
+def test_restore_rejects_changing_owner_during_resume(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    seed_instance(source)
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    target = tmp_path / "target"
+    target.mkdir()
+    monkeypatch.setattr(
+        backup_restore.pwd, "getpwnam",
+        lambda _owner: SimpleNamespace(pw_uid=1234, pw_gid=4321),
+    )
+    monkeypatch.setattr(
+        backup_restore.grp, "getgrnam", lambda _owner: SimpleNamespace(gr_gid=5678),
+    )
+
+    monkeypatch.setattr(
+        backup_restore, "_copy_restore_directory",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("injected install interruption")),
+    )
+    with pytest.raises(OSError, match="injected"):
+        restore_backup(backup, target, owner="owner-a")
+    journal_path = restore_journal_path(target)
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    stage = Path(journal["stage"])
+    assert journal["owner"] == "owner-a"
+
+    with pytest.raises(RuntimeError, match="owner does not match"):
+        restore_backup(backup, target, owner="owner-b")
+    assert journal_path.is_file()
+    assert stage.is_dir()
+
+
+def test_owner_repair_failure_keeps_resumable_journal(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    seed_instance(source)
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    target = tmp_path / "target"
+    target.mkdir()
+    owner = backup_restore.pwd.getpwuid(os.getuid()).pw_name
+    real_set_owner = backup_restore._set_owner
+    failed = False
+
+    def fail_once(root: Path, selected_owner: str | None):
+        nonlocal failed
+        if Path(root) == target / ".platform" and not failed:
+            failed = True
+            raise PermissionError("injected chown failure")
+        return real_set_owner(root, selected_owner)
+
+    monkeypatch.setattr(backup_restore, "_set_owner", fail_once)
+    with pytest.raises(PermissionError, match="injected chown"):
+        restore_backup(backup, target, owner=owner)
+    journal_path = restore_journal_path(target)
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["pending"] == []
+    assert Path(journal["stage"]).is_dir()
+    assert (target / ".platform").is_dir()
+    assert (target / "spaces").is_dir()
+
+    monkeypatch.setattr(backup_restore, "_set_owner", real_set_owner)
+    restore_backup(backup, target, owner=owner)
+    assert not journal_path.exists()
+    assert (target / ".platform").stat().st_uid == os.getuid()
+    assert (target / "spaces").stat().st_uid == os.getuid()
+
+
+def test_restore_rejects_stage_mutation_before_target_publish(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    seed_instance(source)
+    backup = tmp_path / "backup-001"
+    create_backup(source, backup)
+    target = tmp_path / "target"
+    target.mkdir()
+    real_copytree = backup_restore.shutil.copytree
+    mutated_stage: list[Path] = []
+
+    def mutate_after_install_copy(source_path, destination_path, *args, **kwargs):
+        result = real_copytree(source_path, destination_path, *args, **kwargs)
+        source_path = Path(source_path)
+        destination_path = Path(destination_path)
+        if (
+            source_path.name == ".platform"
+            and source_path.parent.name.startswith("restore-")
+            and destination_path.name.startswith("install-.platform-")
+        ):
+            manifest = json.loads(
+                (source_path.parent / "manifest.json").read_text(encoding="utf-8")
+            )
+            relative = next(
+                item["path"] for item in manifest["files"]
+                if item["path"].startswith(".platform/")
+            )
+            victim = source_path.parent / relative
+            victim.write_bytes(victim.read_bytes() + b"tampered")
+            mutated_stage.append(source_path.parent)
+        return result
+
+    monkeypatch.setattr(backup_restore.shutil, "copytree", mutate_after_install_copy)
+    with pytest.raises(RuntimeError, match="staging changed"):
+        restore_backup(backup, target)
+    journal_path = restore_journal_path(target)
+    assert journal_path.is_file()
+    assert mutated_stage == [Path(json.loads(journal_path.read_text(encoding="utf-8"))["stage"])]
+    assert mutated_stage[0].is_dir()
+    assert not (target / ".platform").exists()
+    assert not (target / "spaces").exists()

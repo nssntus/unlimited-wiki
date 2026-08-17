@@ -95,9 +95,12 @@ sudo install -d -m 700 -o unlimited-wiki -g unlimited-wiki \
 sudo cp deploy/systemd/unlimited-wiki.service /etc/systemd/system/
 sudo cp deploy/systemd/unlimited-wiki-backup.service /etc/systemd/system/
 sudo cp deploy/systemd/unlimited-wiki-backup.timer /etc/systemd/system/
+sudo install -m 644 deploy/Caddyfile.example /etc/caddy/Caddyfile
+sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 sudo systemctl daemon-reload
 sudo systemctl enable --now unlimited-wiki.service
 sudo systemctl enable --now unlimited-wiki-backup.timer
+sudo systemctl reload caddy
 ```
 
 systemd 模板为 SIGTERM 排空保留最多 10 分钟，高于 Caddy 的 60 秒请求窗口；正常停止会先停止接收新请求，并等待已进入后端的请求线程退出，再关闭 Workspace worker 和释放实例锁。离线备份只有在 `systemctl stop` 完成后才开始复制数据。
@@ -140,7 +143,7 @@ sudo python3 backup_restore.py restore /var/backups/unlimited-wiki/wiki-20260817
 sudo -u unlimited-wiki WIKI_DISABLE_REMOTE_WORKER=1 python3 serve.py
 ```
 
-备份、恢复和服务进程共用 `.runtime/instance.lock`。恢复会先复制到本实例 `.runtime/restore-*` 私有 staging，再校验 manifest、主密钥和 SQLite 完整性，撤销备份中的浏览器会话，并按 `--owner` 修复数据属主。安装期间会保留严格校验、不可跨目录引用的恢复 journal；每次续做都会重新验证完整 staging。若进程或机器中断，服务会拒绝在半恢复状态启动，使用同一备份重复执行 restore 即可继续。完成只读冒烟检查后停止临时进程，再通过 systemd 正常启动。至少每季度在隔离目录进行一次恢复演练；没有经过恢复验证的备份不能视为可用。
+备份、恢复和服务进程共用 `.runtime/instance.lock`。恢复会先复制到本实例 `.runtime/restore-*` 私有 staging，再校验 manifest、主密钥和 SQLite 完整性，撤销备份中的浏览器会话，并按 `--owner` 统一修复最终 `.platform/` 与 `spaces/` 全树属主。staging 在最终发布前始终由恢复进程私有，每个安装副本发布前会再次校验。安装期间会保留严格校验、不可跨目录引用且绑定 owner 的恢复 journal；续做必须使用相同 `--owner`，属主修复失败也会保留 journal，使用同一备份和 owner 重试即可恢复。若进程或机器中断，服务会拒绝在半恢复状态启动。完成只读冒烟检查后停止临时进程，再通过 systemd 正常启动。至少每季度在隔离目录进行一次恢复演练；没有经过恢复验证的备份不能视为可用。
 
 ## 前端开发
 
