@@ -34,21 +34,15 @@ const statusKind = (status: Task["status"]) =>
         : "warn"
 
 function taskLabel(task: Task) {
-  if (task.kind === "raw-classification-plan") return "Raw 预计分类"
-  if (task.kind === "article-classification") return "正文归类建议"
   if (task.kind === "governance") return "AI 治理"
   return task.kind
 }
 
-function taskHref(task: Task, canWrite: boolean) {
-  if (task.kind === "raw-classification-plan" && typeof task.payload.raw_path === "string") {
-    return canWrite ? `/ingest/${task.payload.raw_path}` : null
-  }
-  if (task.kind === "article-classification" && typeof task.payload.article_id === "string") {
-    return canWrite ? `/classification?article=${task.payload.article_id}` : null
-  }
+function taskHref(task: Task) {
   return typeof task.payload.path === "string" ? `/${task.payload.path}` : null
 }
+
+const actionableTaskKinds = new Set(["generate", "supplement", "governance"])
 
 export function TasksPage() {
   const { hasPermission } = useSession()
@@ -120,7 +114,7 @@ export function TasksPage() {
                     </p>
                   </div>
                   <div className="flex gap-2">
-                    {canWrite && ((["failed", "cancelled"].includes(task.status) ||
+                    {canWrite && actionableTaskKinds.has(task.kind) && task.error_type !== "feature_removed" && ((["failed", "cancelled"].includes(task.status) ||
                       task.result?.conflict === true) && (
                       <Button
                         size="sm"
@@ -128,10 +122,10 @@ export function TasksPage() {
                         onClick={() => action.mutate({ task, action: "retry" })}
                       >
                         <RotateCcwIcon data-icon="inline-start" />
-                          {task.kind.includes("classification") ? "重试归类建议" : "基于当前正文重试"}
+                        基于当前正文重试
                       </Button>
                     ))}
-                    {canWrite && ["queued", "running"].includes(task.status) && (
+                    {canWrite && actionableTaskKinds.has(task.kind) && ["queued", "running"].includes(task.status) && (
                       <Button
                         size="sm"
                         variant="outline"
@@ -143,12 +137,12 @@ export function TasksPage() {
                         取消
                       </Button>
                     )}
-                    {taskHref(task, canWrite) && (
+                    {taskHref(task) && (
                       <Button
                         size="sm"
-                        render={<Link to={taskHref(task, canWrite)!} />}
+                        render={<Link to={taskHref(task)!} />}
                       >
-                        {task.kind === "raw-classification-plan" ? "打开原料" : task.kind === "article-classification" ? "打开归类" : "打开词条"}
+                        打开词条
                       </Button>
                     )}
                   </div>

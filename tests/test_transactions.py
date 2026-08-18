@@ -37,6 +37,27 @@ def test_create_only_commit_does_not_overwrite_existing_file(kb_root: Path):
     assert not (store.history_root / "create-only").exists()
 
 
+def test_commit_distinguishes_target_and_operation_slot_conflicts(kb_root: Path):
+    store = FileStore(kb_root)
+    existing = kb_root / "wiki" / "concepts" / "base.md"
+    with pytest.raises(storage.TransactionTargetExistsError):
+        store.commit(
+            {"wiki/concepts/base.md": "replacement"},
+            kind="test",
+            operation_id="target-conflict",
+            must_not_exist_paths={"wiki/concepts/base.md"},
+        )
+    assert existing.exists()
+
+    (store.history_root / "operation-conflict" / "before").mkdir(parents=True)
+    with pytest.raises(storage.OperationExistsError):
+        store.commit(
+            {"wiki/concepts/new.md": "new"},
+            kind="test",
+            operation_id="operation-conflict",
+        )
+
+
 def test_mid_commit_failure_restores_before_images(kb_root: Path, monkeypatch: pytest.MonkeyPatch):
     store = FileStore(kb_root)
     before = (kb_root / "wiki" / "concepts" / "base.md").read_bytes()

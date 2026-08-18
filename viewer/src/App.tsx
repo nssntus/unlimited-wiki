@@ -37,15 +37,13 @@ const SharePage = lazy(() => import("@/pages/share-page").then((module) => ({ de
 const SubmissionsPage = lazy(() => import("@/pages/submissions-page").then((module) => ({ default: module.SubmissionsPage })))
 const SubmissionDetailPage = lazy(() => import("@/pages/submissions-page").then((module) => ({ default: module.SubmissionDetailPage })))
 const NotificationsPage = lazy(() => import("@/pages/notifications-page").then((module) => ({ default: module.NotificationsPage })))
-const ClassificationPage = lazy(() => import("@/pages/classification-page").then((module) => ({ default: module.ClassificationPage })))
-const CategoriesPage = lazy(() => import("@/pages/categories-page").then((module) => ({ default: module.CategoriesPage })))
 const ReconciliationPage = lazy(() => import("@/pages/reconciliation-page").then((module) => ({ default: module.ReconciliationPage })))
 const WorkspacePage = lazy(() => import("@/pages/workspace-page").then((module) => ({ default: module.WorkspacePage })))
 const AdminReviewsPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminReviewsPage })))
 const AdminReviewDetailPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminReviewDetailPage })))
 const AdminReportsPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminReportsPage })))
 const AdminContentPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminContentPage })))
-const AdminSquarePage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminSquarePage })))
+const AdminCurationPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminCurationPage })))
 const AdminPublicIndexPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminPublicIndexPage })))
 
 export function App() {
@@ -90,8 +88,6 @@ export function App() {
             <Route path="/submissions" element={<RequireSession permission="wiki.write"><SubmissionsPage /></RequireSession>} />
             <Route path="/submissions/:id" element={<RequireSession permission="wiki.write"><SubmissionDetailPage /></RequireSession>} />
             <Route path="/notifications" element={<NotificationsPage />} />
-            <Route path="/classification" element={<RequireSession permission="wiki.write"><ClassificationPage /></RequireSession>} />
-            <Route path="/categories" element={<RequireSession permission="wiki.write"><CategoriesPage /></RequireSession>} />
             <Route path="/reconciliation" element={<RequireSession permission="wiki.write"><ReconciliationPage /></RequireSession>} />
             <Route path="/workspace" element={<WorkspacePage />} />
             <Route path="/*" element={<ArticlePage />} />
@@ -101,10 +97,8 @@ export function App() {
               <Route path="/admin/reviews/:id" element={<AdminReviewDetailPage />} />
               <Route path="/admin/reports" element={<AdminReportsPage />} />
               <Route path="/admin/content" element={<AdminContentPage />} />
-              <Route path="/admin/square" element={<AdminSquarePage />} />
               <Route path="/admin/public-index" element={<AdminPublicIndexPage />} />
-              <Route path="/admin/curation" element={<AdminSquarePage />} />
-              <Route path="/admin/public-taxonomy" element={<AdminSquarePage />} />
+              <Route path="/admin/curation" element={<AdminCurationPage />} />
             </Route>
           </Routes>
         </Suspense>

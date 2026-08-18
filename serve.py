@@ -1061,8 +1061,8 @@ def make_handler(app: WikiApp):
                     raise ApiError(400, "invalid category status")
                 rows = service.categories()
                 return self._json(200, rows if status == "all" else [item for item in rows if item["status"] == status])
-            if path == "/api/classifications/workbench":
-                return self._json(200, service.classification_workbench())
+            if path == "/api/taxonomy":
+                return self._json(200, service.taxonomy())
             if path == "/api/reconciliation":
                 return self._json(200, {"items": service.state.list_reconciliation()})
             if path == "/api/keywords":
@@ -1277,32 +1277,25 @@ def make_handler(app: WikiApp):
                 ), scope=f"account:{self.account_context.user_id}")
                 return self._json(200, response)
 
-            if path == "/api/admin/public-categories":
+            match = re.fullmatch(r"/api/admin/public-categories/([a-f0-9]{32})/update", path)
+            if match:
                 self._require_role("admin")
-                _fields(data, {"id", "slug", "name", "description", "status", "sort_order"}, {"slug", "name", "status"})
+                _fields(data, {"slug", "name", "description", "status", "sort_order"}, {"slug", "name", "status"})
                 sort_order = data.get("sort_order", 0)
                 if not isinstance(sort_order, int): raise ApiError(422, "sort_order must be integer")
                 response, _ = self._platform_idempotency(data, lambda: app.platform.admin_upsert_category(
-                    self.context, _string(data, "id", maximum=32) or None,
-                    _string(data, "slug", maximum=64, required=True), _string(data, "name", maximum=80, required=True),
-                    _string(data, "description", maximum=1000), _string(data, "status", maximum=20, required=True), sort_order,
+                    self.context, match.group(1), _string(data, "slug", maximum=64, required=True),
+                    _string(data, "name", maximum=80, required=True), _string(data, "description", maximum=1000),
+                    _string(data, "status", maximum=20, required=True), sort_order,
                 ))
                 return self._json(200, response)
-            if path == "/api/admin/public-tags":
+            match = re.fullmatch(r"/api/admin/public-tags/([a-f0-9]{32})/update", path)
+            if match:
                 self._require_role("admin")
-                _fields(data, {"id", "slug", "name", "status"}, {"slug", "name", "status"})
+                _fields(data, {"slug", "name", "status"}, {"slug", "name", "status"})
                 response, _ = self._platform_idempotency(data, lambda: app.platform.admin_upsert_tag(
-                    self.context, _string(data, "id", maximum=32) or None,
-                    _string(data, "slug", maximum=64, required=True), _string(data, "name", maximum=50, required=True),
-                    _string(data, "status", maximum=20, required=True),
-                ))
-                return self._json(200, response)
-            if path == "/api/admin/public-category-mappings":
-                self._require_role("admin")
-                _fields(data, {"private_label", "category_id"}, {"private_label", "category_id"})
-                response, _ = self._platform_idempotency(data, lambda: app.platform.admin_map_category(
-                    self.context, _string(data, "private_label", maximum=120, required=True),
-                    _string(data, "category_id", maximum=32, required=True),
+                    self.context, match.group(1), _string(data, "slug", maximum=64, required=True),
+                    _string(data, "name", maximum=50, required=True), _string(data, "status", maximum=20, required=True),
                 ))
                 return self._json(200, response)
             match = re.fullmatch(r"/api/admin/public-categories/([a-f0-9]{32})/merge", path)
@@ -1312,16 +1305,6 @@ def make_handler(app: WikiApp):
                 response, _ = self._platform_idempotency(data, lambda: app.platform.admin_merge_category(
                     self.context, match.group(1), _string(data, "target_id", maximum=32, required=True),
                     _string(data, "reason", maximum=1000, required=True),
-                ))
-                return self._json(200, response)
-            match = re.fullmatch(r"/api/admin/public-entries/([a-f0-9]{32})/taxonomy", path)
-            if match:
-                self._require_role("admin")
-                _fields(data, {"category_id", "tag_ids"})
-                tags = data.get("tag_ids", [])
-                if not isinstance(tags, list) or not all(isinstance(value, str) for value in tags): raise ApiError(422, "tag_ids must be strings")
-                response, _ = self._platform_idempotency(data, lambda: app.platform.admin_set_entry_taxonomy(
-                    self.context, match.group(1), _string(data, "category_id", maximum=32) or None, tags,
                 ))
                 return self._json(200, response)
             match = re.fullmatch(r"/api/admin/public-entries/([a-f0-9]{32})/featured", path)
@@ -1462,8 +1445,7 @@ def make_handler(app: WikiApp):
 
             service = self._private_service()
             content_write_paths = {
-                "/api/generate", "/api/meta", "/api/classifications/preview", "/api/classifications/draft",
-                "/api/classifications/commit", "/api/classifications/retry", "/api/categories/preview",
+                "/api/generate", "/api/meta", "/api/article/taxonomy", "/api/categories/preview",
                 "/api/categories/commit", "/api/reconciliation/scan", "/api/reconciliation/preview",
                 "/api/reconciliation/commit", "/api/governance", "/api/article/save", "/api/ingest/commit",
                 "/api/ingest/upload", "/api/merge/commit", "/api/share-previews", "/api/submissions",
@@ -1472,6 +1454,9 @@ def make_handler(app: WikiApp):
             if path in {"/api/settings/models", "/api/settings/model"}:
                 self._require_workspace_permission("model.manage")
                 self._enter_workspace_action("model.manage")
+            elif path in {"/api/categories/preview", "/api/categories/commit"}:
+                self._require_workspace_permission("wiki.govern")
+                self._enter_workspace_action("wiki.govern")
             elif (
                 path in content_write_paths
                 or re.fullmatch(r"/api/tasks/[a-f0-9]+/(cancel|retry)", path)
@@ -1553,45 +1538,55 @@ def make_handler(app: WikiApp):
                 )
                 return self._json(200, result)
             if path == "/api/generate":
-                _fields(data, {"keyword", "from_path", "heading", "passage"}, {"keyword"})
+                _fields(data, {"keyword", "from_path", "heading", "passage", "category", "tags"}, {"keyword"})
+                category_selection = data.get("category")
+                tag_values = data.get("tags")
+                if category_selection is not None and not isinstance(category_selection, dict):
+                    raise ApiError(422, "category must be a taxonomy selection")
+                if tag_values is not None and (not isinstance(tag_values, list) or not all(isinstance(item, str) for item in tag_values)):
+                    raise ApiError(422, "tags must be an array of strings")
                 response, replay = self._idempotency(data, lambda: service.generate(
                     _string(data, "keyword", maximum=120, required=True),
                     from_path=_string(data, "from_path", maximum=512),
                     heading=_string(data, "heading", maximum=200),
                     passage=_string(data, "passage", maximum=800),
+                    category=category_selection,
+                    tags=tag_values,
                 ))
                 self.diagnostics.refresh()
                 return self._json(200 if replay else 202, response)
             if path == "/api/meta":
-                _fields(data, {"path", "category", "status"}, {"path", "category", "status"})
+                _fields(data, {"path", "category", "status", "tags", "revision"}, {"path", "category", "status"})
+                category_selection = data.get("category")
+                tag_values = data.get("tags")
+                if not isinstance(category_selection, (str, dict)):
+                    raise ApiError(422, "category must be a taxonomy selection")
+                if tag_values is not None and (not isinstance(tag_values, list) or not all(isinstance(item, str) for item in tag_values)):
+                    raise ApiError(422, "tags must be an array of strings")
                 response, _ = self._idempotency(data, lambda: service.apply_meta(
                     _string(data, "path", maximum=512, required=True),
-                    category=_string(data, "category", maximum=80, required=True),
+                    category=category_selection,
                     status=_string(data, "status", maximum=20, required=True),
+                    tags=tag_values,
+                    expected_revision=_string(data, "revision", maximum=128),
                 ))
                 self.diagnostics.refresh()
                 return self._json(200, response)
-            if path == "/api/classifications/preview":
-                _fields(data, {"selections"}, {"selections"})
-                selections = data.get("selections")
-                if not isinstance(selections, list):
-                    raise ApiError(422, "selections must be an array")
-                return self._json(200, service.classification_preview(selections))
-            if path == "/api/classifications/draft":
-                _fields(data, {"selections", "expected_revision"}, {"selections", "expected_revision"})
-                selections = data.get("selections")
-                expected_revision = data.get("expected_revision")
-                if not isinstance(selections, list) or isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
-                    raise ApiError(422, "invalid classification draft")
-                return self._json(200, service.save_classification_draft(selections, expected_revision))
-            if path == "/api/classifications/commit":
-                _fields(data, {"preview_id"}, {"preview_id"})
-                response, replay = self._idempotency(data, lambda: service.classification_commit(_string(data, "preview_id", maximum=64, required=True)))
+            if path == "/api/article/taxonomy":
+                _fields(data, {"path", "category", "status", "tags", "revision"}, {"path", "category", "status", "tags", "revision"})
+                category_selection = data.get("category")
+                tags = data.get("tags")
+                if not isinstance(category_selection, dict) or not isinstance(tags, list) or not all(isinstance(item, str) for item in tags):
+                    raise ApiError(422, "invalid taxonomy selection")
+                response, replay = self._idempotency(data, lambda: service.apply_meta(
+                    _string(data, "path", maximum=512, required=True),
+                    category=category_selection,
+                    status=_string(data, "status", maximum=20, required=True),
+                    tags=tags,
+                    expected_revision=_string(data, "revision", maximum=128, required=True),
+                ))
+                self.diagnostics.refresh()
                 return self._json(200 if replay else 201, response)
-            if path == "/api/classifications/retry":
-                _fields(data, {"article_id"}, {"article_id"})
-                response, replay = self._idempotency(data, lambda: service.retry_classification(_string(data, "article_id", maximum=64, required=True)))
-                return self._json(200 if replay else 202, response)
             if path == "/api/categories/preview":
                 _fields(data, {"action", "category_id", "target_category_id", "name", "description", "sort_order"}, {"action"})
                 action = _string(data, "action", maximum=20, required=True)
@@ -1629,25 +1624,40 @@ def make_handler(app: WikiApp):
                 response, replay = self._idempotency(data, service.enqueue_governance)
                 return self._json(200, {**response, "replay": replay})
             if path == "/api/article/save":
-                _fields(data, {"path", "markdown", "revision", "force"}, {"path", "markdown", "revision"})
+                _fields(data, {"path", "markdown", "revision", "force", "category", "tags"}, {"path", "markdown", "revision"})
                 force = data.get("force", False)
                 if not isinstance(force, bool):
                     raise ApiError(422, "force must be a boolean")
+                category_selection = data.get("category")
+                tag_values = data.get("tags")
+                if category_selection is not None and not isinstance(category_selection, dict):
+                    raise ApiError(422, "category must be a taxonomy selection")
+                if tag_values is not None and (not isinstance(tag_values, list) or not all(isinstance(item, str) for item in tag_values)):
+                    raise ApiError(422, "tags must be an array of strings")
                 response, _ = self._idempotency(data, lambda: service.save_article(
                     _string(data, "path", maximum=512, required=True),
                     _string(data, "markdown", maximum=None, required=True),
                     _string(data, "revision", maximum=128, required=True),
                     force=force,
+                    category=category_selection,
+                    tags=tag_values,
                 ))
                 self.diagnostics.refresh()
                 return self._json(409 if response.get("conflict") else 200, response)
             if path == "/api/ingest/commit":
-                _fields(data, {"path", "disposition", "title", "category", "target_path"}, {"path", "disposition", "title"})
+                _fields(data, {"path", "disposition", "title", "category", "tags", "target_path"}, {"path", "disposition", "title"})
+                category_selection = data.get("category")
+                tag_values = data.get("tags")
+                if category_selection is not None and not isinstance(category_selection, dict):
+                    raise ApiError(422, "category must be a taxonomy selection")
+                if tag_values is not None and (not isinstance(tag_values, list) or not all(isinstance(item, str) for item in tag_values)):
+                    raise ApiError(422, "tags must be an array of strings")
                 response, _ = self._idempotency(data, lambda: service.ingest_commit(
                     _string(data, "path", maximum=512, required=True),
                     _string(data, "disposition", maximum=20, required=True),
                     title=_string(data, "title", maximum=120, required=True),
-                    category=_string(data, "category", maximum=80),
+                    category=category_selection,
+                    tags=tag_values,
                     target_path=_string(data, "target_path", maximum=512) or None,
                 ))
                 self.diagnostics.refresh()
@@ -1697,6 +1707,7 @@ def make_handler(app: WikiApp):
             if path == "/api/share-previews":
                 _fields(data, {
                     "article_path", "source_revision", "attribution", "public_category_id", "tag_ids",
+                    "category_selection", "tag_selections",
                     "reuse_permission", "reuse_policy_version", "reuse_policy_acknowledged", "link_public_profile", "source_urls",
                 }, {"article_path", "source_revision", "attribution"})
                 article_path = _string(data, "article_path", maximum=512, required=True)
@@ -1716,6 +1727,12 @@ def make_handler(app: WikiApp):
                     raise ApiError(422, "invalid attribution")
                 category_id = _string(data, "public_category_id", maximum=32) or None
                 tag_ids = data.get("tag_ids", [])
+                category_selection = data.get("category_selection")
+                tag_selections = data.get("tag_selections")
+                if category_selection is None and category_id:
+                    category_selection = {"kind": "existing", "id": category_id}
+                if tag_selections is None:
+                    tag_selections = [{"kind": "existing", "id": value} for value in tag_ids]
                 source_urls = data.get("source_urls", [])
                 reuse_permission = _string(data, "reuse_permission", maximum=40) or "view_only"
                 reuse_policy_version = _string(data, "reuse_policy_version", maximum=80) or None
@@ -1723,6 +1740,8 @@ def make_handler(app: WikiApp):
                 link_profile = data.get("link_public_profile", False)
                 if (
                     not isinstance(tag_ids, list) or not all(isinstance(value, str) for value in tag_ids)
+                    or not isinstance(category_selection, dict)
+                    or not isinstance(tag_selections, list) or not all(isinstance(value, dict) for value in tag_selections)
                     or not isinstance(source_urls, list) or not all(isinstance(value, str) for value in source_urls)
                     or not isinstance(link_profile, bool)
                     or not isinstance(reuse_acknowledged, bool)
@@ -1763,6 +1782,7 @@ def make_handler(app: WikiApp):
                 fingerprint = snapshot_fingerprint(snapshot)
                 response, _ = self._idempotency(data, lambda: app.platform.create_preview(
                     self.context, article_path, source_revision, article["article_id"], fingerprint, snapshot,
+                    {"category": category_selection, "tags": tag_selections},
                 ))
                 return self._json(201, response)
             if path == "/api/submissions":
@@ -1785,7 +1805,10 @@ def make_handler(app: WikiApp):
             match = re.fullmatch(r"/api/admin/submissions/([a-f0-9]{32})/decision", path)
             if match:
                 self._require_role("admin")
-                _fields(data, {"decision", "reason", "public_category_id", "tag_ids", "duplicate_action"}, {"decision", "reason"})
+                _fields(data, {"decision", "reason", "public_category_id", "tag_ids", "duplicate_action", "taxonomy_decision"}, {"decision", "reason"})
+                taxonomy_decision = data.get("taxonomy_decision")
+                if taxonomy_decision is not None and not isinstance(taxonomy_decision, dict):
+                    raise ApiError(422, "taxonomy_decision must be an object")
                 tag_ids = data.get("tag_ids", [])
                 if not isinstance(tag_ids, list) or not all(isinstance(value, str) for value in tag_ids):
                     raise ApiError(422, "tag_ids must be an array of ids")
@@ -1794,6 +1817,7 @@ def make_handler(app: WikiApp):
                     public_category_id=_string(data, "public_category_id", maximum=32) or None,
                     tag_ids=tag_ids,
                     duplicate_action=_string(data, "duplicate_action", maximum=40) or "independent",
+                    taxonomy_decision=taxonomy_decision,
                 ))
                 return self._json(200, response)
             match = re.fullmatch(r"/api/admin/public-entries/([a-f0-9]{32})/remove", path)

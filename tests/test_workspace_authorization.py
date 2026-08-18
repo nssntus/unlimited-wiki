@@ -10,7 +10,7 @@ import pytest
 
 from platform_store import PlatformStore, now_iso
 from publication import public_markdown, snapshot_fingerprint
-from tests.test_multitenant import Client, context_for, seed_article
+from tests.test_multitenant import Client, context_for, public_taxonomy_payload, seed_article
 from serve import create_app, create_server
 
 
@@ -466,11 +466,13 @@ def test_submission_actions_follow_workspace_role_and_scope(membership_server):
     author.register("submission-scope@example.com", "Submission Scope")
     article_path, revision = seed_article(app, author, "Scoped publication")
     context_a = context_for(app, author)
+    category = next(item for item in app.workspace_service(context_a).categories() if item["status"] == "active")
 
     preview = author.request("POST", "/api/share-previews", {
         "article_path": article_path,
         "source_revision": revision,
         "attribution": "nickname",
+        **public_taxonomy_payload(app),
     }, key="scope-preview-a")[1]
     approved_submission = author.request(
         "POST", "/api/submissions", {"preview_id": preview["preview_id"]}, key="scope-submit-a",
@@ -487,6 +489,7 @@ def test_submission_actions_follow_workspace_role_and_scope(membership_server):
         "article_path": article_path,
         "source_revision": updated_revision,
         "attribution": "nickname",
+        **public_taxonomy_payload(app),
     }, key="scope-preview-failed")[1]
     failed_submission = author.request(
         "POST", "/api/submissions", {"preview_id": second_preview["preview_id"]}, key="scope-submit-failed",
@@ -495,6 +498,9 @@ def test_submission_actions_follow_workspace_role_and_scope(membership_server):
         db.execute("UPDATE submissions SET status='ai_failed' WHERE id=?", (failed_submission["id"],))
 
     _set_workspace_role(app.platform, context_a.user_id, context_a.workspace_id, "viewer")
+    assert author.request("POST", "/api/categories/preview", {
+        "action": "reorder", "category_id": category["category_id"], "sort_order": 0,
+    }, key="viewer-govern")[0] == 403
     assert author.request(
         "POST", f"/api/submissions/{failed_submission['id']}/ai-retry", {}, key="viewer-retry",
     )[0] == 403
@@ -504,6 +510,9 @@ def test_submission_actions_follow_workspace_role_and_scope(membership_server):
     assert Client(base).request("GET", f"/api/public/entries/{approved['public_entry_id']}")[0] == 200
 
     _set_workspace_role(app.platform, context_a.user_id, context_a.workspace_id, "editor")
+    assert author.request("POST", "/api/categories/preview", {
+        "action": "reorder", "category_id": category["category_id"], "sort_order": 0,
+    }, key="editor-govern")[0] == 200
     assert author.request(
         "POST", f"/api/submissions/{failed_submission['id']}/ai-retry", {}, key="editor-retry",
     )[0] == 200
@@ -521,6 +530,7 @@ def test_submissions_and_publication_state_do_not_cross_workspaces(membership_se
     context_a = context_for(app, author)
     preview_a = author.request("POST", "/api/share-previews", {
         "article_path": path_a, "source_revision": revision_a, "attribution": "nickname",
+        **public_taxonomy_payload(app),
     }, key="two-preview-a")[1]
     submission_a = author.request("POST", "/api/submissions", {"preview_id": preview_a["preview_id"]}, key="two-submit-a")[1]
     app.platform.ai_decide(submission_a["id"], "pass", {"summary": "accepted A"})
@@ -541,6 +551,7 @@ def test_submissions_and_publication_state_do_not_cross_workspaces(membership_se
     assert article_b["publication"]["state"] == "not_published"
     preview_status, preview_b = author.request("POST", "/api/share-previews", {
         "article_path": path_b, "source_revision": revision_b, "attribution": "nickname",
+        **public_taxonomy_payload(app),
     }, key="two-preview-b")
     assert preview_status == 201, preview_b
     submission_b = author.request("POST", "/api/submissions", {"preview_id": preview_b["preview_id"]}, key="two-submit-b")[1]

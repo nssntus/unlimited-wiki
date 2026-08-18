@@ -11,6 +11,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
+RETIRED_TASK_KINDS = {"article-classification", "raw-classification-plan"}
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -134,6 +137,17 @@ class StateStore:
                     "UPDATE tasks SET status='queued', next_run_at=?, updated_at=? WHERE status='running'",
                     (now_iso(), now_iso()),
                 )
+            db.execute(
+                """
+                UPDATE tasks
+                SET status='failed', error_type='feature_removed',
+                    error_message='AI classification was retired; choose taxonomy while saving.',
+                    next_run_at=NULL, paused_from_status=NULL, updated_at=?
+                WHERE kind IN ('article-classification','raw-classification-plan')
+                  AND status IN ('staged','queued','running','paused')
+                """,
+                (now_iso(),),
+            )
             db.execute("DELETE FROM idempotency WHERE status='pending'")
             staged = db.execute("SELECT id,payload_json FROM tasks WHERE status='staged'").fetchall()
             for row in staged:
@@ -193,6 +207,8 @@ class StateStore:
         self, kind: str, subject: str, payload: dict, *, staged: bool = False,
         actor_user_id: str | None = None,
     ) -> tuple[dict, bool]:
+        if kind in RETIRED_TASK_KINDS:
+            raise ValueError("task kind is no longer supported")
         active_key = f"{kind}:{subject.casefold()}"
         task_id = uuid.uuid4().hex
         created = now_iso()
@@ -309,74 +325,6 @@ class StateStore:
             )
         return self.get_task(task_id)
 
-    def finalize_classification_success(
-        self,
-        task_id: str,
-        expected_attempt: int,
-        result: dict,
-        *,
-        article_id: str,
-        article_revision: str,
-        taxonomy_revision: int,
-        suggestion: dict,
-    ) -> dict:
-        stamp = now_iso()
-        with self._lock, self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            changed = db.execute(
-                """UPDATE tasks SET status='succeeded', result_json=?, error_type=NULL,
-                error_message=NULL, next_run_at=NULL, updated_at=?
-                WHERE id=? AND status='running' AND attempts=?""",
-                (json.dumps(result, ensure_ascii=False), stamp, task_id, expected_attempt),
-            ).rowcount
-            if changed:
-                db.execute(
-                    """INSERT INTO classification_suggestions
-                    (article_id,article_revision,taxonomy_revision,status,suggestion_json,task_id,error_type,error_message,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(article_id,article_revision,taxonomy_revision) DO UPDATE SET
-                    status=excluded.status,suggestion_json=excluded.suggestion_json,task_id=excluded.task_id,
-                    error_type=NULL,error_message=NULL,updated_at=excluded.updated_at""",
-                    (article_id, article_revision, taxonomy_revision, "succeeded",
-                     json.dumps(suggestion, ensure_ascii=False), task_id, None, None, stamp, stamp),
-                )
-            db.commit()
-        return self.get_task(task_id)
-
-    def finalize_raw_classification_success(
-        self,
-        task_id: str,
-        expected_attempt: int,
-        result: dict,
-        *,
-        raw_path: str,
-        raw_revision: str,
-        taxonomy_revision: int,
-        plan: dict,
-    ) -> dict:
-        stamp = now_iso()
-        with self._lock, self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            changed = db.execute(
-                """UPDATE tasks SET status='succeeded', result_json=?, error_type=NULL,
-                error_message=NULL, next_run_at=NULL, updated_at=?
-                WHERE id=? AND status='running' AND attempts=?""",
-                (json.dumps(result, ensure_ascii=False), stamp, task_id, expected_attempt),
-            ).rowcount
-            if changed:
-                db.execute(
-                    """INSERT INTO raw_classification_plans
-                    (raw_path,raw_revision,taxonomy_revision,status,plan_json,task_id,error_type,error_message,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(raw_path,raw_revision,taxonomy_revision) DO UPDATE SET
-                    status=excluded.status,plan_json=excluded.plan_json,task_id=excluded.task_id,
-                    error_type=NULL,error_message=NULL,updated_at=excluded.updated_at""",
-                    (raw_path, raw_revision, taxonomy_revision, "succeeded",
-                     json.dumps(plan, ensure_ascii=False), task_id, None, None, stamp, stamp),
-                )
-            db.commit()
-        return self.get_task(task_id)
-
     def cancel_task(self, task_id: str) -> dict:
         with self.connect() as db:
             changed = db.execute(
@@ -474,6 +422,8 @@ class StateStore:
             if row is None:
                 raise FileNotFoundError(task_id)
             task = self._task(row)
+            if task["kind"] in RETIRED_TASK_KINDS or task.get("error_type") == "feature_removed":
+                raise ValueError("task kind is no longer supported")
             retryable_conflict = task["status"] == "succeeded" and bool(task.get("result", {}).get("conflict"))
             allowed_status = task["status"] in {"failed", "cancelled"} or retryable_conflict
             if not allowed_status:
@@ -544,72 +494,6 @@ class StateStore:
                     ),
                 )
 
-    def save_classification_suggestion(
-        self,
-        article_id: str,
-        article_revision: str,
-        taxonomy_revision: int,
-        status: str,
-        *,
-        suggestion: dict | None = None,
-        task_id: str | None = None,
-        error_type: str | None = None,
-        error_message: str | None = None,
-    ) -> dict:
-        stamp = now_iso()
-        with self.connect() as db:
-            db.execute(
-                """INSERT INTO classification_suggestions
-                (article_id,article_revision,taxonomy_revision,status,suggestion_json,task_id,error_type,error_message,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(article_id,article_revision,taxonomy_revision) DO UPDATE SET
-                status=excluded.status,suggestion_json=excluded.suggestion_json,task_id=excluded.task_id,
-                error_type=excluded.error_type,error_message=excluded.error_message,updated_at=excluded.updated_at""",
-                (article_id, article_revision, taxonomy_revision, status,
-                 json.dumps(suggestion, ensure_ascii=False) if suggestion is not None else None,
-                 task_id, error_type, error_message[:500] if error_message else None, stamp, stamp),
-            )
-        return self.classification_suggestion(article_id, article_revision, taxonomy_revision) or {}
-
-    def save_raw_classification_plan(self, raw_path: str, raw_revision: str, taxonomy_revision: int, status: str, *, plan: dict | None = None, task_id: str | None = None, error_type: str | None = None, error_message: str | None = None) -> dict:
-        stamp = now_iso()
-        with self.connect() as db:
-            db.execute(
-                """INSERT INTO raw_classification_plans
-                (raw_path,raw_revision,taxonomy_revision,status,plan_json,task_id,error_type,error_message,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(raw_path,raw_revision,taxonomy_revision) DO UPDATE SET
-                status=excluded.status,plan_json=excluded.plan_json,task_id=excluded.task_id,
-                error_type=excluded.error_type,error_message=excluded.error_message,updated_at=excluded.updated_at""",
-                (raw_path, raw_revision, taxonomy_revision, status, json.dumps(plan, ensure_ascii=False) if plan is not None else None, task_id, error_type, error_message[:500] if error_message else None, stamp, stamp),
-            )
-        return self.raw_classification_plan(raw_path, raw_revision, taxonomy_revision) or {}
-
-    def raw_classification_plan(self, raw_path: str, raw_revision: str, taxonomy_revision: int) -> dict | None:
-        with self.connect() as db:
-            row = db.execute(
-                "SELECT * FROM raw_classification_plans WHERE raw_path=? AND raw_revision=? AND taxonomy_revision=?",
-                (raw_path, raw_revision, taxonomy_revision),
-            ).fetchone()
-        if not row:
-            return None
-        item = dict(row)
-        raw_plan = item.pop("plan_json")
-        item["plan"] = json.loads(raw_plan) if raw_plan else None
-        return item
-
-    def classification_suggestion(self, article_id: str, article_revision: str, taxonomy_revision: int) -> dict | None:
-        with self.connect() as db:
-            row = db.execute(
-                "SELECT * FROM classification_suggestions WHERE article_id=? AND article_revision=? AND taxonomy_revision=?",
-                (article_id, article_revision, taxonomy_revision),
-            ).fetchone()
-        if not row:
-            return None
-        item = dict(row)
-        raw_suggestion = item.pop("suggestion_json")
-        item["suggestion"] = json.loads(raw_suggestion) if raw_suggestion else None
-        return item
-
     def create_preview(self, kind: str, payload: dict, *, ttl_minutes: int = 30) -> dict:
         preview_id = uuid.uuid4().hex
         created = now_iso()
@@ -634,36 +518,6 @@ class StateStore:
     def consume_preview(self, preview_id: str) -> None:
         with self.connect() as db:
             db.execute("DELETE FROM classification_previews WHERE id=?", (preview_id,))
-
-    def classification_draft(self) -> dict:
-        with self.connect() as db:
-            row = db.execute("SELECT * FROM classification_draft WHERE id=1").fetchone()
-        if not row:
-            return {"revision": 0, "selections": []}
-        return {"revision": row["revision"], "selections": json.loads(row["payload_json"])}
-
-    def save_classification_draft(self, selections: list[dict], expected_revision: int) -> dict:
-        if not isinstance(selections, list) or len(selections) > 500:
-            raise ValueError("invalid classification draft")
-        with self._lock, self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT revision FROM classification_draft WHERE id=1").fetchone()
-            current = row["revision"] if row else 0
-            if current != expected_revision:
-                db.rollback()
-                raise RuntimeError("classification draft changed")
-            next_revision = current + 1
-            db.execute(
-                """INSERT INTO classification_draft(id,revision,payload_json,updated_at) VALUES(1,?,?,?)
-                ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,payload_json=excluded.payload_json,updated_at=excluded.updated_at""",
-                (next_revision, json.dumps(selections, ensure_ascii=False), now_iso()),
-            )
-            db.commit()
-        return {"revision": next_revision, "selections": selections}
-
-    def clear_classification_draft(self) -> None:
-        with self.connect() as db:
-            db.execute("DELETE FROM classification_draft WHERE id=1")
 
     def replace_reconciliation(self, items: list[dict]) -> list[dict]:
         stamp = now_iso()

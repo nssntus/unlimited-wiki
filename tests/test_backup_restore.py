@@ -20,8 +20,10 @@ from backup_restore import (
     restore_journal_path,
     verify_backup,
 )
-from platform_store import PlatformStore
+from platform_store import SUBMISSION_STATES, PlatformStore
+from publication import snapshot_fingerprint
 from state_store import StateStore
+from square_v2 import normalize_taxonomy_name
 
 
 LEGACY_PLATFORM_DDL = """
@@ -275,12 +277,373 @@ def test_backup_accepts_normal_merged_public_category(tmp_path: Path):
     source.mkdir()
     platform, user, _article, _raw = seed_instance(source)
     _token, context = platform.create_session(user["id"])
-    first = platform.admin_upsert_category(context, None, "first", "First", "", "active", 0)
-    second = platform.admin_upsert_category(context, None, "second", "Second", "", "active", 1)
+    now = "2026-01-01T00:00:00+00:00"
+    with platform.connect() as db:
+        for category_id, slug, name, sort_order in (("1" * 32, "first", "First", 0), ("2" * 32, "second", "Second", 1)):
+            clean, normalized = normalize_taxonomy_name(name, kind="category")
+            db.execute(
+                """INSERT INTO public_categories(id,slug,name,normalized_name,description,status,sort_order,created_by,created_at,updated_at)
+                VALUES(?,?,?,?,?,'active',?,?,?,?)""",
+                (category_id, slug, clean, normalized, "", sort_order, context.user_id, now, now),
+            )
+    first, second = {"id": "1" * 32}, {"id": "2" * 32}
     platform.admin_merge_category(context, first["id"], second["id"], "Duplicate taxonomy")
     backup = tmp_path / "backup"
     create_backup(source, backup)
     assert verify_backup(backup)["schema_version"] == 2
+
+
+@pytest.mark.parametrize("table", ["public_categories", "public_tags"])
+def test_backup_rejects_forged_normalized_taxonomy_names(tmp_path: Path, table: str):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    now = "2026-01-01T00:00:00+00:00"
+    with platform.connect() as db:
+        if table == "public_categories":
+            for item_id, slug, name, normalized in (
+                ("3" * 32, "cafe-a", "Ｃａｆé", "forged-a"),
+                ("4" * 32, "cafe-b", "Cafe\u0301", "forged-b"),
+            ):
+                db.execute(
+                    """INSERT INTO public_categories(id,slug,name,normalized_name,description,status,sort_order,created_by,created_at,updated_at)
+                    VALUES(?,?,?,?,?,'active',0,?,?,?)""",
+                    (item_id, slug, name, normalized, "", user["id"], now, now),
+                )
+        else:
+            for item_id, slug, name, normalized in (
+                ("3" * 32, "cafe-a", "Ｃａｆé", "forged-a"),
+                ("4" * 32, "cafe-b", "Cafe\u0301", "forged-b"),
+            ):
+                db.execute(
+                    "INSERT INTO public_tags(id,slug,name,normalized_name,status,created_at,updated_at) VALUES(?,?,?,?, 'active',?,?)",
+                    (item_id, slug, name, normalized, now, now),
+                )
+    assert_backup_contract_rejects(source, tmp_path, "normalized public taxonomy|duplicate normalized")
+
+
+def test_backup_rejects_malformed_taxonomy_proposal_json(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    now = "2026-01-01T00:00:00+00:00"
+    with platform.connect() as db:
+        db.execute(
+            """INSERT INTO share_previews(
+                id,owner_id,workspace_id,article_path,source_revision,content_hash,snapshot_json,
+                expires_at,created_at,taxonomy_proposal_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            ("5" * 32, user["id"], user["workspace_id"], "concepts/a.md", "r1", "h", "{}", now, now, "{"),
+        )
+    assert_backup_contract_rejects(source, tmp_path, "invalid taxonomy proposal data")
+
+
+def test_backup_rejects_malformed_taxonomy_decision_json(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    _token, context = platform.create_session(user["id"])
+    snapshot = {
+        "title": "Taxonomy decision",
+        "category": "",
+        "content_status": "draft",
+        "markdown": "# Taxonomy decision\n\nPublic body.\n",
+    }
+    preview = platform.create_preview(
+        context,
+        "_inbox/taxonomy-decision.md",
+        "r1",
+        "6" * 32,
+        snapshot_fingerprint(snapshot),
+        snapshot,
+        taxonomy_selection={
+            "category": {"kind": "proposal", "name": "Decision category"},
+            "tags": [],
+        },
+    )
+    submission = platform.submit_preview(context, preview["preview_id"])
+    with platform.connect() as db:
+        db.execute(
+            "UPDATE submissions SET taxonomy_decision_json=? WHERE id=?",
+            ("{", submission["id"]),
+        )
+    assert_backup_contract_rejects(source, tmp_path, "taxonomy decision data")
+
+
+def approve_taxonomy_proposal(platform: PlatformStore, user: dict, *, with_tag: bool = False) -> tuple[str, str, str | None]:
+    _token, context = platform.create_session(user["id"])
+    snapshot = {
+        "title": "Taxonomy audit",
+        "category": "",
+        "content_status": "draft",
+        "markdown": "# Taxonomy audit\n\nPublic body.\n",
+        "attribution": "Audit author",
+    }
+    preview = platform.create_preview(
+        context,
+        "_inbox/taxonomy-audit.md",
+        "r1",
+        "7" * 32,
+        snapshot_fingerprint(snapshot),
+        snapshot,
+        taxonomy_selection={
+            "category": {"kind": "proposal", "name": "Audit category"},
+            "tags": [{"kind": "proposal", "name": "Audit tag"}] if with_tag else [],
+        },
+    )
+    submission = platform.submit_preview(context, preview["preview_id"])
+    platform.ai_decide(submission["id"], "pass", {"summary": "pass", "issues": []})
+    pending = platform.admin_get(context, submission["id"])
+    proposal_items = [pending["taxonomy"]["category"], *pending["taxonomy"]["tags"]]
+    approved = platform.admin_decide(
+        context,
+        submission["id"],
+        "approve",
+        "reviewed",
+        taxonomy_decision={
+            "version": 1,
+            "resolutions": {item["key"]: {"action": "create"} for item in proposal_items},
+        },
+    )
+    with platform.connect() as db:
+        category_id = db.execute(
+            "SELECT category_id FROM public_revision_taxonomy rt "
+            "JOIN public_revisions r ON r.id=rt.revision_id WHERE r.submission_id=?",
+            (submission["id"],),
+        ).fetchone()[0]
+        tag_row = db.execute(
+            "SELECT tag_id FROM public_revision_tags rt "
+            "JOIN public_revisions r ON r.id=rt.revision_id WHERE r.submission_id=?",
+            (submission["id"],),
+        ).fetchone()
+    return submission["id"], category_id, tag_row[0] if tag_row is not None else None
+
+
+def test_backup_accepts_matching_taxonomy_decision_and_frozen_revision(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    submission_id, category_id, _tag_id = approve_taxonomy_proposal(platform, user)
+    backup = tmp_path / "backup"
+
+    create_backup(source, backup)
+    assert verify_backup(backup)["schema_version"] == 2
+    target = tmp_path / "restored"
+    restore_backup(backup, target)
+    with PlatformStore(target).connect() as db:
+        decision = json.loads(db.execute(
+            "SELECT taxonomy_decision_json FROM submissions WHERE id=?", (submission_id,),
+        ).fetchone()[0])
+        revision_category = db.execute(
+            "SELECT rt.category_id FROM public_revision_taxonomy rt "
+            "JOIN public_revisions r ON r.id=rt.revision_id WHERE r.submission_id=?",
+            (submission_id,),
+        ).fetchone()[0]
+    assert decision["resolutions"][0]["id"] == category_id == revision_category
+
+
+def test_backup_accepts_taxonomy_renamed_after_approval(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    _submission_id, category_id, tag_id = approve_taxonomy_proposal(platform, user, with_tag=True)
+    _token, context = platform.create_session(user["id"])
+    platform.admin_upsert_category(
+        context, category_id, "renamed-after-approval", "Renamed After Approval", "", "active", 0,
+    )
+    platform.admin_upsert_tag(context, tag_id, "renamed-tag-after-approval", "Renamed Tag After Approval", "active")
+    backup = tmp_path / "backup"
+
+    create_backup(source, backup)
+    assert verify_backup(backup)["schema_version"] == 2
+    target = tmp_path / "restored"
+    restore_backup(backup, target)
+    restored = PlatformStore(target)
+    assert restored.public_categories()[0]["name"] == "Renamed After Approval"
+    assert restored.public_tags()[0]["name"] == "Renamed Tag After Approval"
+
+
+@pytest.mark.parametrize("kind", ["category", "tag"])
+def test_backup_rejects_taxonomy_decision_that_disagrees_with_frozen_name(tmp_path: Path, kind: str):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    submission_id, _category_id, _tag_id = approve_taxonomy_proposal(platform, user, with_tag=True)
+    with platform.connect() as db:
+        revision_id = db.execute(
+            "SELECT id FROM public_revisions WHERE submission_id=?", (submission_id,),
+        ).fetchone()[0]
+        if kind == "category":
+            db.execute(
+                "UPDATE public_revision_taxonomy SET category_name='Different frozen category' WHERE revision_id=?",
+                (revision_id,),
+            )
+        else:
+            db.execute(
+                "UPDATE public_revision_tags SET tag_name='Different frozen tag' WHERE revision_id=?",
+                (revision_id,),
+            )
+    assert_backup_contract_rejects(source, tmp_path, "invalid taxonomy decision data")
+
+
+def test_backup_accepts_legacy_approved_submission_without_taxonomy_proposal(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    _token, context = platform.create_session(user["id"])
+    snapshot = {
+        "title": "Legacy publication",
+        "category": "",
+        "content_status": "draft",
+        "markdown": "# Legacy publication\n\nPublic body.\n",
+    }
+    preview = platform.create_preview(
+        context, "_inbox/legacy-publication.md", "r1", "a" * 32,
+        snapshot_fingerprint(snapshot), snapshot,
+    )
+    submission = platform.submit_preview(context, preview["preview_id"])
+    platform.ai_decide(submission["id"], "pass", {"summary": "pass", "issues": []})
+    platform.admin_decide(context, submission["id"], "approve", "reviewed")
+
+    backup = tmp_path / "backup"
+    create_backup(source, backup)
+    assert verify_backup(backup)["schema_version"] == 2
+
+
+def test_backup_rejects_unknown_submission_status(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    _token, context = platform.create_session(user["id"])
+    snapshot = {
+        "title": "Invalid submission state",
+        "category": "",
+        "content_status": "draft",
+        "markdown": "# Invalid submission state\n\nPublic body.\n",
+    }
+    preview = platform.create_preview(
+        context, "_inbox/invalid-submission-state.md", "r1", "b" * 32,
+        snapshot_fingerprint(snapshot), snapshot,
+    )
+    submission = platform.submit_preview(context, preview["preview_id"])
+    with platform.connect() as db:
+        db.execute(
+            "UPDATE submissions SET status='not-a-state',taxonomy_decision_json=NULL,public_entry_id=NULL WHERE id=?",
+            (submission["id"],),
+        )
+    assert_backup_contract_rejects(source, tmp_path, "invalid submission status")
+
+
+@pytest.mark.parametrize("status", sorted(SUBMISSION_STATES))
+def test_backup_accepts_every_supported_submission_status(tmp_path: Path, status: str):
+    source = tmp_path / f"source-{status}"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    if status == "approved":
+        approve_taxonomy_proposal(platform, user)
+    else:
+        _token, context = platform.create_session(user["id"])
+        snapshot = {
+            "title": f"Submission {status}",
+            "category": "",
+            "content_status": "draft",
+            "markdown": f"# Submission {status}\n\nPublic body.\n",
+        }
+        preview = platform.create_preview(
+            context, f"_inbox/submission-{status}.md", "r1", "c" * 32,
+            snapshot_fingerprint(snapshot), snapshot,
+        )
+        submission = platform.submit_preview(context, preview["preview_id"])
+        with platform.connect() as db:
+            db.execute("UPDATE submissions SET status=? WHERE id=?", (status, submission["id"]))
+    backup = tmp_path / f"backup-{status}"
+    create_backup(source, backup)
+    assert verify_backup(backup)["schema_version"] == 2
+    restore_backup(backup, tmp_path / f"restored-{status}")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "pending_with_decision",
+        "pending_publication_without_decision",
+        "approved_without_decision",
+        "mismatched_revision",
+    ],
+)
+def test_backup_rejects_taxonomy_decision_that_disagrees_with_publication(
+    tmp_path: Path, mutation: str,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    submission_id, _category_id, _tag_id = approve_taxonomy_proposal(platform, user)
+    with platform.connect() as db:
+        if mutation == "pending_with_decision":
+            db.execute("UPDATE submissions SET status='pending_admin' WHERE id=?", (submission_id,))
+        elif mutation == "pending_publication_without_decision":
+            db.execute(
+                "UPDATE submissions SET status='pending_admin',taxonomy_decision_json=NULL WHERE id=?",
+                (submission_id,),
+            )
+        elif mutation == "approved_without_decision":
+            db.execute("UPDATE submissions SET taxonomy_decision_json=NULL WHERE id=?", (submission_id,))
+        else:
+            now = "2026-01-01T00:00:00+00:00"
+            other_id = "8" * 32
+            clean, normalized = normalize_taxonomy_name("Other category", kind="category")
+            db.execute(
+                """INSERT INTO public_categories(
+                    id,slug,name,normalized_name,description,status,sort_order,created_by,created_at,updated_at
+                ) VALUES(?,?,?,?,?,'active',0,?,?,?)""",
+                (other_id, "other-category", clean, normalized, "", user["id"], now, now),
+            )
+            decision = json.loads(db.execute(
+                "SELECT taxonomy_decision_json FROM submissions WHERE id=?", (submission_id,),
+            ).fetchone()[0])
+            decision["resolutions"][0]["id"] = other_id
+            decision["resolutions"][0]["action"] = "map"
+            db.execute(
+                "UPDATE submissions SET taxonomy_decision_json=? WHERE id=?",
+                (json.dumps(decision), submission_id),
+            )
+    assert_backup_contract_rejects(source, tmp_path, "inconsistent taxonomy decision data")
+
+
+def test_backup_rejects_empty_existing_taxonomy_snapshot_name(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    _submission_id, category_id, _tag_id = approve_taxonomy_proposal(platform, user)
+    _token, context = platform.create_session(user["id"])
+    snapshot = {
+        "title": "Existing taxonomy",
+        "category": "",
+        "content_status": "draft",
+        "markdown": "# Existing taxonomy\n\nPublic body.\n",
+    }
+    preview = platform.create_preview(
+        context,
+        "_inbox/existing-taxonomy.md",
+        "r2",
+        "9" * 32,
+        snapshot_fingerprint(snapshot),
+        snapshot,
+        taxonomy_selection={
+            "category": {"kind": "existing", "id": category_id},
+            "tags": [],
+        },
+    )
+    with platform.connect() as db:
+        proposal = json.loads(db.execute(
+            "SELECT taxonomy_proposal_json FROM share_previews WHERE id=?", (preview["preview_id"],),
+        ).fetchone()[0])
+        proposal["category"]["name"] = "   "
+        db.execute(
+            "UPDATE share_previews SET taxonomy_proposal_json=? WHERE id=?",
+            (json.dumps(proposal), preview["preview_id"]),
+        )
+    assert_backup_contract_rejects(source, tmp_path, "invalid taxonomy proposal data")
 
 
 @pytest.mark.parametrize(
@@ -439,6 +802,14 @@ def test_backup_rejects_malformed_optional_application_tables(tmp_path: Path, da
             "idx_public_entries_source_article",
             "CREATE UNIQUE INDEX idx_public_entries_source_article "
             "ON public_entries(author_id,source_article_id) WHERE source_article_id IS NOT NULL",
+        ),
+        (
+            "idx_public_categories_normalized_name",
+            "CREATE UNIQUE INDEX idx_public_categories_normalized_name ON public_categories(name)",
+        ),
+        (
+            "idx_public_tags_normalized_name",
+            "CREATE INDEX idx_public_tags_normalized_name ON public_tags(normalized_name)",
         ),
     ],
 )
@@ -1696,12 +2067,12 @@ def test_backup_rejects_conflicting_public_category_slug_namespace(tmp_path: Pat
     platform, _user, _article, _raw = seed_instance(source)
     with platform.connect() as db:
         db.execute(
-            "INSERT INTO public_categories(id,slug,name,created_at,updated_at) VALUES(?,?,?,?,?)",
-            ("a" * 32, "reserved-slug", "Category A", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+            "INSERT INTO public_categories(id,slug,name,normalized_name,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            ("a" * 32, "reserved-slug", "Category A", "category a", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
         )
         db.execute(
-            "INSERT INTO public_categories(id,slug,name,created_at,updated_at) VALUES(?,?,?,?,?)",
-            ("b" * 32, "category-b", "Category B", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+            "INSERT INTO public_categories(id,slug,name,normalized_name,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            ("b" * 32, "category-b", "Category B", "category b", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
         )
         db.execute(
             "INSERT INTO public_category_slug_redirects(slug,category_id,created_at) VALUES(?,?,?)",

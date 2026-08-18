@@ -78,6 +78,27 @@ def context_for(app, client: Client):
     return app.platform.resolve_session(client.cookie.split("=", 1)[1])
 
 
+def public_taxonomy_payload(app) -> dict:
+    with app.platform.connect() as db:
+        row = db.execute(
+            "SELECT id FROM public_categories WHERE status='active' ORDER BY created_at LIMIT 1",
+        ).fetchone()
+        if row is None:
+            category_id = "f" * 32
+            timestamp = "2026-01-01T00:00:00+00:00"
+            db.execute("""
+                INSERT INTO public_categories(
+                    id,slug,name,normalized_name,description,status,sort_order,created_at,updated_at
+                ) VALUES(?,?,?,?,?,'active',0,?,?)
+            """, (category_id, "test-public", "Test Public", "test public", "", timestamp, timestamp))
+        else:
+            category_id = row["id"]
+    return {
+        "category_selection": {"kind": "existing", "id": category_id},
+        "tag_selections": [],
+    }
+
+
 def seed_article(app, client: Client, title: str = "Shared title") -> tuple[str, str]:
     context = context_for(app, client)
     root = app.platform.workspace_root(context.workspace_root_name)
@@ -123,6 +144,7 @@ def test_share_preview_rejects_private_or_unselected_public_sources(multi_server
     base_payload = {
         "article_path": path, "source_revision": article["revision"], "attribution": "nickname",
         "source_urls": ["http://127.0.0.1/private"],
+        **public_taxonomy_payload(app),
     }
     status, _ = author.request("POST", "/api/share-previews", base_payload, key="private-source")
     assert status == 422
@@ -201,6 +223,19 @@ def test_dynamic_category_article_and_reconciliation_ids_are_tenant_scoped(multi
     assert bob.request("POST", "/api/reconciliation/preview", {
         "reconciliation_id": reconciliation["id"], "decision": "adopt",
     }, key="cross-reconciliation")[0] == 404
+    for path, payload in (
+        ("/api/admin/public-categories", {"name": "Bypass category"}),
+        ("/api/admin/public-tags", {"name": "Bypass tag"}),
+        ("/api/admin/public-category-mappings", {"private_name": "Private"}),
+        (f"/api/admin/public-entries/{'f' * 32}/taxonomy", {"category_id": "f" * 32}),
+        (f"/api/admin/public-categories/{'f' * 32}/update", {
+            "slug": "cannot-create", "name": "Cannot Create", "description": "", "status": "active", "sort_order": 0,
+        }),
+        (f"/api/admin/public-tags/{'f' * 32}/update", {
+            "slug": "cannot-create", "name": "Cannot Create", "status": "active",
+        }),
+    ):
+        assert alice.request("POST", path, payload, key=f"removed-{path}")[0] == 404
 
 
 def test_logout_revoke_all_and_role_change_take_effect_immediately(multi_server):
@@ -225,6 +260,7 @@ def test_snapshot_ai_admin_publish_with_self_review_and_idor_guards(multi_server
 
     status, preview = alice.request("POST", "/api/share-previews", {
         "article_path": article_path, "source_revision": revision, "attribution": "nickname",
+        **public_taxonomy_payload(app),
     }, key="preview")
     assert status == 201
     assert "Article-ID" not in preview["snapshot"]["markdown"]
@@ -280,6 +316,7 @@ def test_snapshot_ai_admin_publish_with_self_review_and_idor_guards(multi_server
     changed = app.workspace_service(context).read_article(article_path)
     next_preview = alice.request("POST", "/api/share-previews", {
         "article_path": article_path, "source_revision": changed["revision"], "attribution": "nickname",
+        **public_taxonomy_payload(app),
     }, key="preview-v2")[1]
     next_submission = alice.request("POST", "/api/submissions", {"preview_id": next_preview["preview_id"]}, key="submit-v2")[1]
     update_pending = alice.request("GET", f"/api/article?path={article_path}")[1]["publication"]
@@ -305,6 +342,7 @@ def test_snapshot_ai_admin_publish_with_self_review_and_idor_guards(multi_server
     assert published["public_version"] == 2
     duplicate_status, _ = alice.request("POST", "/api/share-previews", {
         "article_path": article_path, "source_revision": changed["revision"], "attribution": "nickname",
+        **public_taxonomy_payload(app),
     }, key="duplicate-published-preview")
     assert duplicate_status == 409
 
@@ -321,6 +359,7 @@ def test_takedown_notifications_author_reapply_and_admin_relist(multi_server):
 
     preview = author.request("POST", "/api/share-previews", {
         "article_path": article_path, "source_revision": revision, "attribution": "nickname",
+        **public_taxonomy_payload(app),
     }, key="moderation-preview")[1]
     submission = author.request("POST", "/api/submissions", {
         "preview_id": preview["preview_id"],
@@ -354,6 +393,7 @@ def test_takedown_notifications_author_reapply_and_admin_relist(multi_server):
     assert removed_state["moderation_reason"] == "事实表述需要修正"
     unchanged_status = author.request("POST", "/api/share-previews", {
         "article_path": article_path, "source_revision": revision, "attribution": "nickname",
+        **public_taxonomy_payload(app),
     }, key="unchanged-relist")[0]
     assert unchanged_status == 409
     removed_rows = admin.request("GET", "/api/admin/public-entries?status=removed_by_admin")[1]
@@ -368,6 +408,7 @@ def test_takedown_notifications_author_reapply_and_admin_relist(multi_server):
     assert author.request("GET", f"/api/article?path={article_path}")[1]["publication"]["state"] == "relist_available"
     next_preview = author.request("POST", "/api/share-previews", {
         "article_path": article_path, "source_revision": changed["revision"], "attribution": "nickname",
+        **public_taxonomy_payload(app),
     }, key="relist-preview")[1]
     next_submission = author.request("POST", "/api/submissions", {
         "preview_id": next_preview["preview_id"],
@@ -452,7 +493,15 @@ def test_platform_ai_worker_reads_snapshot_only_and_recovers_to_admin_queue(tmp_
             time.sleep(0.02)
         result = platform.get_submission(context, submission["id"])
         assert result["status"] == "pending_admin"
-        assert seen == [snapshot]
+        assert seen == [{
+            "snapshot": {
+                "title": snapshot["title"],
+                "markdown": snapshot["markdown"],
+                "attribution": snapshot["attribution"],
+            },
+            "duplicate_candidates": [],
+        }]
+        assert "category" not in seen[0]["snapshot"]
         assert "article_path" not in seen[0] and "workspace_id" not in seen[0]
     finally:
         worker.close()

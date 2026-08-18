@@ -5,7 +5,6 @@ import {
   ArchiveIcon,
   BellIcon,
   CheckCircle2Icon,
-  FolderCogIcon,
   FilePenLineIcon,
   InboxIcon,
   ListTodoIcon,
@@ -16,12 +15,12 @@ import {
   ShieldCheckIcon,
   StoreIcon,
   WorkflowIcon,
-  ListChecksIcon,
   RefreshCcwDotIcon,
   UsersIcon,
 } from "lucide-react"
 
 import { apiGet, type ArticleSummary, type Category, type Notification, queryKeys } from "@/lib/api"
+import { CategoryGovernanceMenu } from "@/features/category-governance-menu"
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import {
@@ -49,8 +48,6 @@ import { WorkspaceSwitcher } from "@/features/workspace-switcher"
 
 const routes = [
   ["/inbox", "原料箱", InboxIcon, "wiki.write"],
-  ["/classification", "待归类", ListChecksIcon, "wiki.write"],
-  ["/categories", "分类管理", FolderCogIcon, "wiki.write"],
   ["/reconciliation", "文件对账", RefreshCcwDotIcon, "wiki.write"],
   ["/todo", "待写概念", ListTodoIcon, "wiki.write"],
   ["/health", "健康检查", CheckCircle2Icon, "wiki.read"],
@@ -70,7 +67,7 @@ export function WikiShell() {
   const [searchOpen, setSearchOpen] = useState(false)
   const { session, signOut, hasPermission } = useSession()
   const articles = useQuery({ queryKey: queryKeys.articles, queryFn: () => apiGet<ArticleSummary[]>("/api/articles") })
-  const categories = useQuery({ queryKey: queryKeys.categories, queryFn: () => apiGet<Category[]>("/api/categories") })
+  const categories = useQuery({ queryKey: [...queryKeys.categories, "all"], queryFn: () => apiGet<Category[]>("/api/categories?status=all") })
   const notifications = useQuery({ queryKey: queryKeys.notifications, queryFn: () => apiGet<Notification[]>("/api/notifications"), refetchInterval: 15000 })
   const unreadNotifications = notifications.data?.filter((item) => !item.read_at).length ?? 0
 
@@ -109,12 +106,12 @@ export function WikiShell() {
             <SidebarSeparator />
             {articles.isLoading ? (
               <div className="flex flex-col gap-3 p-4"><Skeleton className="h-7 w-full" /><Skeleton className="h-7 w-5/6" /><Skeleton className="h-7 w-full" /></div>
-            ) : categories.data?.map((category) => {
+            ) : categories.data?.filter((category) => category.status === "active").map((category) => {
               const rows = (articles.data ?? []).filter((article) => article.primary_category_id === category.category_id)
               if (!rows.length) return null
               return (
                 <SidebarGroup key={category.id}>
-                  <SidebarGroupLabel>{category.label}</SidebarGroupLabel>
+                  <SidebarGroupLabel className="flex items-center justify-between gap-2"><span className="truncate">{category.label}</span>{hasPermission("wiki.govern") && <CategoryGovernanceMenu category={category} />}</SidebarGroupLabel>
                   <SidebarGroupContent>
                     <SidebarMenu>
                       {rows.map((article) => (
@@ -134,12 +131,13 @@ export function WikiShell() {
                 </SidebarGroup>
               )
             })}
-            {(articles.data ?? []).some((article) => article.classification_status !== "confirmed") && (
+            {(articles.data ?? []).some((article) => !article.primary_category_id) && (
               <SidebarGroup>
-                <SidebarGroupLabel>待归类</SidebarGroupLabel>
-                <SidebarGroupContent><SidebarMenu>{(articles.data ?? []).filter((article) => article.classification_status !== "confirmed").map((article) => <SidebarMenuItem key={article.path}><SidebarMenuButton render={<Link to={articleHref(article.path)} />} isActive={location.pathname === articleHref(article.path)} tooltip={article.title}><FilePenLineIcon /><span>{article.title}</span></SidebarMenuButton><SidebarMenuBadge>待确认</SidebarMenuBadge></SidebarMenuItem>)}</SidebarMenu></SidebarGroupContent>
+                <SidebarGroupLabel>未分类</SidebarGroupLabel>
+                <SidebarGroupContent><SidebarMenu>{(articles.data ?? []).filter((article) => !article.primary_category_id).map((article) => <SidebarMenuItem key={article.path}><SidebarMenuButton render={<Link to={articleHref(article.path)} />} isActive={location.pathname === articleHref(article.path)} tooltip={article.title}><FilePenLineIcon /><span>{article.title}</span></SidebarMenuButton></SidebarMenuItem>)}</SidebarMenu></SidebarGroupContent>
               </SidebarGroup>
             )}
+            {hasPermission("wiki.govern") && categories.data?.some((category) => category.status === "archived") && <SidebarGroup><SidebarGroupLabel>已归档分类</SidebarGroupLabel><SidebarGroupContent><SidebarMenu>{categories.data.filter((category) => category.status === "archived").map((category) => <SidebarMenuItem key={category.category_id}><SidebarMenuButton tooltip={category.name}><ArchiveIcon /><span>{category.name}</span></SidebarMenuButton><CategoryGovernanceMenu category={category} /></SidebarMenuItem>)}</SidebarMenu></SidebarGroupContent></SidebarGroup>}
           </ScrollArea>
         </SidebarContent>
         <SidebarFooter className="border-t px-4 py-3 text-xs text-muted-foreground">

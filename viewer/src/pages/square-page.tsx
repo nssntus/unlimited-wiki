@@ -10,6 +10,7 @@ import {
   FlagIcon,
   FolderSearchIcon,
   HistoryIcon,
+  RotateCcwIcon,
   SearchIcon,
   SettingsIcon,
   ShieldCheckIcon,
@@ -26,6 +27,7 @@ import {
   queryKeys,
   REUSE_POLICY_TEXT,
   type CursorPage,
+  type AdminSquareState,
   type PublicCategory,
   type PublicCollection,
   type PublicCorrection,
@@ -427,11 +429,51 @@ export function SquareSearchPage() {
   )
 }
 
+function CategoryAdminMenu({ category }: { category: PublicCategory }) {
+  const { session } = useSession()
+  const client = useQueryClient()
+  const navigate = useNavigate()
+  const [open, setOpen] = useState(false)
+  const [name, setName] = useState(category.name)
+  const [slug, setSlug] = useState(category.slug || "")
+  const [description, setDescription] = useState(category.description || "")
+  const [mergeTarget, setMergeTarget] = useState("")
+  const [reason, setReason] = useState("")
+  const admin = useQuery({ queryKey: queryKeys.adminSquare, queryFn: () => apiGet<AdminSquareState>("/api/admin/square"), enabled: session?.user?.role === "admin" && open })
+  const refresh = async () => { await Promise.all([client.invalidateQueries({ queryKey: queryKeys.square }), client.invalidateQueries({ queryKey: queryKeys.adminSquare })]) }
+  const update = useMutation({ mutationFn: (status: "active" | "disabled") => apiPost(`/api/admin/public-categories/${category.id}/update`, { name, slug, description, status, sort_order: category.sort_order ?? 0 }), onSuccess: async (_value, status) => { await refresh(); toast.success(status === "active" ? "分类已更新" : "分类已归档"); setOpen(false); if (status === "disabled") navigate("/square/categories") }, onError: (error) => toast.error(error.message) })
+  const merge = useMutation({ mutationFn: () => apiPost(`/api/admin/public-categories/${category.id}/merge`, { target_id: mergeTarget, reason }), onSuccess: async () => { await refresh(); toast.success("分类已合并，旧地址继续跳转"); setOpen(false); const target = admin.data?.categories.find((item) => item.id === mergeTarget); if (target?.slug) navigate(`/square/categories/${target.slug}`) }, onError: (error) => toast.error(error.message) })
+  if (session?.user?.role !== "admin" || !category.id) return null
+  return <Dialog open={open} onOpenChange={setOpen}><DialogTrigger render={<Button variant="outline"><SettingsIcon />管理分类</Button>} /><DialogContent><DialogHeader><DialogTitle>管理公共分类</DialogTitle><DialogDescription>新分类只能随投稿批准创建；这里仅做低频重命名、归档或合并。</DialogDescription></DialogHeader><FieldGroup><Field><FieldLabel>名称</FieldLabel><Input value={name} onChange={(event) => setName(event.target.value)} /></Field><Field><FieldLabel>Slug</FieldLabel><Input value={slug} onChange={(event) => setSlug(event.target.value)} /></Field><Field><FieldLabel>说明</FieldLabel><Input value={description} onChange={(event) => setDescription(event.target.value)} /></Field><Field><FieldLabel>合并到</FieldLabel><Select value={mergeTarget} onValueChange={(value) => setMergeTarget(value ?? "")}><SelectTrigger className="w-full"><SelectValue placeholder="可选" /></SelectTrigger><SelectContent><SelectGroup>{admin.data?.categories.filter((item) => item.status === "active" && item.id !== category.id).map((item) => item.id && <SelectItem key={item.id} value={item.id}>{item.name}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>{mergeTarget && <Field><FieldLabel>合并理由</FieldLabel><Input value={reason} onChange={(event) => setReason(event.target.value)} /></Field>}</FieldGroup><DialogFooter className="flex-wrap"><Button variant="destructive" disabled={update.isPending} onClick={() => update.mutate("disabled")}>归档</Button>{mergeTarget && <Button variant="outline" disabled={!reason.trim() || merge.isPending} onClick={() => merge.mutate()}>合并</Button>}<Button disabled={!name || !slug || update.isPending} onClick={() => update.mutate("active")}>保存</Button></DialogFooter></DialogContent></Dialog>
+}
+
 export function PublicCategoriesPage() {
+  const { session } = useSession()
+  const client = useQueryClient()
   const categories = useQuery({
     queryKey: queryKeys.publicCategories,
     queryFn: () => apiGet<PublicCategory[]>("/api/public/categories"),
   })
+  const admin = useQuery({
+    queryKey: queryKeys.adminSquare,
+    queryFn: () => apiGet<AdminSquareState>("/api/admin/square"),
+    enabled: session?.user?.role === "admin",
+  })
+  const restore = useMutation({
+    mutationFn: (category: AdminSquareState["categories"][number]) => apiPost(
+      `/api/admin/public-categories/${category.id}/update`,
+      { name: category.name, slug: category.slug, description: category.description || "", status: "active", sort_order: category.sort_order ?? 0 },
+    ),
+    onSuccess: async () => {
+      await Promise.all([
+        client.invalidateQueries({ queryKey: queryKeys.square }),
+        client.invalidateQueries({ queryKey: queryKeys.adminSquare }),
+      ])
+      toast.success("分类已恢复")
+    },
+    onError: (error) => toast.error(error.message),
+  })
+  const archived = admin.data?.categories.filter((category) => category.status === "disabled") ?? []
   return (
     <main className="mx-auto max-w-5xl px-4 py-10">
       <p className="text-sm font-medium text-primary">公共知识体系</p>
@@ -462,6 +504,7 @@ export function PublicCategoriesPage() {
           ))}
         </div>
       )}
+      {session?.user?.role === "admin" && archived.length > 0 && <section className="mt-12 border-t pt-8"><h2 className="text-sm font-semibold">已归档分类</h2><p className="mt-2 text-sm text-muted-foreground">仅 Admin 可见。恢复后会重新进入公共导航和投稿选择器。</p><div className="mt-4 divide-y border-y">{archived.map((category) => <div key={category.id} className="flex flex-wrap items-center justify-between gap-3 py-4"><div><p className="font-medium">{category.name}</p><p className="text-xs text-muted-foreground">{category.slug}</p></div><Button size="sm" variant="outline" disabled={restore.isPending} onClick={() => restore.mutate(category)}><RotateCcwIcon data-icon="inline-start" />恢复</Button></div>)}</div></section>}
     </main>
   )
 }
@@ -494,7 +537,7 @@ export function PublicCategoryPage() {
   return (
     <main className="mx-auto max-w-5xl px-4 py-10">
       <p className="text-sm font-medium text-primary">公共分类</p>
-      <h1 className="mt-2 text-3xl font-semibold">{category.data.name}</h1>
+      <div className="mt-2 flex flex-wrap items-center justify-between gap-3"><h1 className="text-3xl font-semibold">{category.data.name}</h1><CategoryAdminMenu category={category.data} /></div>
       <p className="mt-3 max-w-2xl text-muted-foreground">
         {category.data.description}
       </p>
@@ -898,7 +941,7 @@ export function PublicEntryPage() {
     onSuccess: (result) => {
       setImportOpen(false)
       void client.invalidateQueries({ queryKey: queryKeys.publicEntry(id) })
-      toast.success("已收入当前 Wiki 的待归类区")
+      toast.success("已收入当前 Wiki 的未分类区")
       window.location.hash = `#/${result.article.path}`
     },
     onError: async (error) => {
