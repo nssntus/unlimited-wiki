@@ -153,7 +153,7 @@ class WikiApp:
         if self.platform is not None:
             self._reconcile_workspace_storage_states()
         self.review_worker = PlatformReviewWorker(
-            self.platform, self.platform_reviewer, self.deployment.review_settings,
+            self.platform, self.platform_reviewer,
         ) if self.platform is not None and self.start_worker else None
         start_public_index = self.start_worker if self.start_public_index_worker is None else self.start_public_index_worker
         self.public_index_worker = PublicIndexWorker(self.platform) if self.platform is not None and start_public_index else None

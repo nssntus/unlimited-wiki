@@ -507,7 +507,7 @@ def test_platform_ai_worker_reads_snapshot_only_and_recovers_to_admin_queue(tmp_
         worker.close()
 
 
-def test_platform_ai_uses_platform_model_without_private_workspace_access(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_platform_ai_uses_submitter_workspace_model_without_cross_tenant_access(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     platform = PlatformStore(tmp_path)
     alice, _ = platform.register("alice@example.com", "Alice", "correct-horse-123")
     bob, _ = platform.register("bob@example.com", "Bob", "correct-horse-123")
@@ -527,11 +527,7 @@ def test_platform_ai_uses_platform_model_without_private_workspace_access(tmp_pa
         return {"decision": "pass", "summary": "accepted"}
 
     monkeypatch.setattr(platform_review, "default_reviewer", fake_review)
-    platform_settings = {
-        "provider": "openai-compatible", "base_url": "https://review.example/v1",
-        "api_key": "platform-review-key", "model": "platform-review-model",
-    }
-    worker = PlatformReviewWorker(platform, settings=platform_settings)
+    worker = PlatformReviewWorker(platform)
     try:
         deadline = time.time() + 2
         while time.time() < deadline and platform.get_submission(bob_context, submission["id"])["status"] != "pending_admin":
@@ -539,11 +535,62 @@ def test_platform_ai_uses_platform_model_without_private_workspace_access(tmp_pa
         assert platform.get_submission(bob_context, submission["id"])["status"] == "pending_admin"
         assert captured["snapshot"]["snapshot"] == snapshot
         assert captured["snapshot"]["duplicate_candidates"] == []
-        assert captured["settings"]["api_key"] == "platform-review-key"
-        assert captured["settings"]["model"] == "platform-review-model"
+        assert captured["settings"]["api_key"] == "bob-key"
+        assert captured["settings"]["model"] == "bob-model"
         serialized = json.dumps(captured, ensure_ascii=False)
-        assert "alice-key" not in serialized and "bob-key" not in serialized
+        assert "alice-key" not in serialized
         assert "private/bob.md" not in serialized and bob_context.workspace_id not in serialized
+        with platform.connect() as db:
+            attempt = db.execute(
+                "SELECT provider,model,report_json FROM submission_review_attempts WHERE submission_id=?",
+                (submission["id"],),
+            ).fetchone()
+        assert attempt["provider"] == "openai-compatible"
+        assert attempt["model"] == "bob-model"
+        assert "bob-key" not in attempt["report_json"]
+        assert "bob.example" not in attempt["report_json"]
+    finally:
+        worker.close()
+
+
+def test_platform_ai_retry_reads_latest_submitter_workspace_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    platform = PlatformStore(tmp_path)
+    user, _ = platform.register("owner@example.com", "Owner", "correct-horse-123")
+    platform.save_model(
+        user["workspace_id"], "openai-compatible", "https://old.example/v1", "old-key", "old-model",
+    )
+    _token, context = platform.create_session(user["id"])
+    snapshot = {"title": "Retry candidate", "markdown": "# Retry candidate\n\nBody"}
+    preview = platform.create_preview(
+        context, "private/retry.md", "rev-retry", "c" * 32, snapshot_fingerprint(snapshot), snapshot,
+    )
+    submission = platform.submit_preview(context, preview["preview_id"])
+    seen_models: list[str] = []
+
+    def fake_review(_value, settings):
+        seen_models.append(settings["model"])
+        if len(seen_models) == 1:
+            return {"decision": "failed", "summary": "retry"}
+        return {"decision": "pass", "summary": "accepted"}
+
+    monkeypatch.setattr(platform_review, "default_reviewer", fake_review)
+    worker = PlatformReviewWorker(platform)
+    try:
+        deadline = time.time() + 2
+        while time.time() < deadline and platform.get_submission(context, submission["id"])["status"] != "ai_failed":
+            time.sleep(0.02)
+        assert platform.get_submission(context, submission["id"])["status"] == "ai_failed"
+
+        platform.save_model(
+            user["workspace_id"], "openai-compatible", "https://new.example/v1", "new-key", "new-model",
+        )
+        platform.retry_ai(context, submission["id"])
+        worker.wake()
+        deadline = time.time() + 2
+        while time.time() < deadline and platform.get_submission(context, submission["id"])["status"] != "pending_admin":
+            time.sleep(0.02)
+        assert platform.get_submission(context, submission["id"])["status"] == "pending_admin"
+        assert seen_models == ["old-model", "new-model"]
     finally:
         worker.close()
 

@@ -2479,6 +2479,7 @@ class PlatformStore(SquareMixin):
             ))
         return {
             "id": claimed["id"], "attempt": claimed["review_attempt"],
+            "workspace_id": claimed["workspace_id"],
             "review_input": {"snapshot": review_snapshot, "duplicate_candidates": review_candidates},
             "content_hash": claimed["content_hash"],
         }
