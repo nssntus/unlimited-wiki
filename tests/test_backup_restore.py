@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import os
 import sqlite3
 import stat
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import backup_restore
 from backup_restore import (
@@ -267,9 +269,86 @@ def test_backup_verify_and_restore_round_trip(tmp_path: Path):
     assert restored.authenticate("owner@example.com", "correct-horse-123") is not None
     assert restored.load_model(user["workspace_id"])["api_key"] == "secret-key"
     with restored.connect() as db:
+        assert db.execute(
+            "SELECT encryption_version FROM model_settings WHERE workspace_id=?", (user["workspace_id"],),
+        ).fetchone()[0] == 2
         assert db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
         assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert db.execute("PRAGMA foreign_key_check").fetchone() is None
+
+
+@pytest.mark.parametrize(
+    "corruption", ["bad_ciphertext", "cross_workspace", "wrong_master_key", "swapped_fields"],
+)
+def test_backup_rejects_model_settings_that_do_not_match_key_workspace_and_field(
+    tmp_path: Path, corruption: str,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    with platform.connect() as db:
+        if corruption == "bad_ciphertext":
+            db.execute(
+                "UPDATE model_settings SET api_key_enc='broken' WHERE workspace_id=?", (user["workspace_id"],),
+            )
+        elif corruption == "swapped_fields":
+            row = db.execute(
+                "SELECT base_url_enc,api_key_enc FROM model_settings WHERE workspace_id=?", (user["workspace_id"],),
+            ).fetchone()
+            db.execute(
+                "UPDATE model_settings SET base_url_enc=?,api_key_enc=? WHERE workspace_id=?",
+                (row["api_key_enc"], row["base_url_enc"], user["workspace_id"]),
+            )
+        elif corruption == "cross_workspace":
+            other, _ = platform.register("other@example.com", "Other", "correct-horse-123")
+            platform.save_model(
+                other["workspace_id"], "openai-compatible", "https://other.example/v1", "other-key", "other-model",
+            )
+            other_cipher = db.execute(
+                "SELECT base_url_enc FROM model_settings WHERE workspace_id=?", (other["workspace_id"],),
+            ).fetchone()[0]
+            db.execute(
+                "UPDATE model_settings SET base_url_enc=? WHERE workspace_id=?",
+                (other_cipher, user["workspace_id"]),
+            )
+    if corruption == "wrong_master_key":
+        (source / ".platform" / "master.key").write_bytes(b"x" * 32)
+    assert_backup_contract_rejects(source, tmp_path, "invalid encrypted model settings")
+
+
+def test_legacy_model_ciphertext_backup_restores_and_migrates_to_field_bound_aad(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    workspace_id = seed_minimum_legacy_instance(source)
+    key = (source / ".platform" / "master.key").read_bytes()
+    cipher = AESGCM(key)
+
+    def legacy_encrypt(value: str) -> str:
+        nonce = b"n" * 12
+        encrypted = cipher.encrypt(
+            nonce, value.encode("utf-8"), f"workspace:{workspace_id}:model".encode("utf-8"),
+        )
+        return base64.urlsafe_b64encode(nonce + encrypted).decode("ascii")
+
+    with sqlite3.connect(source / ".platform" / "platform.sqlite3") as db:
+        db.execute(
+            "INSERT INTO model_settings VALUES(?,?,?,?,?,?)",
+            (
+                workspace_id, "openai-compatible", legacy_encrypt("https://legacy.example/v1"),
+                legacy_encrypt("legacy-key"), "legacy-model", "2026-01-01T00:00:00+00:00",
+            ),
+        )
+    backup = tmp_path / "legacy-backup"
+    create_backup(source, backup)
+    verify_backup(backup)
+    target = tmp_path / "target"
+    restore_backup(backup, target)
+    restored = PlatformStore(target)
+    assert restored.load_model(workspace_id)["api_key"] == "legacy-key"
+    with restored.connect() as db:
+        assert db.execute(
+            "SELECT encryption_version FROM model_settings WHERE workspace_id=?", (workspace_id,),
+        ).fetchone()[0] == 2
 
 
 def test_backup_accepts_normal_merged_public_category(tmp_path: Path):

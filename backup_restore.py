@@ -19,7 +19,11 @@ import pwd
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from model_crypto import MODEL_ENCRYPTION_VERSION, decrypt_model_value
 from platform_store import SUBMISSION_STATES
 from square_v2 import normalize_taxonomy_name, taxonomy_normalized_key
 
@@ -813,6 +817,7 @@ def _check_application_schema(db: sqlite3.Connection, path: Path) -> list[str]:
         if not expected_unique_keys.issubset(actual_unique_keys):
             raise RuntimeError(f"{label} SQLite schema is missing a unique constraint: {table}")
     if anchors is PLATFORM_SCHEMA_ANCHORS:
+        _check_encrypted_model_settings(db, path)
         _check_taxonomy_storage(db)
         meta_table = db.execute(
             "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='public_search_meta'",
@@ -864,6 +869,47 @@ def _check_application_schema(db: sqlite3.Connection, path: Path) -> list[str]:
                     raise RuntimeError("platform SQLite has invalid public index jobs") from None
         return _check_platform_correctness_indexes(db)
     return []
+
+
+def _check_encrypted_model_settings(db: sqlite3.Connection, path: Path) -> None:
+    if path.parent.name != ".platform":
+        return
+    try:
+        key = (path.parent / "master.key").read_bytes()
+        if len(key) != 32:
+            raise ValueError
+        cipher = AESGCM(key)
+        columns = {str(row[1]) for row in db.execute("PRAGMA table_info(model_settings)")}
+        current_schema = "encryption_version" in columns
+        version_expression = "encryption_version" if current_schema else "1"
+        rows = db.execute(f"""
+            SELECT workspace_id,provider,base_url_enc,api_key_enc,model,
+                   {version_expression} encryption_version,
+                   typeof({version_expression}) encryption_version_type
+            FROM model_settings
+        """).fetchall()
+        for row in rows:
+            version = int(row[5])
+            if current_schema and (row[6] != "integer" or version != MODEL_ENCRYPTION_VERSION):
+                raise ValueError
+            base_url = decrypt_model_value(
+                cipher, str(row[2]), workspace_id=str(row[0]), field="base_url", version=version,
+            )
+            api_key = decrypt_model_value(
+                cipher, str(row[3]), workspace_id=str(row[0]), field="api_key", version=version,
+            )
+            parsed = urlsplit(base_url)
+            if (
+                row[1] not in {"openai", "deepseek", "ollama", "openai-compatible"}
+                or not base_url or len(base_url) > 2048
+                or parsed.scheme not in {"http", "https"} or not parsed.netloc
+                or parsed.username is not None or parsed.password is not None
+                or not isinstance(row[4], str) or not row[4] or len(row[4]) > 200
+                or len(api_key) > 8192
+            ):
+                raise ValueError
+    except Exception as exc:
+        raise RuntimeError("platform SQLite has invalid encrypted model settings") from exc
 
 
 def _exercise_session_revocation(db: sqlite3.Connection, *, commit: bool) -> None:

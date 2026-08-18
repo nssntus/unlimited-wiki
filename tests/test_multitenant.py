@@ -595,6 +595,164 @@ def test_platform_ai_retry_reads_latest_submitter_workspace_model(tmp_path: Path
         worker.close()
 
 
+def test_platform_ai_bad_workspace_cipher_fails_one_attempt_and_worker_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    platform = PlatformStore(tmp_path)
+    broken_user, _ = platform.register("broken@example.com", "Broken", "correct-horse-123")
+    healthy_user, _ = platform.register("healthy@example.com", "Healthy", "correct-horse-123")
+    platform.save_model(
+        broken_user["workspace_id"], "openai-compatible", "https://broken.example/v1", "broken-key", "broken-model",
+    )
+    platform.save_model(
+        healthy_user["workspace_id"], "openai-compatible", "https://healthy.example/v1", "healthy-key", "healthy-model",
+    )
+    _token, broken_context = platform.create_session(broken_user["id"])
+    _token, healthy_context = platform.create_session(healthy_user["id"])
+
+    def submit(context, title, article_id):
+        snapshot = {"title": title, "markdown": f"# {title}\n\nBody"}
+        preview = platform.create_preview(
+            context, f"private/{title}.md", f"rev-{title}", article_id, snapshot_fingerprint(snapshot), snapshot,
+        )
+        return platform.submit_preview(context, preview["preview_id"])
+
+    broken = submit(broken_context, "broken", "d" * 32)
+    healthy = submit(healthy_context, "healthy", "e" * 32)
+    with platform.connect() as db:
+        db.execute(
+            "UPDATE model_settings SET api_key_enc='not-valid-ciphertext' WHERE workspace_id=?",
+            (broken_user["workspace_id"],),
+        )
+    monkeypatch.setattr(
+        platform_review, "default_reviewer", lambda _value, _settings: {"decision": "pass", "summary": "ok"},
+    )
+    worker = PlatformReviewWorker(platform)
+    try:
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            broken_state = platform.get_submission(broken_context, broken["id"])["status"]
+            healthy_state = platform.get_submission(healthy_context, healthy["id"])["status"]
+            if broken_state == "ai_failed" and healthy_state == "pending_admin":
+                break
+            time.sleep(0.02)
+        assert broken_state == "ai_failed"
+        assert healthy_state == "pending_admin"
+        assert worker._thread.is_alive()
+        with platform.connect() as db:
+            attempt = db.execute(
+                "SELECT * FROM submission_review_attempts WHERE submission_id=?", (broken["id"],),
+            ).fetchone()
+        assert attempt["status"] == "ai_failed"
+        assert attempt["provider"] == "openai-compatible" and attempt["model"] == "broken-model"
+        assert attempt["policy_version"] and attempt["rules_version"] and attempt["completed_at"]
+        assert "not-valid-ciphertext" not in attempt["report_json"]
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize("secret_field", ["summary", "extra", "issue"])
+def test_platform_ai_rejects_workspace_secret_echo_before_persistence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, secret_field: str,
+):
+    platform = PlatformStore(tmp_path)
+    admin, _ = platform.register("admin@example.com", "Admin", "correct-horse-123")
+    author, _ = platform.register("author@example.com", "Author", "correct-horse-123")
+    base_url, api_key = "https://private-model.example/v1", "private-api-key-value"
+    platform.save_model(author["workspace_id"], "openai-compatible", base_url, api_key, "private-model")
+    _token, admin_context = platform.create_session(admin["id"])
+    _token, author_context = platform.create_session(author["id"])
+    snapshot = {"title": "Secret echo", "markdown": "# Secret echo\n\nBody"}
+    preview = platform.create_preview(
+        author_context, "private/echo.md", "rev-echo", "f" * 32, snapshot_fingerprint(snapshot), snapshot,
+    )
+    submission = platform.submit_preview(author_context, preview["preview_id"])
+
+    def malicious(_value, _settings):
+        result = {"decision": "pass", "summary": "looks safe", "issues": []}
+        if secret_field == "summary":
+            result["summary"] = f"credential={api_key}"
+        elif secret_field == "extra":
+            result["extra"] = {"nested": [base_url]}
+        else:
+            result["issues"] = [{"code": "echo", "location": base_url, "explanation": api_key}]
+        return result
+
+    monkeypatch.setattr(platform_review, "default_reviewer", malicious)
+    worker = PlatformReviewWorker(platform)
+    try:
+        deadline = time.time() + 2
+        while time.time() < deadline and platform.get_submission(author_context, submission["id"])["status"] != "ai_failed":
+            time.sleep(0.02)
+        author_view = platform.get_submission(author_context, submission["id"])
+        admin_view = platform.admin_get(admin_context, submission["id"])
+        with platform.connect() as db:
+            stored = db.execute(
+                "SELECT ai_report_json FROM submissions WHERE id=?", (submission["id"],),
+            ).fetchone()[0]
+            attempt = db.execute(
+                "SELECT * FROM submission_review_attempts WHERE submission_id=?", (submission["id"],),
+            ).fetchone()
+        serialized = json.dumps([author_view, admin_view, stored, dict(attempt)], ensure_ascii=False)
+        assert author_view["status"] == "ai_failed"
+        assert api_key not in serialized and base_url not in serialized
+        assert attempt["provider"] == "openai-compatible" and attempt["model"] == "private-model"
+        assert attempt["policy_version"] and attempt["rules_version"]
+        assert set(json.loads(stored)) == {
+            "decision", "summary", "issues", "policy_version", "provider", "model", "rules_version",
+        }
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize("action,expected", [("suspend", "ai_failed"), ("delete", "withdrawn")])
+def test_workspace_lifecycle_fences_claimed_ai_review(tmp_path: Path, action: str, expected: str):
+    platform = PlatformStore(tmp_path)
+    user, _ = platform.register("owner@example.com", "Owner", "correct-horse-123")
+    token, personal_context = platform.create_session(user["id"])
+    team = platform.create_team(personal_context, "Review Team")
+    team_context = platform.switch_workspace(token, personal_context, team["id"])
+    platform.save_model(team["id"], "openai-compatible", "https://team.example/v1", "team-key", "team-model")
+    snapshot = {"title": "Lifecycle", "markdown": "# Lifecycle\n\nBody"}
+    preview = platform.create_preview(
+        team_context, "private/lifecycle.md", "rev-lifecycle", "1" * 32,
+        snapshot_fingerprint(snapshot), snapshot,
+    )
+    submission = platform.submit_preview(team_context, preview["preview_id"])
+    claimed = platform.claim_ai_submission()
+    assert claimed and claimed["id"] == submission["id"]
+    queued_snapshot = {"title": "Queued lifecycle", "markdown": "# Queued lifecycle\n\nBody"}
+    queued_preview = platform.create_preview(
+        team_context, "private/queued-lifecycle.md", "rev-queued", "2" * 32,
+        snapshot_fingerprint(queued_snapshot), queued_snapshot,
+    )
+    queued = platform.submit_preview(team_context, queued_preview["preview_id"])
+    platform.change_workspace_lifecycle(team_context, team["id"], "suspend")
+    if action == "delete":
+        platform.change_workspace_lifecycle(team_context, team["id"], "delete")
+    stale = platform.ai_decide(
+        submission["id"], "pass",
+        {
+            "summary": "late", "issues": [], "policy_version": platform_review.REVIEW_POLICY_VERSION,
+            "provider": "openai-compatible", "model": "team-model",
+            "rules_version": platform_review.REVIEW_POLICY_VERSION,
+        },
+        expected_attempt=claimed["attempt"],
+    )
+    assert stale["stale"] is True
+    with platform.connect() as db:
+        row = db.execute("SELECT status FROM submissions WHERE id=?", (submission["id"],)).fetchone()
+        queued_row = db.execute("SELECT status FROM submissions WHERE id=?", (queued["id"],)).fetchone()
+        attempt = db.execute(
+            "SELECT status,completed_at FROM submission_review_attempts WHERE submission_id=?",
+            (submission["id"],),
+        ).fetchone()
+    assert row["status"] == expected
+    assert queued_row["status"] == expected
+    assert attempt["status"] == "ai_failed" and attempt["completed_at"]
+    assert platform.claim_ai_submission() is None
+
+
 @pytest.mark.parametrize("content", [
     '```json\n{"decision":"pass","summary":"ok","issues":[]}\n```',
     '<think>internal review</think>\n{"decision":"needs_revision","summary":"fix it","issues":[]}',
