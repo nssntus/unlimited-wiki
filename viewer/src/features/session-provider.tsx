@@ -18,6 +18,7 @@ type SwitchState =
   | { kind: "error"; target: string | null; message: string }
 
 const UNCOMMITTED_SWITCH_STATUSES = new Set([400, 403, 404, 422])
+const ACCOUNT_LEVEL_PATHS = new Set(["/admin/curation"])
 
 export function SessionProvider({ children }: { children: ReactNode }) {
   const client = useQueryClient()
@@ -143,11 +144,12 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     return () => setWorkspaceUnavailableHandler(null)
   })
   const value = { session: query.data, loading: query.isLoading, signOut, switchWorkspace, reconcileWorkspace, changeWorkspaceLifecycle, switchingWorkspace, hasPermission }
+  const workspaceOptional = location.pathname.startsWith("/square") || ACCOUNT_LEVEL_PATHS.has(location.pathname)
   const content = switchState.kind !== "idle"
     ? switchState.kind === "error"
       ? <WorkspaceSwitchGate error={switchState.message} onRetry={retryWorkspaceConfirmation} />
       : <WorkspaceSwitchGate />
-    : query.data?.authenticated && (!query.data.workspace || query.data.workspace_selection_required) && !location.pathname.startsWith("/square")
+    : query.data?.authenticated && (!query.data.workspace || query.data.workspace_selection_required) && !workspaceOptional
       ? <WorkspaceSelectionGate onSwitch={switchWorkspace} onLifecycle={changeWorkspaceLifecycle} onSignOut={signOut} />
       : children
   return <SessionContext.Provider value={value}>{content}</SessionContext.Provider>

@@ -1185,6 +1185,96 @@ def test_category_slug_redirect_merge_mapping_and_revision_taxonomy(square):
     assert store.get_public_v2(unmapped["public_entry_id"])["category"]["id"] == other["id"]
 
 
+def test_admin_assigns_or_creates_category_for_uncategorized_public_entries(square):
+    store, context, category, _tag = square
+    first = _publish(
+        store, context, _snapshot("Needs category", "Body"),
+        article_id="31" * 16, source_revision="r1",
+    )
+    first_id = first["public_entry_id"]
+    with store.connect() as db:
+        db.execute("DELETE FROM public_search_documents WHERE entry_id=?", (first_id,))
+        db.execute("DELETE FROM public_search_fts WHERE entry_id=?", (first_id,))
+    assert [item["id"] for item in store.admin_square_state(context)["uncategorized_entries"]] == [first_id]
+
+    assigned = store.admin_assign_public_category(
+        context, first_id, {"kind": "existing", "id": category["id"]}, "Legacy cleanup",
+    )
+    assert assigned["category"]["id"] == category["id"]
+    assert assigned["resolution_action"] == "accept"
+    assert store.admin_square_state(context)["uncategorized_entries"] == []
+    assert store.get_public_v2(first_id)["category"]["id"] == category["id"]
+    assert store.public_versions(first_id)[0]["category"]["id"] is None
+    with store.connect() as db:
+        audit = db.execute(
+            "SELECT detail_json FROM audit_events WHERE action='public_entry.category_assign' AND object_id=?",
+            (first_id,),
+        ).fetchone()
+    assert json.loads(audit["detail_json"])["reason"] == "Legacy cleanup"
+
+    second = _publish(
+        store, context, _snapshot("Create category", "Body"),
+        article_id="32" * 16, source_revision="r1",
+    )
+    created = store.admin_assign_public_category(
+        context, second["public_entry_id"], {"kind": "create", "name": "Ｃａｆé"}, "New taxonomy",
+    )
+    third = _publish(
+        store, context, _snapshot("Reuse category", "Body"),
+        article_id="33" * 16, source_revision="r1",
+    )
+    reused = store.admin_assign_public_category(
+        context, third["public_entry_id"], {"kind": "create", "name": "Cafe\u0301"}, "Reuse taxonomy",
+    )
+    assert created["category"]["id"] == reused["category"]["id"]
+    with store.connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM public_categories WHERE normalized_name=?", ("café",),
+        ).fetchone()[0] == 1
+
+
+def test_admin_category_assignment_is_fail_closed_and_concurrent(square):
+    store, context, category, _tag = square
+    blocked = _publish(
+        store, context, _snapshot("Blocked category", "Body"),
+        article_id="41" * 16, source_revision="r1",
+    )
+    store.admin_upsert_category(
+        context, category["id"], category["slug"], category["name"], "", "disabled", 0,
+    )
+    with pytest.raises(ValueError, match="disabled"):
+        store.admin_assign_public_category(
+            context, blocked["public_entry_id"], {"kind": "create", "name": category["name"]}, "Should fail",
+        )
+    assert store.get_public_v2(blocked["public_entry_id"])["category"]["id"] is None
+
+    race = _publish(
+        store, context, _snapshot("Concurrent category", "Body"),
+        article_id="42" * 16, source_revision="r1",
+    )
+    before = len(store.admin_square_state(context)["categories"])
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def assign(name: str) -> None:
+        barrier.wait()
+        try:
+            store.admin_assign_public_category(
+                context, race["public_entry_id"], {"kind": "create", "name": name}, "Concurrent cleanup",
+            )
+            outcomes.append("ok")
+        except FileNotFoundError:
+            outcomes.append("stale")
+
+    threads = [threading.Thread(target=assign, args=(name,)) for name in ("Alpha Queue", "Beta Queue")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert sorted(outcomes) == ["ok", "stale"]
+    assert len(store.admin_square_state(context)["categories"]) == before + 1
+
+
 def test_public_review_issues_are_allowlisted_without_model_text(square):
     store, context, category, _tag = square
     snapshot = _snapshot("Review projection", "Visible", category_id=category["id"])

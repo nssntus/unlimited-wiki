@@ -250,6 +250,89 @@ def test_logout_revoke_all_and_role_change_take_effect_immediately(multi_server)
     assert alice.request("GET", "/api/articles")[0] == 401
 
 
+def test_admin_assigns_uncategorized_public_entry_without_current_workspace(multi_server):
+    app, base = multi_server
+    admin, member = Client(base), Client(base)
+    assert admin.register("taxonomy-admin@example.com", "Taxonomy Admin")[0] == 201
+    assert member.register("taxonomy-member@example.com", "Taxonomy Member")[0] == 201
+    context = context_for(app, admin)
+    snapshot = {
+        "title": "Legacy uncategorized entry",
+        "category": "private-only",
+        "content_status": "词条",
+        "markdown": "# Legacy uncategorized entry\n\nPublic body.\n",
+        "summary": "Needs a public category",
+        "attribution": "Taxonomy Admin",
+        "source_summaries": [],
+        "square": {},
+    }
+    preview = app.platform.create_preview(
+        context, "concepts/legacy-taxonomy.md", "r1", "7" * 32,
+        snapshot_fingerprint(snapshot), snapshot,
+    )
+    submission = app.platform.submit_preview(context, preview["preview_id"])
+    app.platform.ai_decide(submission["id"], "pass", {"summary": "ok", "issues": []})
+    published = app.platform.admin_decide(context, submission["id"], "approve", "Legacy approval")
+    entry_id = published["public_entry_id"]
+
+    status, state = admin.request("GET", "/api/admin/square")
+    assert status == 200
+    assert [item["id"] for item in state["uncategorized_entries"]] == [entry_id]
+    assert member.request(
+        "POST", f"/api/admin/public-entries/{entry_id}/category-assignment",
+        {"category": {"kind": "create", "name": "Member Bypass"}, "reason": "No"},
+        key="member-category-bypass",
+    )[0] == 403
+
+    with app.platform.connect() as db:
+        db.execute("UPDATE sessions SET current_workspace_id=NULL WHERE user_id=?", (context.user_id,))
+    assert admin.request("GET", "/api/auth/session")[1]["workspace_selection_required"] is True
+    assert admin.request("GET", "/api/admin/square")[0] == 200
+    assigned_status, assigned = admin.request(
+        "POST", f"/api/admin/public-entries/{entry_id}/category-assignment",
+        {"category": {"kind": "create", "name": "Instant Public Category"}, "reason": "Resolve legacy queue"},
+        key="admin-category-create",
+    )
+    assert assigned_status == 200
+    assert assigned["category"]["name"] == "Instant Public Category"
+    assert admin.request("GET", "/api/admin/square")[1]["uncategorized_entries"] == []
+    assert app.platform.get_public_v2(entry_id)["category"]["id"] == assigned["category"]["id"]
+
+    existing_snapshot = {**snapshot, "title": "Existing category selection"}
+    existing_preview = app.platform.create_preview(
+        context, "concepts/existing-public-taxonomy.md", "r1", "8" * 32,
+        snapshot_fingerprint(existing_snapshot), existing_snapshot,
+    )
+    existing_submission = app.platform.submit_preview(context, existing_preview["preview_id"])
+    app.platform.ai_decide(existing_submission["id"], "pass", {"summary": "ok", "issues": []})
+    existing_entry = app.platform.admin_decide(
+        context, existing_submission["id"], "approve", "Legacy approval",
+    )["public_entry_id"]
+    existing_status, existing_result = admin.request(
+        "POST", f"/api/admin/public-entries/{existing_entry}/category-assignment",
+        {"category": {"kind": "existing", "id": assigned["category"]["id"]}, "reason": "Use existing"},
+        key="admin-category-existing",
+    )
+    assert existing_status == 200
+    assert existing_result["category"]["id"] == assigned["category"]["id"]
+    collection_status, collection = admin.request(
+        "POST", "/api/admin/public-collections",
+        {
+            "slug": "workspace-free-curation", "title": "Workspace-free curation",
+            "description": "Account-level Admin flow", "status": "published",
+            "items": [{"entry_id": existing_entry}], "reason": "Verify account scope",
+        },
+        key="admin-account-collection",
+    )
+    assert collection_status == 200
+    assert collection["title"] == "Workspace-free curation"
+    assert admin.request(
+        "POST", f"/api/admin/public-entries/{entry_id}/category-assignment",
+        {"category": {"kind": "create", "name": "Second Category"}, "reason": "Must not overwrite"},
+        key="admin-category-stale",
+    )[0] == 404
+
+
 def test_snapshot_ai_admin_publish_with_self_review_and_idor_guards(multi_server):
     app, base = multi_server
     alice, bob = Client(base), Client(base)

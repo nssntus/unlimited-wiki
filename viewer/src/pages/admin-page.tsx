@@ -22,6 +22,8 @@ import {
   type Submission,
 } from "@/lib/api"
 import { MarkdownContent, StatusBadge } from "@/components/markdown-content"
+import { CategoryPicker, type TaxonomySelection } from "@/features/taxonomy-picker"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import {
   AlertDialog,
@@ -52,6 +54,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Skeleton } from "@/components/ui/skeleton"
+import { Spinner } from "@/components/ui/spinner"
 import {
   Table,
   TableBody,
@@ -455,6 +458,12 @@ export function AdminCurationPage() {
   const [correctionResponses, setCorrectionResponses] = useState<
     Record<string, string>
   >({})
+  const [categorySelections, setCategorySelections] = useState<
+    Record<string, TaxonomySelection>
+  >({})
+  const [categoryReasons, setCategoryReasons] = useState<Record<string, string>>(
+    {}
+  )
   const [collection, setCollection] = useState({
     title: "",
     slug: "",
@@ -477,6 +486,46 @@ export function AdminCurationPage() {
     onSuccess: async () => {
       await refresh()
       toast.success("纠错建议已处理")
+    },
+    onError: (error) => toast.error(error.message),
+  })
+  const assignCategory = useMutation({
+    mutationFn: ({
+      entryId,
+      category,
+      reason,
+    }: {
+      entryId: string
+      category: TaxonomySelection
+      reason: string
+    }) => {
+      if (category.kind !== "existing" && category.kind !== "create") {
+        throw new Error("请选择已有分类或创建新分类")
+      }
+      return apiPost(
+        `/api/admin/public-entries/${entryId}/category-assignment`,
+        {
+          category:
+            category.kind === "existing"
+              ? { kind: "existing", id: category.id }
+              : { kind: "create", name: category.name },
+          reason,
+        }
+      )
+    },
+    onSuccess: async (_value, variables) => {
+      setCategorySelections((current) => {
+        const next = { ...current }
+        delete next[variables.entryId]
+        return next
+      })
+      setCategoryReasons((current) => {
+        const next = { ...current }
+        delete next[variables.entryId]
+        return next
+      })
+      await refresh()
+      toast.success("公共分类已应用")
     },
     onError: (error) => toast.error(error.message),
   })
@@ -506,13 +555,108 @@ export function AdminCurationPage() {
     },
     onError: (error) => toast.error(error.message),
   })
+  const activeCategories =
+    state.data?.categories
+      .filter((category) => category.status === "active" && category.id)
+      .map((category) => ({ id: category.id!, name: category.name })) ?? []
+  const uncategorizedEntries = state.data?.uncategorized_entries ?? []
   return (
     <main className="mx-auto max-w-5xl px-4 py-10">
       <p className="text-sm font-medium text-primary">Admin</p>
-      <h1 className="mt-2 text-3xl font-semibold">广场策展</h1>
+      <h1 className="mt-2 text-3xl font-semibold">分类与策展</h1>
       <p className="mt-3 text-muted-foreground">
-        公共分类与标签只在投稿审核中确认；这里仅处理专题和纠错。
+        为旧公开词条补充公共分类，并处理专题和纠错。
       </p>
+      <section className="mt-10">
+        <h2 className="font-semibold">待公共分类</h2>
+        <p className="mt-2 text-sm text-muted-foreground">
+          搜索并选择已有分类；没有匹配项时可直接创建。分类与词条绑定会一次提交。
+        </p>
+        {state.isLoading ? (
+          <Skeleton className="mt-5 h-48 w-full" />
+        ) : state.isError ? (
+          <Alert className="mt-5" variant="destructive">
+            <AlertTitle>无法加载待分类词条</AlertTitle>
+            <AlertDescription>
+              <p>{state.error.message}</p>
+              <Button className="mt-3" variant="outline" onClick={() => void state.refetch()}>
+                <RotateCcwIcon data-icon="inline-start" />重试
+              </Button>
+            </AlertDescription>
+          </Alert>
+        ) : uncategorizedEntries.length ? (
+          <div className="mt-5 divide-y border-y">
+          {uncategorizedEntries.map((entry) => {
+            const selection = categorySelections[entry.id]
+            const reason = categoryReasons[entry.id] || ""
+            const assigning = assignCategory.isPending && assignCategory.variables?.entryId === entry.id
+            return (
+              <article
+                key={entry.id}
+                className="grid gap-4 py-5 md:grid-cols-[minmax(0,1fr)_minmax(16rem,22rem)]"
+              >
+                <div className="min-w-0">
+                  <Link
+                    className="font-medium text-link"
+                    to={`/square/entries/${entry.id}`}
+                  >
+                    {entry.title}
+                  </Link>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    公开版本 v{entry.version} · {new Date(entry.published_at).toLocaleString()}
+                  </p>
+                  {entry.summary && (
+                    <p className="mt-2 line-clamp-2 text-sm text-muted-foreground">
+                      {entry.summary}
+                    </p>
+                  )}
+                </div>
+                <div className="grid min-w-0 gap-2">
+                  <CategoryPicker
+                    options={activeCategories}
+                    value={selection ?? null}
+                    onChange={(value) =>
+                      setCategorySelections((current) => ({
+                        ...current,
+                        [entry.id]: value,
+                      }))
+                    }
+                  />
+                  <Input
+                    value={reason}
+                    onChange={(event) =>
+                      setCategoryReasons((current) => ({
+                        ...current,
+                        [entry.id]: event.target.value,
+                      }))
+                    }
+                    placeholder="归类理由"
+                  />
+                  <Button
+                    disabled={!selection || !reason.trim() || assignCategory.isPending}
+                    onClick={() =>
+                      selection &&
+                      assignCategory.mutate({
+                        entryId: entry.id,
+                        category: selection,
+                        reason,
+                      })
+                    }
+                  >
+                    {assigning && <Spinner data-icon="inline-start" />}
+                    {assigning ? "正在应用" : "应用分类"}
+                  </Button>
+                </div>
+              </article>
+            )
+          })}
+          </div>
+        ) : (
+          <p className="mt-5 border-y py-10 text-center text-sm text-muted-foreground">
+            当前没有待公共分类词条
+          </p>
+        )}
+      </section>
       <section className="mt-10">
         <h2 className="font-semibold">待处理纠错</h2>
         <div className="mt-5 divide-y border-y">
