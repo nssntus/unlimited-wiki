@@ -40,7 +40,7 @@ def project_review_result(
     decision = value.get("decision")
     summary = value.get("summary", "")
     issues = value.get("issues", [])
-    if decision not in valid_decisions or not isinstance(summary, str) or not isinstance(issues, list):
+    if not isinstance(decision, str) or decision not in valid_decisions or not isinstance(summary, str) or not isinstance(issues, list):
         return review_failure(ValueError("invalid review response"))
     projected_issues = []
     if len(issues) > 32:
@@ -66,23 +66,62 @@ def project_review_result(
     }
 
 
+def _normalize_decision_object(value: object) -> object:
+    """Accept the one-hot boolean status shape emitted by some JSON-mode models."""
+    if not isinstance(value, dict):
+        return value
+    state_keys = [decision for decision in VALID_DECISIONS if decision in value]
+    if "decision" in value:
+        decision = value["decision"]
+        if not isinstance(decision, str) or decision not in VALID_DECISIONS or state_keys:
+            raise ValueError("review response did not contain a valid decision object")
+        return value
+    if not state_keys or any(type(value[decision]) is not bool for decision in state_keys):
+        raise ValueError("review response did not contain a valid decision object")
+    selected = [decision for decision in state_keys if value[decision] is True]
+    if len(selected) != 1:
+        raise ValueError("review response did not contain a valid decision object")
+    normalized = dict(value)
+    normalized["decision"] = selected[0]
+    return normalized
+
+
+def _object_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("review response contained duplicate JSON key")
+        result[key] = value
+    return result
+
+
 def parse_review_result(content: str, *, sensitive_values: tuple[str, ...] = ()) -> ReviewResult:
     """Extract the first schema-shaped JSON object from compatible-model output."""
     text = content.lstrip("\ufeff").strip()
-    candidates = re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
-    candidates.append(text)
-    decoder = json.JSONDecoder()
-    for candidate in candidates:
-        for match in re.finditer(r"\{", candidate):
-            try:
-                result, _end = decoder.raw_decode(candidate[match.start():])
-            except json.JSONDecodeError:
-                continue
-            if isinstance(result, dict) and result.get("decision") in VALID_DECISIONS:
-                return project_review_result(
-                    result, sensitive_values=sensitive_values, allow_failed=False,
-                )
-    raise ValueError("review response did not contain a valid decision object")
+    if _contains_sensitive(text, tuple(item for item in sensitive_values if item)):
+        return review_failure(ValueError("sensitive review response"), code="sensitive_response")
+    decoder = json.JSONDecoder(object_pairs_hook=_object_without_duplicate_keys)
+    match = re.search(r"[\{\[]", text)
+    if match is None:
+        raise ValueError("review response did not contain a valid decision object")
+    try:
+        result, end = decoder.raw_decode(text[match.start():])
+    except json.JSONDecodeError as exc:
+        raise ValueError("review response did not contain a valid decision object") from exc
+    remainder = text[match.start() + end:]
+    for extra_match in re.finditer(r"[\{\[]", remainder):
+        try:
+            extra, _extra_end = decoder.raw_decode(remainder[extra_match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(extra, (dict, list)):
+            raise ValueError("review response contained multiple JSON containers")
+    result = _normalize_decision_object(result)
+    if not isinstance(result, dict):
+        raise ValueError("review response did not contain a valid decision object")
+    return project_review_result(
+        result, sensitive_values=sensitive_values, allow_failed=False,
+    )
 
 
 def review_failure(exc: Exception, *, code: str | None = None) -> ReviewResult:
@@ -135,8 +174,11 @@ def default_reviewer(snapshot: dict, settings: dict) -> ReviewResult:
                     "quality, obvious factual-risk signals, copyright-risk signals, and near-duplicate signals present "
                     "in the snapshot. Use pass only when no revision-blocking issue exists; use needs_revision when the "
                     "author can correct specific issues; use reject for clearly unsafe or abusive submissions. Return "
-                    "one JSON object with decision exactly pass, needs_revision, or reject; a user-facing summary; "
-                    "issues as an array of objects containing code, location, and explanation; and policy_version. "
+                    "exactly one JSON object shaped like "
+                    "{\"decision\":\"pass\",\"summary\":\"...\",\"issues\":[]}. The key must be named decision; "
+                    "never use pass, needs_revision, or reject as a key. decision must be exactly pass, "
+                    "needs_revision, or reject. issues must be an array of objects containing non-empty code and "
+                    "optional location and explanation strings. "
                     "Do not publish, edit, request private files, or infer private workspace content."
                 )},
                 {"role": "user", "content": json.dumps(snapshot, ensure_ascii=False)},

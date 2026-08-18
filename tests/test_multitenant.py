@@ -13,7 +13,7 @@ import dynamic_categories as dc
 
 from legacy_migration import migrate_legacy_workspace
 from platform_store import PlatformStore
-from platform_review import PlatformReviewWorker, parse_review_result, review_failure
+from platform_review import PlatformReviewWorker, parse_review_result, project_review_result, review_failure
 from publication import public_markdown, snapshot_fingerprint
 from serve import create_app, create_server
 
@@ -1129,15 +1129,109 @@ def test_workspace_suspend_waits_for_review_dispatch_before_return(
         worker.close()
 
 
-@pytest.mark.parametrize("content", [
-    '```json\n{"decision":"pass","summary":"ok","issues":[]}\n```',
-    '<think>internal review</think>\n{"decision":"needs_revision","summary":"fix it","issues":[]}',
-    'Review result:\n{"decision":"reject","summary":"unsafe","issues":[]}\nDone.',
+@pytest.mark.parametrize(("content", "expected"), [
+    ('```json\n{"decision":"pass","summary":"ok","issues":[]}\n```', "pass"),
+    ('<think>internal review</think>\n{"decision":"needs_revision","summary":"fix it","issues":[]}', "needs_revision"),
+    ('Review result:\n{"decision":"reject","summary":"unsafe","issues":[]}\nDone.', "reject"),
+    ('{"pass":true,"summary":"ok","issues":[]}', "pass"),
+    ('{"needs_revision":true,"summary":"fix it","issues":[]}', "needs_revision"),
+    ('{"reject":true,"summary":"unsafe","issues":[]}', "reject"),
 ])
-def test_platform_review_accepts_compatible_model_json_wrappers(content: str):
+def test_platform_review_accepts_compatible_model_json_wrappers(content: str, expected: str):
     result = parse_review_result(content)
-    assert result["decision"] in {"pass", "needs_revision", "reject"}
+    assert result["decision"] == expected
     assert result["policy_version"] == platform_review.REVIEW_POLICY_VERSION
+
+
+def test_platform_review_rejects_ambiguous_boolean_decisions():
+    with pytest.raises(ValueError, match="valid decision object"):
+        parse_review_result('{"pass":true,"reject":true,"summary":"ambiguous","issues":[]}')
+
+
+def test_platform_review_does_not_accept_nested_decision_from_ambiguous_outer_object():
+    with pytest.raises(ValueError, match="valid decision object"):
+        parse_review_result(
+            '{"pass":true,"reject":true,"summary":"ambiguous",'
+            '"issues":[{"pass":true,"summary":"nested","issues":[]}]}'
+        )
+
+
+def test_platform_review_rejects_sensitive_outer_response_before_nested_decision():
+    result = parse_review_result(
+        '{"debug":"secret-api-key","result":{"pass":true,"summary":"nested","issues":[]}}',
+        sensitive_values=("secret-api-key",),
+    )
+    assert result["decision"] == "failed"
+    assert result["issues"][0]["code"] == "sensitive_response"
+
+
+@pytest.mark.parametrize("content", [
+    '[{"pass":true,"summary":"first","issues":[]},'
+    '{"reject":true,"summary":"second","issues":[]}]',
+    '```json\n[{"pass":true,"summary":"first","issues":[]},'
+    '{"reject":true,"summary":"second","issues":[]}]\n```',
+])
+def test_platform_review_rejects_top_level_decision_arrays(content: str):
+    with pytest.raises(ValueError, match="valid decision object"):
+        parse_review_result(content)
+
+
+@pytest.mark.parametrize("content", [
+    '[{"pass":true,"summary":"inner","issues":[]}',
+    '```json\n[{"pass":true,"summary":"inner","issues":[]}\n```',
+    '{"result":{"decision":"pass","summary":"inner","issues":[]}',
+    '```json\n{"result":{"decision":"pass","summary":"inner","issues":[]}\n```',
+])
+def test_platform_review_rejects_malformed_outer_containers(content: str):
+    with pytest.raises(ValueError, match="valid decision object"):
+        parse_review_result(content)
+
+
+@pytest.mark.parametrize("content", [
+    '{"decision":"pass","summary":"first","issues":[]}'
+    ' {"decision":"reject","summary":"second","issues":[]}',
+    '```json\n{"decision":"pass","summary":"first","issues":[]}'
+    ' {"decision":"reject","summary":"second","issues":[]}\n```',
+])
+def test_platform_review_rejects_multiple_top_level_json_containers(content: str):
+    with pytest.raises(ValueError, match="multiple JSON containers"):
+        parse_review_result(content)
+
+
+@pytest.mark.parametrize("content", [
+    '{"decision":"pass","reject":true,"summary":"mixed","issues":[]}',
+    '```json\n{"decision":"pass","reject":true,"summary":"mixed","issues":[]}\n```',
+    '{"pass":true,"reject":1,"summary":"typed","issues":[]}',
+    '```json\n{"pass":true,"reject":1,"summary":"typed","issues":[]}\n```',
+])
+def test_platform_review_rejects_mixed_or_non_boolean_status_keys(content: str):
+    with pytest.raises(ValueError, match="valid decision object"):
+        parse_review_result(content)
+
+
+@pytest.mark.parametrize("content", [
+    '{"decision":[],"summary":"bad","issues":[]}',
+    '```json\n{"decision":[],"summary":"bad","issues":[]}\n```',
+])
+def test_platform_review_rejects_non_string_decisions_as_invalid_response(content: str):
+    with pytest.raises(ValueError, match="valid decision object"):
+        parse_review_result(content)
+    result = project_review_result({"decision": [], "summary": "bad", "issues": []})
+    assert result["decision"] == "failed"
+    assert result["issues"][0]["code"] == "invalid_response"
+
+
+@pytest.mark.parametrize("content", [
+    '{"decision":"reject","decision":"pass","summary":"dup","issues":[]}',
+    '```json\n{"decision":"reject","decision":"pass","summary":"dup","issues":[]}\n```',
+    '{"pass":true,"pass":false,"reject":true,"summary":"dup","issues":[]}',
+    '```json\n{"pass":true,"pass":false,"reject":true,"summary":"dup","issues":[]}\n```',
+    '{"decision":"pass","summary":"dup","issues":[{"code":"a","code":"b"}]}',
+    '```json\n{"decision":"pass","summary":"dup","issues":[{"code":"a","code":"b"}]}\n```',
+])
+def test_platform_review_rejects_duplicate_keys_at_any_object_depth(content: str):
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        parse_review_result(content)
 
 
 def test_platform_review_invalid_response_reports_actionable_code():
