@@ -200,7 +200,7 @@ def _public_review_issues(report: Any) -> list[dict]:
     return result
 
 
-def _square_public_markdown(markdown: str) -> str:
+def square_public_markdown(markdown: str, *, private_category: object = "") -> str:
     """Remove the private canonical preamble while preserving body Markdown."""
     value = str(markdown or "")
     header = canonical_metadata_preamble(value)
@@ -220,7 +220,7 @@ def _square_public_markdown(markdown: str) -> str:
     while cursor > 0 and cursor < len(lines) and not lines[cursor].strip():
         cursor += 1
     block_start = cursor
-    blocks: list[tuple[int, int, set[str]]] = []
+    blocks: list[tuple[int, int, dict[str, str]]] = []
     allowed = {
         "article-id", "category-id", "classification", "classification-updated",
         "category", "status", "generation", "updated", "archived", "tags",
@@ -228,19 +228,28 @@ def _square_public_markdown(markdown: str) -> str:
     }
     while cursor > 0 and cursor < len(lines):
         start = cursor
-        keys: set[str] = set()
+        values: dict[str, str] = {}
         while cursor < len(lines):
             match = META_RE.match(lines[cursor].rstrip("\r\n"))
             if match is None or match.group(1).strip().casefold() not in allowed:
                 break
-            keys.add(match.group(1).strip().casefold())
+            values[match.group(1).strip().casefold()] = match.group(2).strip()
             cursor += 1
-        if not keys:
+        if not values:
             break
-        blocks.append((start, cursor, keys))
+        blocks.append((start, cursor, values))
         while cursor < len(lines) and not lines[cursor].strip():
             cursor += 1
-    if blocks and {"category", "status"}.issubset(blocks[0][2]):
+    normalize_hint = lambda item: " ".join(unicodedata.normalize("NFKC", str(item or "")).split()).casefold()
+    first_values = blocks[0][2] if blocks else {}
+    trusted_category = normalize_hint(private_category)
+    if blocks and (
+        {"category", "status"}.issubset(first_values)
+        or (
+            trusted_category
+            and normalize_hint(first_values.get("category")) == trusted_category
+        )
+    ):
         value = "".join(lines[:block_start] + lines[cursor:])
     # Older generated articles carry private workflow state in this exact
     # trailing footer. Requiring the terminal horizontal rule keeps body text
@@ -260,7 +269,9 @@ def _public_snapshot(snapshot: dict) -> dict:
         # never copied from an immutable legacy snapshot.
         "category": "",
         "content_status": str(snapshot.get("content_status") or "")[:40],
-        "markdown": _square_public_markdown(str(snapshot.get("markdown") or "")),
+        "markdown": square_public_markdown(
+            str(snapshot.get("markdown") or ""), private_category=snapshot.get("category"),
+        ),
         "summary": str(snapshot.get("summary") or "")[:2000],
         "attribution": str(snapshot.get("attribution") or "匿名用户")[:120],
         "source_summaries": [],
@@ -564,7 +575,12 @@ class SquareMixin:
         """, (entry_id,)).fetchall()]
         title = str(snapshot.get("title") or "")[:300]
         summary = str(snapshot.get("summary") or "")[:2000]
-        body = re.sub(r"[`#>*_\[\]()]", " ", _square_public_markdown(str(snapshot.get("markdown") or "")))[:200_000]
+        body = re.sub(
+            r"[`#>*_\[\]()]", " ",
+            square_public_markdown(
+                str(snapshot.get("markdown") or ""), private_category=snapshot.get("category"),
+            ),
+        )[:200_000]
         category_name = str(row["category_name"] or "待公共分类")[:120]
         attribution = str(snapshot.get("attribution") or "匿名用户")[:120]
         first = row["first_published_at"] or row["created_at"] or row["published_at"]

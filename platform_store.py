@@ -23,8 +23,10 @@ from pathlib import Path
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
 
-from model_crypto import MODEL_ENCRYPTION_VERSION, decrypt_model_value, encrypt_model_value
-from publication import FINGERPRINT_VERSION, article_id_from_markdown, normalize_text, review_markdown, snapshot_fingerprint
+from model_crypto import (
+    MODEL_ENCRYPTION_VERSION, decrypt_model_value, encrypt_model_value, is_model_endpoint_shape,
+)
+from publication import FINGERPRINT_VERSION, article_id_from_markdown, normalize_text, snapshot_fingerprint
 from square_v2 import (
     REPORT_REASONS,
     REUSE_PERMISSIONS,
@@ -32,6 +34,7 @@ from square_v2 import (
     SquareMixin,
     initialize_square_schema,
     normalize_taxonomy_name,
+    square_public_markdown,
     taxonomy_slug,
 )
 
@@ -52,6 +55,16 @@ SUBMISSION_STATES = {
 AI_REVIEW_POLICY_VERSION = "2026-08-14.v1"
 PUBLIC_STATES = {"published", "withdrawn_by_author", "removed_by_admin", "superseded"}
 ACTIVE_SUBMISSION_STATES = {"ai_queued", "ai_reviewing", "pending_admin"}
+
+
+def _model_secret_collision(model: object, base_url: object, api_key: object) -> bool:
+    model_value = str(model or "").strip()
+    candidates = {
+        str(api_key or "").strip(),
+        str(base_url or "").strip(),
+        str(base_url or "").strip().rstrip("/"),
+    }
+    return bool(model_value and any(value and value in model_value for value in candidates))
 
 
 class PlatformIdempotencyError(RuntimeError):
@@ -232,6 +245,8 @@ class PlatformStore(SquareMixin):
         self.db_path = self.state_root / "platform.sqlite3"
         self.vault = SecretVault(self.state_root)
         self._lock = threading.RLock()
+        self._review_dispatch_guard = threading.Lock()
+        self._review_dispatch_locks: dict[str, threading.RLock] = {}
         self._transaction_context = threading.local()
         self._initialize()
 
@@ -476,21 +491,95 @@ class PlatformStore(SquareMixin):
                 JOIN organizations organization ON organization.id=workspace.organization_id
                 JOIN submissions submission ON submission.workspace_id=workspace.id
                 WHERE (workspace.status<>'active' OR organization.status<>'active')
-                  AND submission.status='ai_reviewing'
+                  AND submission.status IN (
+                    'ai_queued','ai_reviewing','ai_failed','needs_revision','pending_admin','admin_changes_requested'
+                  )
             """).fetchall()
             for workspace in inactive_workspaces:
                 self._terminate_workspace_reviews(
                     db, workspace["id"], workspace["status"], restart_stamp,
                 )
-            db.execute("""
-                UPDATE submissions SET status='ai_queued',updated_at=?
-                WHERE status='ai_reviewing' AND EXISTS(
-                    SELECT 1 FROM workspaces workspace JOIN organizations organization
-                    ON organization.id=workspace.organization_id
-                    WHERE workspace.id=submissions.workspace_id AND workspace.status='active'
-                      AND organization.status='active'
+            running_attempts = db.execute("""
+                SELECT attempt.submission_id,attempt.attempt,submission.status submission_status,
+                       submission.review_attempt,submission.workspace_id,
+                       workspace.status workspace_status,organization.status organization_status,
+                       setting.provider,setting.model,setting.base_url_enc,setting.api_key_enc,
+                       setting.encryption_version,
+                       (SELECT COUNT(*) FROM submission_review_attempts sibling
+                        WHERE sibling.submission_id=attempt.submission_id AND sibling.status='running') running_count
+                FROM submission_review_attempts attempt
+                JOIN submissions submission ON submission.id=attempt.submission_id
+                JOIN workspaces workspace ON workspace.id=submission.workspace_id
+                JOIN organizations organization ON organization.id=workspace.organization_id
+                LEFT JOIN model_settings setting ON setting.workspace_id=submission.workspace_id
+                WHERE attempt.status='running'
+            """).fetchall()
+            requeued: set[str] = set()
+            for attempt in running_attempts:
+                active_current = bool(
+                    attempt["submission_status"] == "ai_reviewing"
+                    and attempt["attempt"] == attempt["review_attempt"]
+                    and attempt["running_count"] == 1
+                    and attempt["workspace_status"] == "active"
+                    and attempt["organization_status"] == "active"
                 )
-            """, (restart_stamp,))
+                safe_model = self._safe_model_audit_value(attempt)
+                code = "worker_restarted" if active_current else "orphan_attempt_recovered"
+                summary = (
+                    "The previous review attempt was interrupted and has been queued again."
+                    if active_current else "An inconsistent review attempt was closed during startup recovery."
+                )
+                report = self._review_failure_report(code, summary, attempt["provider"], safe_model)
+                db.execute("""
+                    UPDATE submission_review_attempts
+                    SET status='ai_failed',policy_version=?,provider=COALESCE(provider,?),model=?,
+                        rules_version=?,report_json=?,completed_at=?
+                    WHERE submission_id=? AND attempt=? AND status='running'
+                """, (
+                    AI_REVIEW_POLICY_VERSION, attempt["provider"], safe_model,
+                    AI_REVIEW_POLICY_VERSION, json.dumps(report, ensure_ascii=False), restart_stamp,
+                    attempt["submission_id"], attempt["attempt"],
+                ))
+                if active_current:
+                    db.execute(
+                        "UPDATE submissions SET status='ai_queued',updated_at=? WHERE id=? AND status='ai_reviewing'",
+                        (restart_stamp, attempt["submission_id"]),
+                    )
+                    requeued.add(attempt["submission_id"])
+                elif attempt["submission_status"] == "ai_reviewing":
+                    db.execute("""
+                        UPDATE submissions
+                        SET status='ai_failed',ai_report_json=?,ai_policy_version=?,ai_model=?,
+                            ai_rules_version=?,updated_at=? WHERE id=? AND status='ai_reviewing'
+                    """, (
+                        json.dumps(report, ensure_ascii=False), AI_REVIEW_POLICY_VERSION, safe_model,
+                        AI_REVIEW_POLICY_VERSION, restart_stamp, attempt["submission_id"],
+                    ))
+            missing_attempts = db.execute("""
+                SELECT submission.id FROM submissions submission
+                JOIN workspaces workspace ON workspace.id=submission.workspace_id
+                JOIN organizations organization ON organization.id=workspace.organization_id
+                WHERE submission.status='ai_reviewing' AND workspace.status='active'
+                  AND organization.status='active'
+                  AND NOT EXISTS(
+                    SELECT 1 FROM submission_review_attempts attempt
+                    WHERE attempt.submission_id=submission.id AND attempt.status='running'
+                  )
+            """).fetchall()
+            missing_report = self._review_failure_report(
+                "orphan_attempt_recovered", "The review attempt history was incomplete and was closed safely.",
+                None, None,
+            )
+            for submission in missing_attempts:
+                if submission["id"] in requeued:
+                    continue
+                db.execute("""
+                    UPDATE submissions SET status='ai_failed',ai_report_json=?,ai_policy_version=?,
+                        ai_model=NULL,ai_rules_version=?,updated_at=? WHERE id=? AND status='ai_reviewing'
+                """, (
+                    json.dumps(missing_report, ensure_ascii=False), AI_REVIEW_POLICY_VERSION,
+                    AI_REVIEW_POLICY_VERSION, restart_stamp, submission["id"],
+                ))
             self._backfill_square_v2(db)
         os.chmod(self.db_path, 0o600)
 
@@ -512,6 +601,10 @@ class PlatformStore(SquareMixin):
                 )
             except (binascii.Error, InvalidTag, UnicodeDecodeError, ValueError):
                 # A damaged row remains unusable and will be rejected by offline backup validation.
+                continue
+            # V1 used one authentication domain for both fields. A URL-shaped
+            # API key is therefore indistinguishable from swapped ciphertext.
+            if version == 1 and is_model_endpoint_shape(api_key):
                 continue
             db.execute("""
                 UPDATE model_settings
@@ -1533,7 +1626,7 @@ class PlatformStore(SquareMixin):
             raise ValueError("unsupported workspace lifecycle action")
         expected, target = transitions[action]
         stamp = now_iso()
-        with self._lock, self.connect() as db:
+        with self.review_dispatch(workspace_id), self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = self._workspace_access_row(db, context.user_id, workspace_id)
             if (
@@ -1591,8 +1684,10 @@ class PlatformStore(SquareMixin):
         self, db: sqlite3.Connection, workspace_id: str, workspace_status: str, stamp: str,
     ) -> None:
         settings = db.execute(
-            "SELECT provider,model FROM model_settings WHERE workspace_id=?", (workspace_id,),
+            """SELECT workspace_id,provider,model,base_url_enc,api_key_enc,encryption_version
+               FROM model_settings WHERE workspace_id=?""", (workspace_id,),
         ).fetchone()
+        safe_model = self._safe_model_audit_value(settings) if settings else None
         decision_status = "ai_failed" if workspace_status == "suspended" else "withdrawn"
         report = {
             "decision": "failed",
@@ -1600,7 +1695,7 @@ class PlatformStore(SquareMixin):
             "issues": [{"code": f"workspace_{workspace_status}", "location": "workspace"}],
             "policy_version": AI_REVIEW_POLICY_VERSION,
             "provider": settings["provider"] if settings else None,
-            "model": settings["model"] if settings else None,
+            "model": safe_model,
             "rules_version": AI_REVIEW_POLICY_VERSION,
         }
         serialized = json.dumps(report, ensure_ascii=False)
@@ -1635,6 +1730,80 @@ class PlatformStore(SquareMixin):
             decision_status, serialized, AI_REVIEW_POLICY_VERSION, report["model"],
             AI_REVIEW_POLICY_VERSION, stamp, workspace_id, *source_statuses,
         ))
+
+    @staticmethod
+    def _review_failure_report(code: str, summary: str, provider: object, model: object) -> dict:
+        return {
+            "decision": "failed", "summary": summary,
+            "issues": [{"code": code, "location": "review_worker"}],
+            "policy_version": AI_REVIEW_POLICY_VERSION,
+            "provider": provider, "model": model, "rules_version": AI_REVIEW_POLICY_VERSION,
+        }
+
+    def _complete_withdrawn_review_attempts(
+        self,
+        db: sqlite3.Connection,
+        submissions: list[sqlite3.Row],
+        code: str,
+        summary: str,
+        stamp: str,
+    ) -> None:
+        for submission in submissions:
+            settings = db.execute(
+                """SELECT workspace_id,provider,model,base_url_enc,api_key_enc,encryption_version
+                   FROM model_settings WHERE workspace_id=?""",
+                (submission["workspace_id"],),
+            ).fetchone()
+            safe_model = self._safe_model_audit_value(settings)
+            provider = settings["provider"] if settings else None
+            report = self._review_failure_report(code, summary, provider, safe_model)
+            db.execute("""
+                UPDATE submission_review_attempts
+                SET status='withdrawn',policy_version=?,provider=COALESCE(provider,?),model=?,
+                    rules_version=?,report_json=?,completed_at=?
+                WHERE submission_id=? AND attempt=? AND status='running'
+            """, (
+                AI_REVIEW_POLICY_VERSION, provider, safe_model, AI_REVIEW_POLICY_VERSION,
+                json.dumps(report, ensure_ascii=False), stamp,
+                submission["id"], submission["review_attempt"],
+            ))
+
+    def _safe_model_audit_value(self, row: sqlite3.Row | None) -> str | None:
+        if row is None or any(
+            row[key] is None for key in ("encryption_version", "base_url_enc", "api_key_enc")
+        ):
+            return None
+        try:
+            version = int(row["encryption_version"])
+            base_url = decrypt_model_value(
+                self.vault._cipher, row["base_url_enc"], workspace_id=row["workspace_id"],
+                field="base_url", version=version,
+            )
+            api_key = decrypt_model_value(
+                self.vault._cipher, row["api_key_enc"], workspace_id=row["workspace_id"],
+                field="api_key", version=version,
+            )
+        except (binascii.Error, InvalidTag, TypeError, UnicodeDecodeError, ValueError):
+            return None
+        return None if _model_secret_collision(row["model"], base_url, api_key) else str(row["model"] or "")
+
+    @contextlib.contextmanager
+    def review_dispatch(self, workspace_id: str):
+        with self._review_dispatch_guard:
+            lock = self._review_dispatch_locks.setdefault(workspace_id, threading.RLock())
+        with lock:
+            yield
+
+    def review_attempt_active(self, submission_id: str, expected_attempt: int) -> bool:
+        with self._lock, self.connect() as db:
+            return db.execute("""
+                SELECT 1 FROM submissions submission
+                JOIN workspaces workspace ON workspace.id=submission.workspace_id
+                JOIN organizations organization ON organization.id=workspace.organization_id
+                WHERE submission.id=? AND submission.status='ai_reviewing'
+                  AND submission.review_attempt=? AND workspace.status='active'
+                  AND organization.status='active'
+            """, (submission_id, expected_attempt)).fetchone() is not None
 
     def workspace_storage_state(self, workspace_id: str) -> dict:
         with self.connect() as db:
@@ -1966,6 +2135,14 @@ class PlatformStore(SquareMixin):
                 WHERE entry_id IN (SELECT id FROM public_entries WHERE author_id=?)
             """, (now, context.user_id))
             db.execute("UPDATE public_subscriptions SET status='inactive',updated_at=? WHERE user_id=?", (now, context.user_id))
+            account_reviewing = db.execute("""
+                SELECT id,workspace_id,review_attempt FROM submissions
+                WHERE owner_id=? AND status='ai_reviewing'
+            """, (context.user_id,)).fetchall()
+            self._complete_withdrawn_review_attempts(
+                db, account_reviewing, "account_deleted",
+                "The review was cancelled because the author account was deleted.", now,
+            )
             db.execute("""
                 UPDATE submissions SET status='withdrawn',reason='account_deleted',updated_at=?
                 WHERE owner_id=? AND status IN (
@@ -2060,10 +2237,15 @@ class PlatformStore(SquareMixin):
             ).fetchone()
             effective_key = api_key
             if not effective_key and existing:
+                existing_version = int(existing["encryption_version"])
                 effective_key = decrypt_model_value(
                     self.vault._cipher, existing["api_key_enc"], workspace_id=workspace_id,
-                    field="api_key", version=int(existing["encryption_version"]),
+                    field="api_key", version=existing_version,
                 )
+                if existing_version == 1 and is_model_endpoint_shape(effective_key):
+                    raise ValueError("re-enter the API key to migrate legacy model settings")
+            if _model_secret_collision(model, base_url, effective_key):
+                raise ValueError("model name must not match a model credential or endpoint")
             db.execute("""
                 INSERT INTO model_settings(
                     workspace_id,provider,base_url_enc,api_key_enc,model,updated_at,encryption_version
@@ -2084,7 +2266,7 @@ class PlatformStore(SquareMixin):
         if row is None:
             return {}
         version = int(row["encryption_version"])
-        return {
+        result = {
             "provider": row["provider"],
             "base_url": decrypt_model_value(
                 self.vault._cipher, row["base_url_enc"], workspace_id=workspace_id,
@@ -2096,6 +2278,9 @@ class PlatformStore(SquareMixin):
             ),
             "model": row["model"],
         }
+        if version == 1 and is_model_endpoint_shape(result["api_key"]):
+            return {}
+        return result
 
     def load_review_model(self, submission_id: str, expected_attempt: int) -> dict:
         with self._lock, self.connect() as db:
@@ -2626,34 +2811,44 @@ class PlatformStore(SquareMixin):
                     ) VALUES(?,?,'running',?,?,?,?,?)
                 """, (
                     claimed["id"], claimed["review_attempt"], AI_REVIEW_POLICY_VERSION,
-                    row["review_provider"], row["review_model"], AI_REVIEW_POLICY_VERSION, now_iso(),
+                    row["review_provider"], None, AI_REVIEW_POLICY_VERSION, now_iso(),
                 ))
             db.commit()
         if not changed:
             return None
-        snapshot = json.loads(claimed["snapshot_json"])
-        review_snapshot = {
-            key: snapshot.get(key)
-            for key in ("title", "content_status", "summary", "attribution")
-            if key in snapshot
-        }
-        review_snapshot["markdown"] = review_markdown(str(snapshot.get("markdown") or ""))
-        public_sources = self._safe_public_sources(snapshot)
-        if public_sources:
-            review_snapshot["public_sources"] = public_sources
-        candidates = self.duplicate_candidates(snapshot)
-        review_candidates = [
-            {
-                key: candidate[key]
-                for key in ("title", "summary", "attribution", "version")
-                if key in candidate
+        try:
+            snapshot = json.loads(claimed["snapshot_json"])
+            review_snapshot = {
+                key: snapshot.get(key)
+                for key in ("title", "content_status", "summary", "attribution")
+                if key in snapshot
             }
-            for candidate in candidates
-        ]
-        with self.connect() as db:
-            db.execute("UPDATE submissions SET duplicate_candidates_json=? WHERE id=? AND review_attempt=?", (
-                json.dumps(candidates, ensure_ascii=False), claimed["id"], claimed["review_attempt"],
-            ))
+            review_snapshot["markdown"] = square_public_markdown(
+                str(snapshot.get("markdown") or ""), private_category=snapshot.get("category"),
+            )
+            public_sources = self._safe_public_sources(snapshot)
+            if public_sources:
+                review_snapshot["public_sources"] = public_sources
+            candidates = self.duplicate_candidates(snapshot)
+            review_candidates = [
+                {
+                    key: candidate[key]
+                    for key in ("title", "summary", "attribution", "version")
+                    if key in candidate
+                }
+                for candidate in candidates
+            ]
+            with self.connect() as db:
+                db.execute("UPDATE submissions SET duplicate_candidates_json=? WHERE id=? AND review_attempt=?", (
+                    json.dumps(candidates, ensure_ascii=False), claimed["id"], claimed["review_attempt"],
+                ))
+        except Exception:
+            return {
+                "id": claimed["id"], "attempt": claimed["review_attempt"],
+                "workspace_id": claimed["workspace_id"],
+                "review_provider": row["review_provider"], "review_model": None,
+                "claim_failure": "projection_error",
+            }
         return {
             "id": claimed["id"], "attempt": claimed["review_attempt"],
             "workspace_id": claimed["workspace_id"],
@@ -2705,7 +2900,13 @@ class PlatformStore(SquareMixin):
                 db.commit(); return self._submission_public(row)
             if row["status"] in {"approved", "admin_rejected", "ai_rejected"}:
                 db.rollback(); raise RuntimeError("decided submissions cannot be cancelled")
-            db.execute("UPDATE submissions SET status='withdrawn',updated_at=? WHERE id=?", (now_iso(), submission_id))
+            stamp = now_iso()
+            if row["status"] == "ai_reviewing":
+                self._complete_withdrawn_review_attempts(
+                    db, [row], "submission_withdrawn",
+                    "The author cancelled the submission while review was in progress.", stamp,
+                )
+            db.execute("UPDATE submissions SET status='withdrawn',updated_at=? WHERE id=?", (stamp, submission_id))
             saved = db.execute("SELECT * FROM submissions WHERE id=?", (submission_id,)).fetchone()
             self._audit(db, context.user_id, "submission.cancel", "submission", submission_id)
             db.commit()

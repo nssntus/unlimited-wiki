@@ -4,12 +4,32 @@ from __future__ import annotations
 
 import base64
 import os
+from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
 MODEL_ENCRYPTION_VERSION = 2
 MODEL_FIELDS = frozenset({"base_url", "api_key"})
+
+
+def is_model_endpoint_shape(value: object) -> bool:
+    """Return whether a value can be interpreted as an HTTP model endpoint."""
+    text = str(value or "").strip()
+    if not text or len(text) > 2048:
+        return False
+    try:
+        parsed = urlsplit(text)
+        _ = parsed.port
+    except ValueError:
+        return False
+    return bool(
+        parsed.scheme in {"http", "https"}
+        and parsed.netloc
+        and parsed.hostname
+        and parsed.username is None
+        and parsed.password is None
+    )
 
 
 def _scope(workspace_id: str, field: str, version: int) -> str:

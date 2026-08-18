@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import base64
 import os
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -351,6 +352,158 @@ def test_legacy_model_ciphertext_backup_restores_and_migrates_to_field_bound_aad
         ).fetchone()[0] == 2
 
 
+@pytest.mark.parametrize("swapped", [False, True])
+def test_backup_rejects_ambiguous_legacy_url_shaped_api_key(tmp_path: Path, swapped: bool):
+    source = tmp_path / "source"
+    source.mkdir()
+    workspace_id = seed_minimum_legacy_instance(source)
+    cipher = AESGCM((source / ".platform" / "master.key").read_bytes())
+
+    def legacy_encrypt(value: str) -> str:
+        nonce = os.urandom(12)
+        encrypted = cipher.encrypt(
+            nonce, value.encode("utf-8"), f"workspace:{workspace_id}:model".encode("utf-8"),
+        )
+        return base64.urlsafe_b64encode(nonce + encrypted).decode("ascii")
+
+    base_url, api_key = "https://models.example/v1", "https://credential.example/token"
+    values = (api_key, base_url) if swapped else (base_url, api_key)
+    with sqlite3.connect(source / ".platform" / "platform.sqlite3") as db:
+        db.execute(
+            "INSERT INTO model_settings VALUES(?,?,?,?,?,?)",
+            (
+                workspace_id, "openai-compatible", legacy_encrypt(values[0]), legacy_encrypt(values[1]),
+                "legacy-model", "2026-01-01T00:00:00+00:00",
+            ),
+        )
+    store = PlatformStore(source)
+    with store.connect() as db:
+        assert db.execute(
+            "SELECT encryption_version FROM model_settings WHERE workspace_id=?", (workspace_id,),
+        ).fetchone()[0] == 1
+    assert store.load_model(workspace_id) == {}
+    with pytest.raises(ValueError, match="re-enter the API key"):
+        store.save_model(workspace_id, "openai-compatible", base_url, "", "legacy-model")
+    assert_backup_contract_rejects(source, tmp_path, "invalid encrypted model settings")
+    store.save_model(workspace_id, "openai-compatible", base_url, api_key, "legacy-model")
+    assert store.load_model(workspace_id)["api_key"] == api_key
+    with store.connect() as db:
+        assert db.execute(
+            "SELECT encryption_version FROM model_settings WHERE workspace_id=?", (workspace_id,),
+        ).fetchone()[0] == 2
+    repaired_backup = tmp_path / f"repaired-backup-{swapped}"
+    create_backup(source, repaired_backup)
+    verify_backup(repaired_backup)
+
+
+@pytest.mark.parametrize("collision", ["api_key", "base_url"])
+def test_backup_rejects_model_name_matching_decrypted_secret(tmp_path: Path, collision: str):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    with platform.connect() as db:
+        row = db.execute(
+            "SELECT base_url_enc,api_key_enc FROM model_settings WHERE workspace_id=?", (user["workspace_id"],),
+        ).fetchone()
+        secret = platform.load_model(user["workspace_id"])[collision]
+        db.execute(
+            "UPDATE model_settings SET model=? WHERE workspace_id=?",
+            (f"prefix-{secret}-suffix", user["workspace_id"]),
+        )
+    assert_backup_contract_rejects(source, tmp_path, "invalid encrypted model settings")
+
+
+def test_backup_accepts_v2_url_shaped_api_key_with_field_bound_ciphertext(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    platform.save_model(
+        user["workspace_id"], "openai-compatible", "https://models.example/v1",
+        "https://credential.example/token", "safe-model",
+    )
+    backup = tmp_path / "backup"
+    create_backup(source, backup)
+    verify_backup(backup)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["terminal_parent", "missing_current", "unknown_status", "completed_running", "reviewing_without_running"],
+)
+def test_backup_rejects_inconsistent_submission_review_attempts(tmp_path: Path, corruption: str):
+    source = tmp_path / "source"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    _token, context = platform.create_session(user["id"])
+    snapshot = {"title": "Attempt", "markdown": "# Attempt\n\nBody"}
+    preview = platform.create_preview(
+        context, "private/attempt.md", "rev-attempt", "7" * 32,
+        snapshot_fingerprint(snapshot), snapshot,
+    )
+    submission = platform.submit_preview(context, preview["preview_id"])
+    assert platform.claim_ai_submission()
+    with platform.connect() as db:
+        if corruption == "terminal_parent":
+            db.execute("UPDATE submissions SET status='ai_failed' WHERE id=?", (submission["id"],))
+        elif corruption == "missing_current":
+            db.execute("UPDATE submissions SET review_attempt=2 WHERE id=?", (submission["id"],))
+        elif corruption == "unknown_status":
+            db.execute(
+                "UPDATE submission_review_attempts SET status='not-a-state',completed_at=? WHERE submission_id=?",
+                ("2026-01-01T00:00:00+00:00", submission["id"]),
+            )
+        elif corruption == "completed_running":
+            db.execute(
+                "UPDATE submission_review_attempts SET completed_at=? WHERE submission_id=?",
+                ("2026-01-01T00:00:00+00:00", submission["id"]),
+            )
+        else:
+            db.execute(
+                "UPDATE submission_review_attempts SET status='ai_failed',completed_at=? WHERE submission_id=?",
+                ("2026-01-01T00:00:00+00:00", submission["id"]),
+            )
+    assert_backup_contract_rejects(source, tmp_path, "invalid submission review attempts")
+
+
+@pytest.mark.parametrize("action", ["withdraw", "delete_account"])
+def test_withdrawn_running_review_attempt_is_immediately_backup_safe(tmp_path: Path, action: str):
+    source = tmp_path / f"source-{action}"
+    source.mkdir()
+    platform, user, _article, _raw = seed_instance(source)
+    _token, context = platform.create_session(user["id"])
+    snapshot = {"title": "Running withdrawal", "markdown": "# Running withdrawal\n\nBody"}
+    preview = platform.create_preview(
+        context, "private/running-withdrawal.md", "rev-running-withdrawal", "8" * 32,
+        snapshot_fingerprint(snapshot), snapshot,
+    )
+    submission = platform.submit_preview(context, preview["preview_id"])
+    claimed = platform.claim_ai_submission()
+    assert claimed and claimed["id"] == submission["id"]
+
+    if action == "withdraw":
+        platform.withdraw(context, submission["id"])
+        expected_code = "submission_withdrawn"
+    else:
+        result = platform.delete_account(context, "correct-horse-123")
+        for workspace in result["cleanup_workspaces"]:
+            shutil.rmtree(source / "spaces" / workspace["root_name"])
+        expected_code = "account_deleted"
+
+    with platform.connect() as db:
+        saved = db.execute("SELECT status FROM submissions WHERE id=?", (submission["id"],)).fetchone()
+        attempt = db.execute("""
+            SELECT status,completed_at,report_json FROM submission_review_attempts
+            WHERE submission_id=? AND attempt=1
+        """, (submission["id"],)).fetchone()
+    assert saved["status"] == "withdrawn"
+    assert attempt["status"] == "withdrawn" and attempt["completed_at"]
+    assert expected_code in attempt["report_json"]
+
+    backup = tmp_path / f"backup-{action}"
+    create_backup(source, backup)
+    assert verify_backup(backup)["schema_version"] == 2
+
+
 def test_backup_accepts_normal_merged_public_category(tmp_path: Path):
     source = tmp_path / "source"
     source.mkdir()
@@ -633,8 +786,12 @@ def test_backup_accepts_every_supported_submission_status(tmp_path: Path, status
             snapshot_fingerprint(snapshot), snapshot,
         )
         submission = platform.submit_preview(context, preview["preview_id"])
-        with platform.connect() as db:
-            db.execute("UPDATE submissions SET status=? WHERE id=?", (status, submission["id"]))
+        if status == "ai_reviewing":
+            claimed = platform.claim_ai_submission()
+            assert claimed and claimed["id"] == submission["id"]
+        else:
+            with platform.connect() as db:
+                db.execute("UPDATE submissions SET status=? WHERE id=?", (status, submission["id"]))
     backup = tmp_path / f"backup-{status}"
     create_backup(source, backup)
     assert verify_backup(backup)["schema_version"] == 2

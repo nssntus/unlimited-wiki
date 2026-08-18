@@ -89,6 +89,8 @@ def review_failure(exc: Exception, *, code: str | None = None) -> ReviewResult:
     name = type(exc).__name__
     if code == "sensitive_response":
         summary = "The workspace review model returned an unsafe review response."
+    elif code:
+        summary = "The workspace review could not be completed. Retry is available."
     elif name in {"APITimeoutError", "TimeoutError"}:
         code, summary = "timeout", "The workspace review model timed out. Retry is available."
     elif name in {"AuthenticationError", "PermissionDeniedError"}:
@@ -180,35 +182,46 @@ class PlatformReviewWorker:
             provider = str(row.get("review_provider") or "openai-compatible")
             model = str(row.get("review_model") or "")
             settings: dict = {}
-            try:
-                if self.reviewer is not None:
-                    provider, model = "injected", "injected-reviewer"
-                    raw_result = self.reviewer(row["review_input"])
-                    result = project_review_result(raw_result)
-                else:
-                    settings = self.store.load_review_model(row["id"], row["attempt"])
-                    provider = str(settings.get("provider") or provider)
-                    model = str(settings.get("model") or model)
-                    raw_result = default_reviewer(row["review_input"], settings)
-                    result = project_review_result(
-                        raw_result,
-                        sensitive_values=(
+            with self.store.review_dispatch(row["workspace_id"]):
+                if not self.store.review_attempt_active(row["id"], row["attempt"]):
+                    continue
+                try:
+                    if row.get("claim_failure"):
+                        result = review_failure(RuntimeError("review projection failed"), code="projection_error")
+                    elif self.reviewer is not None:
+                        provider, model = "injected", "injected-reviewer"
+                        raw_result = self.reviewer(row["review_input"])
+                        result = project_review_result(raw_result)
+                    else:
+                        settings = self.store.load_review_model(row["id"], row["attempt"])
+                        provider = str(settings.get("provider") or provider)
+                        model = str(settings.get("model") or "")
+                        sensitive_values = (
                             str(settings.get("api_key") or ""),
                             str(settings.get("base_url") or ""),
                             str(settings.get("base_url") or "").rstrip("/"),
-                        ),
+                        )
+                        if _contains_sensitive({"provider": provider, "model": model}, sensitive_values):
+                            result = review_failure(
+                                ValueError("sensitive review metadata"), code="sensitive_response",
+                            )
+                            model = ""
+                        else:
+                            raw_result = default_reviewer(row["review_input"], settings)
+                            result = project_review_result(raw_result, sensitive_values=sensitive_values)
+                except Exception as exc:
+                    result = review_failure(exc)
+                result.update({
+                    "provider": provider,
+                    "model": model,
+                    "policy_version": REVIEW_POLICY_VERSION,
+                    "rules_version": REVIEW_POLICY_VERSION,
+                })
+            while not self._stop.is_set():
+                try:
+                    self.store.ai_decide(
+                        row["id"], str(result["decision"]), result, expected_attempt=row["attempt"],
                     )
-            except Exception as exc:
-                result = review_failure(exc)
-            result.update({
-                "provider": provider,
-                "model": model,
-                "policy_version": REVIEW_POLICY_VERSION,
-                "rules_version": REVIEW_POLICY_VERSION,
-            })
-            try:
-                self.store.ai_decide(
-                    row["id"], str(result["decision"]), result, expected_attempt=row["attempt"],
-                )
-            except Exception:
-                continue
+                    break
+                except Exception:
+                    self._stop.wait(0.25)

@@ -23,7 +23,7 @@ from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from model_crypto import MODEL_ENCRYPTION_VERSION, decrypt_model_value
+from model_crypto import MODEL_ENCRYPTION_VERSION, decrypt_model_value, is_model_endpoint_shape
 from platform_store import SUBMISSION_STATES
 from square_v2 import normalize_taxonomy_name, taxonomy_normalized_key
 
@@ -737,6 +737,49 @@ def _check_taxonomy_storage(db: sqlite3.Connection) -> None:
                 raise RuntimeError("platform SQLite has invalid taxonomy decision data")
 
 
+def _check_submission_review_attempts(db: sqlite3.Connection) -> None:
+    if db.execute(
+        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='submission_review_attempts'",
+    ).fetchone() is None:
+        return
+    submission_columns = {str(row[1]) for row in db.execute("PRAGMA table_info(submissions)")}
+    if "review_attempt" not in submission_columns:
+        raise RuntimeError("platform SQLite has invalid submission review attempts")
+    allowed_statuses = {
+        "running", "ai_failed", "needs_revision", "ai_rejected", "pending_admin", "withdrawn",
+    }
+    attempts_by_submission: dict[str, list[sqlite3.Row]] = {}
+    for attempt in db.execute("""
+        SELECT submission_id,attempt,typeof(attempt) attempt_type,status,completed_at
+        FROM submission_review_attempts ORDER BY submission_id,attempt
+    """):
+        if (
+            attempt["attempt_type"] != "integer"
+            or int(attempt["attempt"]) < 1
+            or attempt["status"] not in allowed_statuses
+            or (attempt["status"] == "running") != (attempt["completed_at"] is None)
+        ):
+            raise RuntimeError("platform SQLite has invalid submission review attempts")
+        attempts_by_submission.setdefault(str(attempt["submission_id"]), []).append(attempt)
+    for submission in db.execute(
+        "SELECT id,status,review_attempt,typeof(review_attempt) review_attempt_type FROM submissions",
+    ):
+        if submission["review_attempt_type"] != "integer" or int(submission["review_attempt"]) < 0:
+            raise RuntimeError("platform SQLite has invalid submission review attempts")
+        attempts = attempts_by_submission.pop(str(submission["id"]), [])
+        expected_count = int(submission["review_attempt"])
+        if [int(item["attempt"]) for item in attempts] != list(range(1, expected_count + 1)):
+            raise RuntimeError("platform SQLite has invalid submission review attempts")
+        running = [item for item in attempts if item["status"] == "running"]
+        if submission["status"] == "ai_reviewing":
+            if len(running) != 1 or int(running[0]["attempt"]) != expected_count:
+                raise RuntimeError("platform SQLite has invalid submission review attempts")
+        elif running:
+            raise RuntimeError("platform SQLite has invalid submission review attempts")
+    if attempts_by_submission:
+        raise RuntimeError("platform SQLite has invalid submission review attempts")
+
+
 def _check_application_schema(db: sqlite3.Connection, path: Path) -> list[str]:
     db.row_factory = sqlite3.Row
     anchors = PLATFORM_SCHEMA_ANCHORS if path.parent.name == ".platform" else WORKSPACE_SCHEMA_ANCHORS
@@ -819,6 +862,7 @@ def _check_application_schema(db: sqlite3.Connection, path: Path) -> list[str]:
     if anchors is PLATFORM_SCHEMA_ANCHORS:
         _check_encrypted_model_settings(db, path)
         _check_taxonomy_storage(db)
+        _check_submission_review_attempts(db)
         meta_table = db.execute(
             "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='public_search_meta'",
         ).fetchone()
@@ -899,13 +943,21 @@ def _check_encrypted_model_settings(db: sqlite3.Connection, path: Path) -> None:
                 cipher, str(row[3]), workspace_id=str(row[0]), field="api_key", version=version,
             )
             parsed = urlsplit(base_url)
+            ambiguous_legacy_key = version == 1 and is_model_endpoint_shape(api_key)
+            model_value = str(row[4]).strip() if isinstance(row[4], str) else ""
+            model_secret_collision = bool(model_value and any(
+                secret and secret in model_value
+                for secret in (api_key.strip(), base_url.strip(), base_url.strip().rstrip("/"))
+            ))
             if (
                 row[1] not in {"openai", "deepseek", "ollama", "openai-compatible"}
                 or not base_url or len(base_url) > 2048
                 or parsed.scheme not in {"http", "https"} or not parsed.netloc
                 or parsed.username is not None or parsed.password is not None
-                or not isinstance(row[4], str) or not row[4] or len(row[4]) > 200
+                or not model_value or len(model_value) > 200
                 or len(api_key) > 8192
+                or ambiguous_legacy_key
+                or model_secret_collision
             ):
                 raise ValueError
     except Exception as exc:
