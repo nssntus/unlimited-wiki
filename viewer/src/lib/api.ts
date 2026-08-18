@@ -181,6 +181,7 @@ export type AdminSquareState = {
   category_mappings: Array<{ private_label: string; category_id: string | null; status: string; updated_at: string }>
   corrections: Array<PublicCorrection & { entry_title: string }>
   index_jobs: Array<{ entry_id: string; status: "pending" | "running" | "retry" | "dead"; attempts: number; last_error: string | null; not_before: string | null; updated_at: string }>
+  uncategorized_entries: Array<{ id: string; revision_id: string; version: number; title: string; summary: string; published_at: string; updated_at: string }>
 }
 export type Notification = { id: string; kind: string; object_type: string; object_id: string; title: string; message: string; read_at: string | null; created_at: string }
 export type AdminPublicEntry = { id: string; status: "published" | "removed_by_admin"; author_id: string; author_nickname: string; revision_id: string; version: number; snapshot: Submission["snapshot"]; content_hash: string; published_at: string; moderation_reason: string | null; moderated_at: string | null; featured: boolean; featured_order: number | null }

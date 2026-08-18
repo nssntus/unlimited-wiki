@@ -1036,6 +1036,9 @@ def make_handler(app: WikiApp):
             if path == "/api/public/me/library":
                 if self.account_context is None: raise ApiError(401, "authentication required")
                 return self._json(200, app.platform.my_square_library(self.context or self.account_context))
+            if path == "/api/admin/square":
+                self._require_role("admin")
+                return self._json(200, app.platform.admin_square_state(self.context or self.account_context))
             if not path.startswith("/api/"):
                 return self._serve_static(path)
 
@@ -1129,9 +1132,6 @@ def make_handler(app: WikiApp):
             if match:
                 self._require_role("admin")
                 return self._json(200, app.platform.admin_public_versions(self.context, match.group(1)))
-            if path == "/api/admin/square":
-                self._require_role("admin")
-                return self._json(200, app.platform.admin_square_state(self.context))
             return self._serve_static(path)
 
         def _dispatch_post(self) -> None:
@@ -1284,28 +1284,40 @@ def make_handler(app: WikiApp):
                 sort_order = data.get("sort_order", 0)
                 if not isinstance(sort_order, int): raise ApiError(422, "sort_order must be integer")
                 response, _ = self._platform_idempotency(data, lambda: app.platform.admin_upsert_category(
-                    self.context, match.group(1), _string(data, "slug", maximum=64, required=True),
+                    self.context or self.account_context, match.group(1), _string(data, "slug", maximum=64, required=True),
                     _string(data, "name", maximum=80, required=True), _string(data, "description", maximum=1000),
                     _string(data, "status", maximum=20, required=True), sort_order,
-                ))
+                ), scope=f"account:{self.account_context.user_id}")
                 return self._json(200, response)
             match = re.fullmatch(r"/api/admin/public-tags/([a-f0-9]{32})/update", path)
             if match:
                 self._require_role("admin")
                 _fields(data, {"slug", "name", "status"}, {"slug", "name", "status"})
                 response, _ = self._platform_idempotency(data, lambda: app.platform.admin_upsert_tag(
-                    self.context, match.group(1), _string(data, "slug", maximum=64, required=True),
+                    self.context or self.account_context, match.group(1), _string(data, "slug", maximum=64, required=True),
                     _string(data, "name", maximum=50, required=True), _string(data, "status", maximum=20, required=True),
-                ))
+                ), scope=f"account:{self.account_context.user_id}")
                 return self._json(200, response)
             match = re.fullmatch(r"/api/admin/public-categories/([a-f0-9]{32})/merge", path)
             if match:
                 self._require_role("admin")
                 _fields(data, {"target_id", "reason"}, {"target_id", "reason"})
                 response, _ = self._platform_idempotency(data, lambda: app.platform.admin_merge_category(
-                    self.context, match.group(1), _string(data, "target_id", maximum=32, required=True),
+                    self.context or self.account_context, match.group(1), _string(data, "target_id", maximum=32, required=True),
                     _string(data, "reason", maximum=1000, required=True),
-                ))
+                ), scope=f"account:{self.account_context.user_id}")
+                return self._json(200, response)
+            match = re.fullmatch(r"/api/admin/public-entries/([a-f0-9]{32})/category-assignment", path)
+            if match:
+                self._require_role("admin")
+                _fields(data, {"category", "reason"}, {"category", "reason"})
+                category = data.get("category")
+                if not isinstance(category, dict):
+                    raise ApiError(422, "category must be a taxonomy selection")
+                response, _ = self._platform_idempotency(data, lambda: app.platform.admin_assign_public_category(
+                    self.context or self.account_context, match.group(1), category,
+                    _string(data, "reason", maximum=1000, required=True),
+                ), scope=f"account:{self.account_context.user_id}")
                 return self._json(200, response)
             match = re.fullmatch(r"/api/admin/public-entries/([a-f0-9]{32})/featured", path)
             if match:
@@ -1323,11 +1335,11 @@ def make_handler(app: WikiApp):
                 items = data.get("items", [])
                 if not isinstance(items, list) or not all(isinstance(value, dict) for value in items): raise ApiError(422, "items must be objects")
                 response, _ = self._platform_idempotency(data, lambda: app.platform.admin_upsert_collection(
-                    self.context, _string(data, "id", maximum=32) or None,
+                    self.context or self.account_context, _string(data, "id", maximum=32) or None,
                     _string(data, "slug", maximum=64, required=True), _string(data, "title", maximum=120, required=True),
                     _string(data, "description", maximum=2000), _string(data, "status", maximum=20, required=True),
                     items, _string(data, "reason", maximum=1000, required=True),
-                ))
+                ), scope=f"account:{self.account_context.user_id}")
                 return self._json(200, response)
             match = re.fullmatch(r"/api/admin/public-entries/([a-f0-9]{32})/revisions/([a-f0-9]{32})/(?P<action>isolate|restore)", path)
             if match:

@@ -1525,8 +1525,89 @@ class SquareMixin:
             index_jobs = [dict(row) for row in db.execute(
                 "SELECT entry_id,status,attempts,last_error,not_before,updated_at FROM public_index_jobs ORDER BY updated_at",
             ).fetchall()]
+            uncategorized_rows = db.execute("""
+                SELECT e.id,e.current_revision_id revision_id,e.updated_at,
+                       r.version,r.snapshot_json,r.published_at
+                FROM public_entries e
+                JOIN public_revisions r ON r.id=e.current_revision_id
+                WHERE e.status='published' AND e.public_category_id IS NULL
+                  AND r.visibility='public'
+                ORDER BY e.updated_at DESC,e.id
+                LIMIT 500
+            """).fetchall()
+            uncategorized_entries = []
+            for row in uncategorized_rows:
+                snapshot = _public_snapshot(json.loads(row["snapshot_json"]))
+                uncategorized_entries.append({
+                    "id": row["id"], "revision_id": row["revision_id"],
+                    "version": row["version"], "title": snapshot["title"],
+                    "summary": snapshot["summary"], "published_at": row["published_at"],
+                    "updated_at": row["updated_at"],
+                })
         return {"categories": categories, "tags": tags, "collections": collections,
-                "category_mappings": mappings, "corrections": corrections, "index_jobs": index_jobs}
+                "category_mappings": mappings, "corrections": corrections, "index_jobs": index_jobs,
+                "uncategorized_entries": uncategorized_entries}
+
+    def admin_assign_public_category(
+        self, context: Any, entry_id: str, selection: dict, reason: str,
+    ) -> dict:
+        if not reason.strip():
+            raise ValueError("category assignment reason is required")
+        if not isinstance(selection, dict):
+            raise ValueError("invalid public category selection")
+        if selection.get("kind") == "create" and set(selection) == {"kind", "name"}:
+            selection = {"kind": "proposal", "name": selection["name"]}
+        elif selection.get("kind") != "existing" or set(selection) != {"kind", "id"}:
+            raise ValueError("invalid public category selection")
+        now = _now()
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._authorize_admin_in_transaction(db, context.user_id)
+            entry = db.execute("""
+                SELECT e.id,e.current_revision_id
+                FROM public_entries e
+                JOIN public_revisions r ON r.id=e.current_revision_id
+                WHERE e.id=? AND e.status='published' AND e.public_category_id IS NULL
+                  AND r.visibility='public'
+            """, (entry_id,)).fetchone()
+            if entry is None:
+                db.rollback()
+                raise FileNotFoundError(entry_id)
+            taxonomy = self._canonicalize_taxonomy_selection(
+                db, {"category": selection, "tags": []},
+            )
+            category_selection = taxonomy["category"]
+            taxonomy_decision = None
+            if category_selection["kind"] == "proposal":
+                taxonomy_decision = {
+                    "version": 1,
+                    "resolutions": {category_selection["key"]: {"action": "create"}},
+                }
+            category_id, _tag_ids, resolved = self._resolve_taxonomy_decision(
+                db, taxonomy, taxonomy_decision, context.user_id, now,
+            )
+            changed = db.execute("""
+                UPDATE public_entries SET public_category_id=?,updated_at=?
+                WHERE id=? AND status='published' AND public_category_id IS NULL
+                  AND current_revision_id=?
+            """, (category_id, now, entry_id, entry["current_revision_id"])).rowcount
+            if changed != 1:
+                db.rollback()
+                raise FileNotFoundError(entry_id)
+            index_current = self._refresh_square_entry(db, entry_id)
+            category = db.execute(
+                "SELECT id,slug,name,description,status,sort_order FROM public_categories WHERE id=?",
+                (category_id,),
+            ).fetchone()
+            action = resolved["resolutions"][0]["action"]
+            self._audit(db, context.user_id, "public_entry.category_assign", "public_entry", entry_id, {
+                "category_id": category_id, "resolution_action": action, "reason": reason.strip(),
+            })
+            db.commit()
+        return {
+            "entry_id": entry_id, "category": dict(category),
+            "resolution_action": action, "index_pending": not index_current,
+        }
 
     def admin_public_versions(self, context: Any, entry_id: str) -> list[dict]:
         if context.role != "admin":
