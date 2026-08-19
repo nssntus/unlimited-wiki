@@ -1650,6 +1650,8 @@ class SquareMixin:
     def admin_set_featured(self, context: Any, entry_id: str, featured: bool, reason: str, sort_order: int = 0) -> dict:
         if not reason.strip():
             raise ValueError("curation reason is required")
+        if type(sort_order) is not int or not -(2**63) <= sort_order <= 2**63 - 1:
+            raise ValueError("sort order must be a signed 64-bit integer")
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE"); self._authorize_admin_in_transaction(db, context.user_id)
             changed = db.execute("UPDATE public_entries SET featured_order=? WHERE id=? AND status='published'", (int(sort_order) if featured else None, entry_id)).rowcount

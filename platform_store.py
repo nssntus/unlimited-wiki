@@ -1889,6 +1889,7 @@ class PlatformStore(SquareMixin):
 
     def run_platform_idempotent(
         self, scope: str, endpoint: str, key: str, data: dict, action,
+        *, required_admin_user_id: str | None = None,
     ) -> tuple[dict, bool]:
         """Commit the platform mutation and its replay record in one transaction."""
         payload_hash = self._platform_payload_hash(data)
@@ -1897,6 +1898,8 @@ class PlatformStore(SquareMixin):
             self._transaction_context.rollback_callbacks = []
             try:
                 db.execute("BEGIN IMMEDIATE")
+                if required_admin_user_id is not None:
+                    self._authorize_admin_in_transaction(db, required_admin_user_id)
                 row = db.execute(
                     "SELECT * FROM platform_idempotency WHERE scope=? AND endpoint=? AND key=?",
                     (scope, endpoint, key),
@@ -3179,18 +3182,21 @@ class PlatformStore(SquareMixin):
             result.append(item)
         return result
 
-    def admin_public_entries(self, context: SessionContext, status: str) -> list[dict]:
-        if context.role != "admin":
-            raise PermissionError("admin role required")
+    def admin_public_entries(
+        self, context: SessionContext | AccountSessionContext, status: str,
+    ) -> list[dict]:
         if status not in {"published", "removed_by_admin"}:
             raise ValueError("invalid public entry status")
-        with self.connect() as db:
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN")
+            self._authorize_admin_in_transaction(db, context.user_id)
             rows = db.execute("""
                 SELECT e.id,e.status,e.author_id,e.moderation_reason,e.moderated_at,e.featured_order,
                        r.id revision_id,r.version,r.snapshot_json,r.content_hash,r.published_at,u.nickname
                 FROM public_entries e JOIN public_revisions r ON r.id=e.current_revision_id
                 JOIN users u ON u.id=e.author_id WHERE e.status=? ORDER BY e.updated_at DESC
             """, (status,)).fetchall()
+            db.commit()
         result = []
         for row in rows:
             snapshot = json.loads(row["snapshot_json"])
