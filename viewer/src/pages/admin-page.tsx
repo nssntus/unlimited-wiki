@@ -6,6 +6,8 @@ import {
   EyeIcon,
   FileWarningIcon,
   RotateCcwIcon,
+  SearchIcon,
+  StarIcon,
   Trash2Icon,
   XIcon,
 } from "lucide-react"
@@ -22,8 +24,10 @@ import {
   type Submission,
 } from "@/lib/api"
 import { MarkdownContent, StatusBadge } from "@/components/markdown-content"
+import { AdminFeaturedAction } from "@/features/admin-featured-action"
 import { CategoryPicker, type TaxonomySelection } from "@/features/taxonomy-picker"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   AlertDialog,
@@ -464,6 +468,20 @@ export function AdminCurationPage() {
   const [categoryReasons, setCategoryReasons] = useState<Record<string, string>>(
     {}
   )
+  const [featuredSearch, setFeaturedSearch] = useState("")
+  const [featuredFilter, setFeaturedFilter] = useState<
+    "all" | "featured" | "unfeatured"
+  >("all")
+  const [featuredTarget, setFeaturedTarget] = useState<AdminPublicEntry | null>(
+    null
+  )
+  const publishedEntries = useQuery({
+    queryKey: queryKeys.adminPublicEntries("published"),
+    queryFn: () =>
+      apiGet<AdminPublicEntry[]>(
+        "/api/admin/public-entries?status=published"
+      ),
+  })
   const [collection, setCollection] = useState({
     title: "",
     slug: "",
@@ -560,13 +578,120 @@ export function AdminCurationPage() {
       .filter((category) => category.status === "active" && category.id)
       .map((category) => ({ id: category.id!, name: category.name })) ?? []
   const uncategorizedEntries = state.data?.uncategorized_entries ?? []
+  const normalizedFeaturedSearch = featuredSearch.trim().toLocaleLowerCase()
+  const visibleFeaturedEntries = (publishedEntries.data ?? []).filter(
+    (entry) => {
+      if (featuredFilter === "featured" && !entry.featured) return false
+      if (featuredFilter === "unfeatured" && entry.featured) return false
+      if (!normalizedFeaturedSearch) return true
+      return `${entry.snapshot.title} ${entry.author_nickname}`
+        .toLocaleLowerCase()
+        .includes(normalizedFeaturedSearch)
+    }
+  )
+  const featuredCount =
+    publishedEntries.data?.filter((entry) => entry.featured).length ?? 0
   return (
     <main className="mx-auto max-w-5xl px-4 py-10">
       <p className="text-sm font-medium text-primary">Admin</p>
       <h1 className="mt-2 text-3xl font-semibold">分类与策展</h1>
       <p className="mt-3 text-muted-foreground">
-        为旧公开词条补充公共分类，并处理专题和纠错。
+        直接管理精选内容、待公共分类、专题和纠错。
       </p>
+      <section className="mt-10 border-y py-6">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="font-semibold">精选管理</h2>
+            <p className="mt-1 text-sm text-muted-foreground">
+              已精选 {featuredCount} 篇。无需打开正文预览即可加入或取消精选。
+            </p>
+          </div>
+          <Badge variant="outline">
+            共 {publishedEntries.data?.length ?? 0} 篇已发布
+          </Badge>
+        </div>
+        <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="relative w-full sm:max-w-sm">
+            <SearchIcon className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              className="pl-9"
+              value={featuredSearch}
+              placeholder="搜索标题或作者"
+              onChange={(event) => setFeaturedSearch(event.target.value)}
+            />
+          </div>
+          <Tabs
+            value={featuredFilter}
+            onValueChange={(value) =>
+              setFeaturedFilter(value as typeof featuredFilter)
+            }
+          >
+            <TabsList className="w-full sm:w-auto">
+              <TabsTrigger value="all">全部</TabsTrigger>
+              <TabsTrigger value="featured">已精选</TabsTrigger>
+              <TabsTrigger value="unfeatured">未精选</TabsTrigger>
+            </TabsList>
+          </Tabs>
+        </div>
+        {publishedEntries.isLoading ? (
+          <Skeleton className="mt-5 h-48 w-full" />
+        ) : publishedEntries.isError ? (
+          <Alert className="mt-5" variant="destructive">
+            <AlertTitle>无法加载已发布词条</AlertTitle>
+            <AlertDescription>
+              <p>{publishedEntries.error.message}</p>
+              <Button
+                className="mt-3"
+                variant="outline"
+                onClick={() => void publishedEntries.refetch()}
+              >
+                <RotateCcwIcon data-icon="inline-start" />重试
+              </Button>
+            </AlertDescription>
+          </Alert>
+        ) : visibleFeaturedEntries.length ? (
+          <div className="mt-5 divide-y border-t">
+            {visibleFeaturedEntries.map((entry) => (
+              <article
+                key={entry.id}
+                className="flex flex-col gap-3 py-4 sm:flex-row sm:items-center sm:justify-between"
+              >
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Link
+                      className="truncate font-medium text-link"
+                      to={`/square/entries/${entry.id}`}
+                    >
+                      {entry.snapshot.title}
+                    </Link>
+                    {entry.featured ? (
+                      <Badge>精选 · 顺序 {entry.featured_order}</Badge>
+                    ) : (
+                      <Badge variant="outline">未精选</Badge>
+                    )}
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {entry.author_nickname} · v{entry.version} ·{" "}
+                    {new Date(entry.published_at).toLocaleString()}
+                  </p>
+                </div>
+                <Button
+                  className="w-full sm:w-auto"
+                  variant={entry.featured ? "outline" : "default"}
+                  onClick={() => setFeaturedTarget(entry)}
+                >
+                  <StarIcon data-icon="inline-start" />
+                  {entry.featured ? "取消精选" : "加入精选"}
+                </Button>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <p className="mt-5 border-t py-10 text-center text-sm text-muted-foreground">
+            没有符合当前筛选的词条
+          </p>
+        )}
+      </section>
       <section className="mt-10">
         <h2 className="font-semibold">待公共分类</h2>
         <p className="mt-2 text-sm text-muted-foreground">
@@ -802,6 +927,11 @@ export function AdminCurationPage() {
           </Button>
         </FieldGroup>
       </section>
+      <AdminFeaturedAction
+        key={featuredTarget?.id ?? "curation-feature"}
+        entry={featuredTarget}
+        onClose={() => setFeaturedTarget(null)}
+      />
     </main>
   )
 }
@@ -1006,20 +1136,6 @@ function AdminEntryTools({
       client.invalidateQueries({ queryKey: queryKeys.square }),
     ])
   }
-  const feature = useMutation({
-    mutationFn: () =>
-      apiPost(`/api/admin/public-entries/${entry!.id}/featured`, {
-        featured: !entry!.featured,
-        reason,
-        sort_order: entry!.featured ? 0 : 0,
-      }),
-    onSuccess: async () => {
-      await refresh()
-      toast.success(entry?.featured ? "已取消精选" : "已加入精选")
-      onClose()
-    },
-    onError: (error) => toast.error(error.message),
-  })
   const isolate = useMutation({
     mutationFn: ({
       revision,
@@ -1056,31 +1172,16 @@ function AdminEntryTools({
           />
         )}
         <section className="border-t pt-5">
-          <Field>
-            <FieldLabel htmlFor="curation-reason">策展或隔离理由</FieldLabel>
+          <h3 className="text-sm font-semibold">历史修订</h3>
+          <Field className="mt-3">
+            <FieldLabel htmlFor="isolation-reason">版本隔离理由</FieldLabel>
             <Textarea
-              id="curation-reason"
+              id="isolation-reason"
               value={reason}
               onChange={(event) => setReason(event.target.value)}
-              placeholder="该理由会进入审计记录"
+              placeholder="隔离或恢复历史版本时写入审计记录"
             />
           </Field>
-          <div className="mt-3">
-            <Button
-              variant="outline"
-              disabled={
-                !reason.trim() ||
-                feature.isPending ||
-                entry?.status !== "published"
-              }
-              onClick={() => feature.mutate()}
-            >
-              {entry?.featured ? "取消精选" : "加入精选"}
-            </Button>
-          </div>
-        </section>
-        <section className="border-t pt-5">
-          <h3 className="text-sm font-semibold">历史修订</h3>
           <div className="mt-3 divide-y border-y">
             {versions.data?.map((version) => (
               <div
@@ -1132,6 +1233,9 @@ export function AdminContentPage() {
     "published"
   )
   const [preview, setPreview] = useState<AdminPublicEntry | null>(null)
+  const [featuredTarget, setFeaturedTarget] = useState<AdminPublicEntry | null>(
+    null
+  )
   const [target, setTarget] = useState<AdminPublicEntry | null>(null)
   const [reason, setReason] = useState("")
   const rows = useQuery({
@@ -1193,6 +1297,7 @@ export function AdminContentPage() {
               <TableHead>词条</TableHead>
               <TableHead>作者</TableHead>
               <TableHead>版本</TableHead>
+              <TableHead>精选</TableHead>
               <TableHead>处理信息</TableHead>
               <TableHead className="text-right">操作</TableHead>
             </TableRow>
@@ -1210,6 +1315,25 @@ export function AdminContentPage() {
                 </TableCell>
                 <TableCell>{entry.author_nickname}</TableCell>
                 <TableCell>v{entry.version}</TableCell>
+                <TableCell>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {entry.featured ? (
+                      <Badge>精选 · 顺序 {entry.featured_order}</Badge>
+                    ) : (
+                      <Badge variant="outline">未精选</Badge>
+                    )}
+                    {entry.status === "published" && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => setFeaturedTarget(entry)}
+                      >
+                        <StarIcon data-icon="inline-start" />
+                        {entry.featured ? "取消" : "加入"}
+                      </Button>
+                    )}
+                  </div>
+                </TableCell>
                 <TableCell>
                   <div className="max-w-72 text-xs whitespace-normal text-muted-foreground">
                     {entry.moderation_reason ||
@@ -1252,6 +1376,11 @@ export function AdminContentPage() {
         </div>
       )}
       <AdminEntryTools entry={preview} onClose={() => setPreview(null)} />
+      <AdminFeaturedAction
+        key={featuredTarget?.id ?? "content-feature"}
+        entry={featuredTarget}
+        onClose={() => setFeaturedTarget(null)}
+      />
       <AlertDialog
         open={Boolean(target)}
         onOpenChange={(open) => {

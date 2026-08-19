@@ -719,6 +719,14 @@ Visible body
     assert "private-research" not in json.dumps(public, ensure_ascii=False)
     assert "square" not in public["snapshot"]
     assert "private/raw/path.md" not in json.dumps(public, ensure_ascii=False)
+    with pytest.raises(ValueError, match="signed 64-bit"):
+        store.admin_set_featured(context, entry_id, True, "Invalid boolean order", True)
+    store.admin_set_featured(context, entry_id, True, "Minimum order", -(2**63))
+    store.admin_set_featured(context, entry_id, True, "Maximum order", 2**63 - 1)
+    with pytest.raises(ValueError, match="signed 64-bit"):
+        store.admin_set_featured(context, entry_id, True, "Below minimum", -(2**63) - 1)
+    with pytest.raises(ValueError, match="signed 64-bit"):
+        store.admin_set_featured(context, entry_id, True, "Above maximum", 2**63)
     store.admin_set_featured(context, entry_id, True, "Useful overview", 3)
     with store.connect() as db:
         after = db.execute("SELECT snapshot_json,content_hash FROM public_revisions WHERE entry_id=?", (entry_id,)).fetchone()

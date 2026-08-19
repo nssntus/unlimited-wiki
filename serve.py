@@ -844,7 +844,12 @@ def make_handler(app: WikiApp):
                     raise ApiError(409, "workspace selection required", details={"code": "workspace_selection_required"})
                 scope = f"workspace:{self.context.workspace_id}"
             try:
-                return app.platform.run_platform_idempotent(scope, endpoint, key, data, action)
+                return app.platform.run_platform_idempotent(
+                    scope, endpoint, key, data, action,
+                    required_admin_user_id=(
+                        self.account_context.user_id if endpoint.startswith("/api/admin/") else None
+                    ),
+                )
             except PlatformIdempotencyError as exc:
                 raise ApiError(409, str(exc)) from exc
 
@@ -1039,6 +1044,12 @@ def make_handler(app: WikiApp):
             if path == "/api/admin/square":
                 self._require_role("admin")
                 return self._json(200, app.platform.admin_square_state(self.context or self.account_context))
+            if path == "/api/admin/public-entries":
+                self._require_role("admin")
+                return self._json(200, app.platform.admin_public_entries(
+                    self.context or self.account_context,
+                    _single_query(parsed, "status") or "published",
+                ))
             if not path.startswith("/api/"):
                 return self._serve_static(path)
 
@@ -1123,11 +1134,6 @@ def make_handler(app: WikiApp):
             if path == "/api/admin/reports":
                 self._require_role("admin")
                 return self._json(200, app.platform.admin_reports(self.context))
-            if path == "/api/admin/public-entries":
-                self._require_role("admin")
-                return self._json(200, app.platform.admin_public_entries(
-                    self.context, _single_query(parsed, "status") or "published",
-                ))
             match = re.fullmatch(r"/api/admin/public-entries/([a-f0-9]{32})/revisions", path)
             if match:
                 self._require_role("admin")
@@ -1323,11 +1329,17 @@ def make_handler(app: WikiApp):
             if match:
                 self._require_role("admin")
                 _fields(data, {"featured", "reason", "sort_order"}, {"featured", "reason"})
-                if not isinstance(data.get("featured"), bool) or not isinstance(data.get("sort_order", 0), int): raise ApiError(422, "invalid featured options")
+                sort_order = data.get("sort_order", 0)
+                if (
+                    not isinstance(data.get("featured"), bool)
+                    or type(sort_order) is not int
+                    or not -(2**63) <= sort_order <= 2**63 - 1
+                ):
+                    raise ApiError(422, "invalid featured options")
                 response, _ = self._platform_idempotency(data, lambda: app.platform.admin_set_featured(
-                    self.context, match.group(1), data["featured"],
-                    _string(data, "reason", maximum=1000, required=True), data.get("sort_order", 0),
-                ))
+                    self.context or self.account_context, match.group(1), data["featured"],
+                    _string(data, "reason", maximum=1000, required=True), sort_order,
+                ), scope=f"account:{self.account_context.user_id}")
                 return self._json(200, response)
             if path == "/api/admin/public-collections":
                 self._require_role("admin")

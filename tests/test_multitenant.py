@@ -250,7 +250,7 @@ def test_logout_revoke_all_and_role_change_take_effect_immediately(multi_server)
     assert alice.request("GET", "/api/articles")[0] == 401
 
 
-def test_admin_assigns_uncategorized_public_entry_without_current_workspace(multi_server):
+def test_admin_assigns_uncategorized_public_entry_without_current_workspace(multi_server, monkeypatch):
     app, base = multi_server
     admin, member = Client(base), Client(base)
     assert admin.register("taxonomy-admin@example.com", "Taxonomy Admin")[0] == 201
@@ -288,6 +288,96 @@ def test_admin_assigns_uncategorized_public_entry_without_current_workspace(mult
         db.execute("UPDATE sessions SET current_workspace_id=NULL WHERE user_id=?", (context.user_id,))
     assert admin.request("GET", "/api/auth/session")[1]["workspace_selection_required"] is True
     assert admin.request("GET", "/api/admin/square")[0] == 200
+    published_status, published_entries = admin.request(
+        "GET", "/api/admin/public-entries?status=published",
+    )
+    assert published_status == 200
+    assert any(item["id"] == entry_id for item in published_entries)
+    original_admin_public_entries = app.platform.admin_public_entries
+
+    def revoke_admin_before_read(stale_context, status):
+        with app.platform.connect() as db:
+            db.execute("UPDATE users SET role='user' WHERE id=?", (stale_context.user_id,))
+        try:
+            return original_admin_public_entries(stale_context, status)
+        finally:
+            with app.platform.connect() as db:
+                db.execute("UPDATE users SET role='admin' WHERE id=?", (stale_context.user_id,))
+
+    monkeypatch.setattr(app.platform, "admin_public_entries", revoke_admin_before_read)
+    assert admin.request("GET", "/api/admin/public-entries?status=published")[0] == 403
+    monkeypatch.setattr(app.platform, "admin_public_entries", original_admin_public_entries)
+    assert member.request(
+        "POST", f"/api/admin/public-entries/{entry_id}/featured",
+        {"featured": True, "reason": "Member bypass"}, key="member-feature-bypass",
+    )[0] == 403
+    for index, invalid_order in enumerate((True, 1.5, "7")):
+        assert admin.request(
+            "POST", f"/api/admin/public-entries/{entry_id}/featured",
+            {"featured": True, "reason": "Invalid order type", "sort_order": invalid_order},
+            key=f"admin-feature-invalid-order-{index}",
+        )[0] == 422
+    for label, boundary_order in (("min", -(2**63)), ("max", 2**63 - 1)):
+        boundary_status, boundary = admin.request(
+            "POST", f"/api/admin/public-entries/{entry_id}/featured",
+            {"featured": True, "reason": f"Valid {label} order", "sort_order": boundary_order},
+            key=f"admin-feature-{label}-order",
+        )
+        assert boundary_status == 200
+        assert boundary["sort_order"] == boundary_order
+    for label, invalid_order in (("below-min", -(2**63) - 1), ("above-max", 2**63)):
+        assert admin.request(
+            "POST", f"/api/admin/public-entries/{entry_id}/featured",
+            {"featured": True, "reason": f"Invalid {label} order", "sort_order": invalid_order},
+            key=f"admin-feature-{label}-order",
+        )[0] == 422
+    featured_status, featured = admin.request(
+        "POST", f"/api/admin/public-entries/{entry_id}/featured",
+        {"featured": True, "reason": "Feature from account-level curation", "sort_order": 7},
+        key="admin-account-feature",
+    )
+    assert featured_status == 200
+    assert featured["featured"] is True
+    assert featured["sort_order"] == 7
+    replay_status, replayed = admin.request(
+        "POST", f"/api/admin/public-entries/{entry_id}/featured",
+        {"featured": True, "reason": "Feature from account-level curation", "sort_order": 7},
+        key="admin-account-feature",
+    )
+    assert replay_status == 200
+    assert replayed == featured
+    original_run_platform_idempotent = app.platform.run_platform_idempotent
+
+    def revoke_admin_before_replay(*args, **kwargs):
+        with app.platform.connect() as db:
+            db.execute("UPDATE users SET role='user' WHERE id=?", (context.user_id,))
+        try:
+            return original_run_platform_idempotent(*args, **kwargs)
+        finally:
+            with app.platform.connect() as db:
+                db.execute("UPDATE users SET role='admin' WHERE id=?", (context.user_id,))
+
+    monkeypatch.setattr(app.platform, "run_platform_idempotent", revoke_admin_before_replay)
+    assert admin.request(
+        "POST", f"/api/admin/public-entries/{entry_id}/featured",
+        {"featured": True, "reason": "Feature from account-level curation", "sort_order": 7},
+        key="admin-account-feature",
+    )[0] == 403
+    monkeypatch.setattr(app.platform, "run_platform_idempotent", original_run_platform_idempotent)
+    with app.platform.connect() as db:
+        assert db.execute(
+            """SELECT COUNT(*) FROM curation_records
+               WHERE object_id=? AND action='feature' AND reason=?""",
+            (entry_id, "Feature from account-level curation"),
+        ).fetchone()[0] == 1
+    assert next(
+        item for item in admin.request(
+            "GET", "/api/admin/public-entries?status=published",
+        )[1] if item["id"] == entry_id
+    )["featured_order"] == 7
+    assert any(item["id"] == entry_id for item in Client(base).request(
+        "GET", "/api/public/home",
+    )[1]["featured"])
     assigned_status, assigned = admin.request(
         "POST", f"/api/admin/public-entries/{entry_id}/category-assignment",
         {"category": {"kind": "create", "name": "Instant Public Category"}, "reason": "Resolve legacy queue"},
