@@ -127,6 +127,49 @@ def test_private_routes_require_session_and_static_login_shell_is_public(multi_s
     assert anonymous.request("GET", "/api/public/entries")[1] == []
 
 
+@pytest.mark.parametrize(
+    ("filename", "content_types", "mime_override"),
+    [
+        ("favicon.svg", {"image/svg+xml"}, None),
+        ("favicon.ico", {"image/x-icon", "image/vnd.microsoft.icon"}, None),
+        (
+            "favicon.ico",
+            {"image/x-icon", "image/vnd.microsoft.icon"},
+            "image/vnd.microsoft.icon",
+        ),
+        ("apple-touch-icon.png", {"image/png"}, None),
+    ],
+)
+def test_brand_assets_are_served_as_images(
+    multi_server,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    content_types: set[str],
+    mime_override: str | None,
+):
+    app, base = multi_server
+    source = Path(__file__).resolve().parents[1] / "viewer" / "public" / filename
+    (app.dist_dir / filename).write_bytes(source.read_bytes())
+    if mime_override is not None:
+        original_guess_type = __import__("serve").mimetypes.guess_type
+        monkeypatch.setattr(
+            "serve.mimetypes.guess_type",
+            lambda name: (mime_override, None) if name.endswith(".ico") else original_guess_type(name),
+        )
+    parsed = urlsplit(base)
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+    connection.request("GET", f"/{filename}")
+    response = connection.getresponse()
+    body = response.read()
+    connection.close()
+
+    assert response.status == 200
+    assert response.getheader("Content-Type") in content_types
+    assert response.getheader("Cache-Control") == "no-store"
+    assert body == source.read_bytes()
+    assert not body.lstrip().lower().startswith(b"<!doctype html")
+
+
 def test_share_preview_rejects_private_or_unselected_public_sources(multi_server):
     app, base = multi_server
     author = Client(base)
