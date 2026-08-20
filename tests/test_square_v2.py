@@ -3,6 +3,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -1342,11 +1343,88 @@ def test_import_workspace_precondition_and_recovered_operation_retry(square):
         assert replayed["replay"] is True
         store.finish_public_import(context, intent["id"])
         store.remap_public_import_paths(
-            context.workspace_id, {intent["private_path"]: "concepts/moved-import.md"},
+            context.workspace_id,
+            [{
+                "article_id": intent["private_article_id"],
+                "private_path": "concepts/moved-import.md",
+                "article_revision": "a" * 64,
+            }],
         )
         assert store.my_square_library(context)["imports"][0]["private_path"] == "concepts/moved-import.md"
     finally:
         service.close()
+
+
+def test_public_import_path_projection_converges_after_late_first_move_callback(square):
+    store, context, category, _tag = square
+    approved = _publish(
+        store, context,
+        _snapshot("Ordered projection", "Body", category_id=category["id"], permission="allow_private_copy"),
+        article_id="9" * 32, source_revision="r1", category_id=category["id"],
+    )
+    detail = store.get_public_v2(approved["public_entry_id"])
+    intent = store.begin_public_import(
+        context, approved["public_entry_id"], detail["revision_id"],
+        expected_workspace_id=context.workspace_id,
+        expected_policy_version=REUSE_POLICY_VERSION, acknowledged=True,
+    )
+    root = store.workspace_root(context.workspace_root_name)
+    seed = WikiService(root, start_worker=False)
+    imported = seed.import_public_article(intent)
+    store.finish_public_import(context, intent["id"])
+    seed.state.record_raw(
+        "raw/local/ordered-projection.md", "bytes", "text", "imported",
+        imported["article"]["path"], imported["operation_id"],
+    )
+    seed.close()
+
+    first_callback_started = threading.Event()
+    release_first_callback = threading.Event()
+    callback_calls = 0
+
+    def delayed_projection(projections: list[dict[str, str]]) -> None:
+        nonlocal callback_calls
+        callback_calls += 1
+        if callback_calls == 1:
+            first_callback_started.set()
+            assert release_first_callback.wait(5)
+        store.remap_public_import_paths(context.workspace_id, projections)
+
+    def immediate_projection(projections: list[dict[str, str]]) -> None:
+        store.remap_public_import_paths(context.workspace_id, projections)
+
+    first = WikiService(root, start_worker=False, path_remap_callback=delayed_projection)
+    second = WikiService(root, start_worker=False, path_remap_callback=immediate_projection)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_move = pool.submit(
+                first.apply_meta,
+                imported["article"]["path"],
+                category={"kind": "create", "name": "First Move"},
+                status="词条",
+            )
+            assert first_callback_started.wait(5)
+            current = second.resolve_article_id(intent["private_article_id"])
+            second_move = pool.submit(
+                second.apply_meta,
+                current["path"],
+                category={"kind": "create", "name": "Second Move"},
+                status="词条",
+            )
+            moved_second = second_move.result(timeout=5)
+            release_first_callback.set()
+            moved_first = first_move.result(timeout=5)
+
+        final_path = moved_second["article"]["path"]
+        assert moved_first["article"]["path"] != final_path
+        assert second.resolve_article_id(intent["private_article_id"])["path"] == final_path
+        assert second.state.raw_records()[0]["target_path"] == final_path
+        assert store.my_square_library(context)["imports"][0]["private_path"] == final_path
+        assert callback_calls == 2
+    finally:
+        release_first_callback.set()
+        first.close()
+        second.close()
 
 
 def test_stale_search_projection_is_hidden_from_profile_collection_and_related(square):

@@ -127,6 +127,62 @@ def test_private_routes_require_session_and_static_login_shell_is_public(multi_s
     assert anonymous.request("GET", "/api/public/entries")[1] == []
 
 
+def test_manual_article_http_create_is_idempotent_and_workspace_scoped(multi_server):
+    _app, base = multi_server
+    alice, bob = Client(base), Client(base)
+    assert alice.register("manual-alice@example.com", "Manual Alice")[0] == 201
+    assert bob.register("manual-bob@example.com", "Manual Bob")[0] == 201
+    payload = {
+        "title": "Manual HTTP",
+        "markdown": "## 概述\n\n由用户手动输入的正文。",
+        "category": {"kind": "create", "name": "Handwritten"},
+        "tags": ["Markdown"],
+    }
+
+    status, created = alice.request("POST", "/api/articles", payload, key="manual-create")
+    assert status == 201
+    assert created["article"]["path"] == "Handwritten/Manual-HTTP.md"
+    assert created["article"]["tags"] == ["Markdown"]
+    article_id = created["article"]["article_id"]
+
+    status, replay = alice.request("POST", "/api/articles", payload, key="manual-create")
+    assert status == 200
+    assert replay["article"]["article_id"] == article_id
+    assert len(alice.request("GET", "/api/articles")[1]) == 1
+
+    status, error = alice.request("POST", "/api/articles", {**payload, "markdown": "Changed"}, key="manual-create")
+    assert status == 409
+    assert "idempotency" in error["error"]
+
+    status, recovered = alice.request("POST", "/api/articles", payload, key="manual-recovery")
+    assert status == 200
+    assert recovered["article"]["article_id"] == article_id
+
+    status, duplicate = alice.request("POST", "/api/articles", {**payload, "markdown": "Different body"}, key="manual-duplicate")
+    assert status == 409
+    assert "already exists" in duplicate["error"]
+
+    status, isolated = bob.request("POST", "/api/articles", payload, key="manual-create")
+    assert status == 201
+    assert isolated["article"]["article_id"] != article_id
+
+
+def test_manual_article_http_rejects_invalid_payload_without_writes(multi_server):
+    _app, base = multi_server
+    owner = Client(base)
+    assert owner.register("manual-invalid@example.com", "Manual Invalid")[0] == 201
+    payload = {
+        "title": "Invalid HTTP",
+        "markdown": "# Forged title\n\nBody",
+        "category": {"kind": "inbox"},
+        "tags": [],
+    }
+    assert owner.request("POST", "/api/articles", payload, key="invalid-h1")[0] == 422
+    assert owner.request("POST", "/api/articles", {**payload, "markdown": "Body", "category": "_inbox"}, key="invalid-category")[0] == 422
+    assert owner.request("POST", "/api/articles", {**payload, "markdown": "Body", "tags": "tag"}, key="invalid-tags")[0] == 422
+    assert owner.request("GET", "/api/articles")[1] == []
+
+
 @pytest.mark.parametrize(
     ("filename", "content_types", "mime_override"),
     [

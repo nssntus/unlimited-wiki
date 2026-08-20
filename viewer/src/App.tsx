@@ -1,5 +1,5 @@
 import { lazy, Suspense } from "react"
-import { HashRouter, Route, Routes } from "react-router-dom"
+import { createHashRouter, createRoutesFromElements, Outlet, Route, RouterProvider } from "react-router-dom"
 
 import { WikiShell } from "@/layouts/wiki-shell"
 import { PublicShell } from "@/layouts/public-shell"
@@ -10,6 +10,7 @@ import { WorkspaceDirectoryPage } from "@/features/workspace-selection-gate"
 
 const ArticlePage = lazy(() => import("@/pages/article-page").then((module) => ({ default: module.ArticlePage })))
 const EditorPage = lazy(() => import("@/pages/editor-page").then((module) => ({ default: module.EditorPage })))
+const NewArticlePage = lazy(() => import("@/pages/new-article-page").then((module) => ({ default: module.NewArticlePage })))
 const HealthPage = lazy(() => import("@/pages/health-page").then((module) => ({ default: module.HealthPage })))
 const InboxPage = lazy(() => import("@/pages/inbox-page").then((module) => ({ default: module.InboxPage })))
 const IngestPage = lazy(() => import("@/pages/ingest-page").then((module) => ({ default: module.IngestPage })))
@@ -46,12 +47,18 @@ const AdminContentPage = lazy(() => import("@/pages/admin-page").then((module) =
 const AdminCurationPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminCurationPage })))
 const AdminPublicIndexPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminPublicIndexPage })))
 
-export function App() {
+function AppRoot() {
   return (
-    <HashRouter>
-      <SessionProvider>
-        <Suspense fallback={<div className="p-8"><Skeleton className="h-[70svh] w-full" /></div>}>
-          <Routes>
+    <SessionProvider>
+      <Suspense fallback={<div className="p-8"><Skeleton className="h-[70svh] w-full" /></div>}>
+        <Outlet />
+      </Suspense>
+    </SessionProvider>
+  )
+}
+
+const router = createHashRouter(createRoutesFromElements(
+  <Route element={<AppRoot />}>
             <Route path="/login" element={<AuthPage mode="login" />} />
             <Route path="/register" element={<AuthPage mode="register" />} />
             <Route path="/recover" element={<AuthPage mode="recover" />} />
@@ -81,6 +88,7 @@ export function App() {
             <Route path="/health" element={<HealthPage />} />
             <Route path="/tasks" element={<TasksPage />} />
             <Route path="/merge" element={<RequireSession permission="wiki.write"><MergePage /></RequireSession>} />
+            <Route path="/new" element={<RequireSession permission="wiki.write"><NewArticlePage /></RequireSession>} />
             <Route path="/edit/*" element={<RequireSession permission="wiki.write"><EditorPage /></RequireSession>} />
             <Route path="/raw/*" element={<RawPage />} />
             <Route path="/settings" element={<SettingsPage />} />
@@ -100,11 +108,11 @@ export function App() {
               <Route path="/admin/public-index" element={<AdminPublicIndexPage />} />
               <Route path="/admin/curation" element={<AdminCurationPage />} />
             </Route>
-          </Routes>
-        </Suspense>
-      </SessionProvider>
-    </HashRouter>
-  )
+  </Route>,
+))
+
+export function App() {
+  return <RouterProvider router={router} />
 }
 
 export default App

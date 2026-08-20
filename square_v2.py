@@ -1212,16 +1212,33 @@ class SquareMixin:
             )
             db.commit()
 
-    def remap_public_import_paths(self, workspace_id: str, path_map: dict[str, str]) -> None:
-        if not path_map:
+    def remap_public_import_paths(self, workspace_id: str, projections: list[dict[str, str]]) -> None:
+        if not projections:
             return
+        normalized: list[tuple[str, str]] = []
+        for item in projections:
+            if not isinstance(item, dict) or set(item) != {"article_id", "private_path", "article_revision"}:
+                raise ValueError("invalid article path projection")
+            article_id, private_path, article_revision = (
+                item["article_id"], item["private_path"], item["article_revision"],
+            )
+            if not isinstance(article_id, str) or re.fullmatch(r"[a-f0-9]{32}", article_id) is None:
+                raise ValueError("invalid article path projection")
+            if (
+                not isinstance(private_path, str) or not private_path or "\\" in private_path
+                or private_path.startswith("/") or any(part in {"", ".", ".."} for part in private_path.split("/"))
+            ):
+                raise ValueError("invalid article path projection")
+            if not isinstance(article_revision, str) or re.fullmatch(r"[a-f0-9]{64}", article_revision) is None:
+                raise ValueError("invalid article path projection")
+            normalized.append((article_id, private_path))
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            for old, new in path_map.items():
+            for article_id, private_path in normalized:
                 db.execute("""
                     UPDATE public_imports SET private_path=?,updated_at=?
-                    WHERE workspace_id=? AND private_path=? AND status='complete'
-                """, (new, _now(), workspace_id, old))
+                    WHERE workspace_id=? AND private_article_id=? AND status='complete'
+                """, (private_path, _now(), workspace_id, article_id))
             db.commit()
 
     def update_public_import_path(self, context: Any, import_id: str, article_id: str, path: str) -> dict:

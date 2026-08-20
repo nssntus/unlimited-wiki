@@ -17,11 +17,13 @@ import { Field, FieldError, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Spinner } from "@/components/ui/spinner"
 import { useSession } from "@/features/session-context"
+import { useUnsavedChanges } from "@/features/unsaved-changes-context"
 
 export function WorkspaceSwitcher() {
   const client = useQueryClient()
   const navigate = useNavigate()
   const { session, switchWorkspace, switchingWorkspace } = useSession()
+  const { runAfterDiscard } = useUnsavedChanges()
   const [createOpen, setCreateOpen] = useState(false)
   const [name, setName] = useState("")
   const workspaces = useQuery({
@@ -56,7 +58,7 @@ export function WorkspaceSwitcher() {
       <DropdownMenuContent className="min-w-64">
         <DropdownMenuGroup>
           <DropdownMenuLabel>切换 Wiki 空间</DropdownMenuLabel>
-          {(workspaces.data ?? []).map((workspace) => <DropdownMenuItem key={workspace.id} disabled={switchingWorkspace} onClick={() => workspace.id !== current?.id && switching.mutate(workspace.id)}>
+          {(workspaces.data ?? []).map((workspace) => <DropdownMenuItem key={workspace.id} disabled={switchingWorkspace} onClick={() => workspace.id !== current?.id && void runAfterDiscard(() => switching.mutateAsync(workspace.id)).catch(() => undefined)}>
             {workspace.kind === "team" ? <Building2Icon /> : <UserRoundIcon />}
             <span className="min-w-0 flex-1"><span className="block truncate">{workspace.display_name}</span><span className="text-xs text-muted-foreground">{workspace.role === "owner" ? "Owner" : workspace.role === "editor" ? "Editor" : "Viewer"}</span></span>
             {workspace.id === current?.id && <CheckIcon className="ml-auto" />}
@@ -71,7 +73,7 @@ export function WorkspaceSwitcher() {
       <DialogContent>
         <DialogHeader><DialogTitle>创建团队空间</DialogTitle><DialogDescription>创建后可邀请已有账号协作。空间内容、任务和模型配置彼此隔离。</DialogDescription></DialogHeader>
         <Field><FieldLabel htmlFor="workspace-name">空间名称</FieldLabel><Input id="workspace-name" value={name} maxLength={80} autoFocus onChange={(event) => setName(event.target.value)} placeholder="例如：产品知识库" />{create.isError && <FieldError>{create.error.message}</FieldError>}</Field>
-        <DialogFooter><Button variant="outline" onClick={() => setCreateOpen(false)}>取消</Button><Button disabled={!name.trim() || create.isPending} onClick={() => create.mutate()}>{create.isPending && <Spinner data-icon="inline-start" />}创建</Button></DialogFooter>
+        <DialogFooter><Button variant="outline" onClick={() => setCreateOpen(false)}>取消</Button><Button disabled={!name.trim() || create.isPending} onClick={() => void runAfterDiscard(() => create.mutateAsync()).catch(() => undefined)}>{create.isPending && <Spinner data-icon="inline-start" />}创建</Button></DialogFooter>
       </DialogContent>
     </Dialog>
   </>

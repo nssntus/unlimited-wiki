@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import threading
 
 import pytest
 
 import dynamic_categories as dc
 import storage
+import wiki_service as wiki_service_module
 from state_store import StateStore, now_iso
 from wiki_service import WikiService
 
@@ -50,6 +52,396 @@ def test_generate_can_save_to_inbox_or_create_category_with_tags(service: WikiSe
     assert created["category_label"] == "Research Notes"
     assert created["tags"] == ["AI", "Workflow"]
     assert (service.root / "wiki" / "Research-Notes").is_dir()
+
+
+def test_manual_article_create_is_atomic_and_replays_committed_result(service: WikiService):
+    result = service.create_article(
+        "Manual Knowledge",
+        "## 概述\n\n全部内容由用户手动输入。\n\n- 第一项\n- 第二项",
+        category={"kind": "create", "name": "Manual Notes"},
+        tags=["Writing", "writing"],
+    )
+    article = result["article"]
+
+    assert result["replayed"] is False
+    assert result["created_category"] is True
+    assert article["path"] == "Manual-Notes/Manual-Knowledge.md"
+    assert article["category_label"] == "Manual Notes"
+    assert article["content_status"] == "草稿"
+    assert article["classification_status"] == "confirmed"
+    assert article["tags"] == ["Writing"]
+    assert len(article["article_id"]) == 32
+    assert "全部内容由用户手动输入" in article["markdown"]
+    assert "Manual Knowledge" in (service.root / "wiki" / "index.md").read_text(encoding="utf-8")
+
+    replay = service.create_article(
+        "Manual Knowledge",
+        "## 概述\n\n全部内容由用户手动输入。\n\n- 第一项\n- 第二项",
+        category={"kind": "create", "name": "Manual Notes"},
+        tags=["Writing", "writing"],
+    )
+    assert replay["replayed"] is True
+    assert replay["operation_id"] == result["operation_id"]
+    assert replay["article"]["article_id"] == article["article_id"]
+
+
+def test_manual_article_create_rolls_back_new_category_and_retries(service: WikiService, monkeypatch: pytest.MonkeyPatch):
+    registry_before = (service.root / dc.REGISTRY_REL).read_bytes()
+    original_write = storage.atomic_write
+    failed = False
+
+    def fail_once(path: Path, data: bytes):
+        nonlocal failed
+        if not failed and path.name == "log.md":
+            failed = True
+            raise OSError("injected manual create failure")
+        return original_write(path, data)
+
+    monkeypatch.setattr(storage, "atomic_write", fail_once)
+    with pytest.raises(OSError, match="manual create failure"):
+        service.create_article(
+            "Retry Manual",
+            "正文。",
+            category={"kind": "create", "name": "Retry Manual Category"},
+            tags=["retry"],
+        )
+
+    assert (service.root / dc.REGISTRY_REL).read_bytes() == registry_before
+    assert not (service.root / "wiki" / "Retry-Manual-Category").exists()
+    assert not any(item["title"] == "Retry Manual" for item in service.articles())
+
+    result = service.create_article(
+        "Retry Manual",
+        "正文。",
+        category={"kind": "create", "name": "Retry Manual Category"},
+        tags=["retry"],
+    )
+    assert result["operation_id"].endswith("-attempt-2")
+    assert result["article"]["path"] == "Retry-Manual-Category/Retry-Manual.md"
+
+
+def test_manual_article_replay_rejects_target_replaced_by_redirect(service: WikiService):
+    created = service.create_article(
+        "Redirect Repair Manual",
+        "Original body.",
+        category={"kind": "inbox"},
+        tags=[],
+    )
+    target = service.root / "wiki" / created["article"]["path"]
+    target.write_text("# Redirect Repair Manual\n\n> Redirect: ../concepts/base.md\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="requires repair"):
+        service.create_article(
+            "Redirect Repair Manual",
+            "Original body.",
+            category={"kind": "inbox"},
+            tags=[],
+        )
+
+
+def test_manual_article_create_never_overwrites_physical_or_alias_collision(service: WikiService):
+    target = service.root / "wiki" / "_inbox" / "Physical-Manual.md"
+    target.parent.mkdir(exist_ok=True)
+    target.write_text("# Different title\n\nORIGINAL SENTINEL\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        service.create_article("Physical Manual", "Replacement body.", category={"kind": "inbox"}, tags=[])
+    assert "ORIGINAL SENTINEL" in target.read_text(encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        service.create_article("Base", "Replacement body.", category={"kind": "inbox"}, tags=[])
+    assert "Replacement body" not in service.read_article("concepts/base.md")["markdown"]
+
+
+def test_concurrent_manual_article_title_collision_has_one_writer(service: WikiService):
+    def create(body: str):
+        try:
+            return service.create_article("Concurrent Manual", body, category={"kind": "inbox"}, tags=[])
+        except FileExistsError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(create, ("First body", "Second body")))
+
+    created = [item for item in results if isinstance(item, dict)]
+    rejected = [item for item in results if isinstance(item, FileExistsError)]
+    assert len(created) == len(rejected) == 1
+    article = service.read_article("_inbox/Concurrent-Manual.md")
+    assert ("First body" in article["markdown"]) != ("Second body" in article["markdown"])
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "",
+        "# Nested title\n\nBody",
+        "  # Indented title\n\nBody",
+        "Setext title\n===\n\nBody",
+        "> Article-ID: forged\n\nBody",
+        "> Redirect: ../concepts/base.md\n\nBody",
+    ],
+)
+def test_manual_article_rejects_empty_h1_and_managed_metadata(service: WikiService, body: str):
+    with pytest.raises(ValueError):
+        service.create_article("Invalid Manual", body, category={"kind": "inbox"}, tags=[])
+    assert not (service.root / "wiki" / "_inbox" / "Invalid-Manual.md").exists()
+
+
+@pytest.mark.parametrize("fence", ["`", "~"])
+def test_manual_article_allows_h1_examples_inside_longer_markdown_fences(
+    service: WikiService, fence: str,
+):
+    outer = fence * 4
+    inner = fence * 3
+    body = f"""## Fence example
+
+{outer}markdown
+{inner}markdown
+# Example H1
+{inner}
+{outer}
+
+Regular body.
+"""
+    result = service.create_article("Fence Manual", body, category={"kind": "inbox"}, tags=[])
+    assert result["article"]["path"] == "_inbox/Fence-Manual.md"
+    assert "# Example H1" in result["article"]["markdown"]
+
+
+def test_manual_article_creation_serializes_planning_across_service_instances(
+    service: WikiService, monkeypatch: pytest.MonkeyPatch,
+):
+    second = WikiService(service.root, start_worker=False)
+    first_planning = threading.Event()
+    release_first = threading.Event()
+    second_planning = threading.Event()
+    first_plan = service._plan_taxonomy
+    second_plan = second._plan_taxonomy
+
+    def pause_first(*args, **kwargs):
+        first_planning.set()
+        assert release_first.wait(timeout=5)
+        return first_plan(*args, **kwargs)
+
+    def observe_second(*args, **kwargs):
+        second_planning.set()
+        return second_plan(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_plan_taxonomy", pause_first)
+    monkeypatch.setattr(second, "_plan_taxonomy", observe_second)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_future = pool.submit(
+                service.create_article,
+                "First Shared Manual",
+                "First body.",
+                category={"kind": "create", "name": "First Shared Category"},
+                tags=["first"],
+            )
+            assert first_planning.wait(timeout=5)
+            second_future = pool.submit(
+                second.create_article,
+                "Second Shared Manual",
+                "Second body.",
+                category={"kind": "create", "name": "Second Shared Category"},
+                tags=["second"],
+            )
+            assert not second_planning.wait(timeout=0.2)
+            release_first.set()
+            first_result = first_future.result(timeout=5)
+            second_result = second_future.result(timeout=5)
+    finally:
+        release_first.set()
+        second.close()
+
+    registry = dc.load_registry(service.root)
+    category_ids = {item["category_id"] for item in registry["categories"]}
+    assert first_result["article"]["primary_category_id"] in category_ids
+    assert second_result["article"]["primary_category_id"] in category_ids
+    index = (service.root / "wiki" / "index.md").read_text(encoding="utf-8")
+    log = (service.root / "wiki" / "log.md").read_text(encoding="utf-8")
+    assert "First Shared Manual" in index and "Second Shared Manual" in index
+    assert first_result["operation_id"] in log and second_result["operation_id"] in log
+
+
+def test_manual_article_and_apply_meta_share_cross_instance_planning_lock(
+    service: WikiService, monkeypatch: pytest.MonkeyPatch,
+):
+    second = WikiService(service.root, start_worker=False)
+    governance_planning = threading.Event()
+    release_governance = threading.Event()
+    manual_planning = threading.Event()
+    governance_plan = service._plan_taxonomy
+    manual_plan = second._plan_taxonomy
+
+    def pause_governance(*args, **kwargs):
+        governance_planning.set()
+        assert release_governance.wait(timeout=5)
+        return governance_plan(*args, **kwargs)
+
+    def observe_manual(*args, **kwargs):
+        manual_planning.set()
+        return manual_plan(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_plan_taxonomy", pause_governance)
+    monkeypatch.setattr(second, "_plan_taxonomy", observe_manual)
+    try:
+        base = service.read_article("concepts/base.md")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            governance_future = pool.submit(
+                service.apply_meta,
+                "concepts/base.md",
+                category={"kind": "create", "name": "Governed Shared Category"},
+                status="词条",
+                tags=["governed"],
+                expected_revision=base["revision"],
+            )
+            assert governance_planning.wait(timeout=5)
+            manual_future = pool.submit(
+                second.create_article,
+                "Manual During Governance",
+                "Manual body.",
+                category={"kind": "create", "name": "Manual Shared Category"},
+                tags=["manual"],
+            )
+            assert not manual_planning.wait(timeout=0.2)
+            release_governance.set()
+            governance_result = governance_future.result(timeout=5)
+            manual_result = manual_future.result(timeout=5)
+    finally:
+        release_governance.set()
+        second.close()
+
+    registry = dc.load_registry(service.root)
+    category_ids = {item["category_id"] for item in registry["categories"]}
+    assert governance_result["article"]["primary_category_id"] in category_ids
+    assert manual_result["article"]["primary_category_id"] in category_ids
+    index = (service.root / "wiki" / "index.md").read_text(encoding="utf-8")
+    log = (service.root / "wiki" / "log.md").read_text(encoding="utf-8")
+    assert "Base" in index and "Manual During Governance" in index
+    assert governance_result["operation_id"] in log and manual_result["operation_id"] in log
+
+
+def test_manual_article_and_save_share_cross_instance_planning_lock(
+    service: WikiService, monkeypatch: pytest.MonkeyPatch,
+):
+    second = WikiService(service.root, start_worker=False)
+    manual_planning = threading.Event()
+    release_manual = threading.Event()
+    save_started = threading.Event()
+    save_planning = threading.Event()
+    manual_plan = service._plan_taxonomy
+    render_index = wiki_service_module.render_index
+
+    def pause_manual(*args, **kwargs):
+        manual_planning.set()
+        assert release_manual.wait(timeout=5)
+        return manual_plan(*args, **kwargs)
+
+    def observe_save(root, overrides=None):
+        if overrides and "wiki/concepts/base.md" in overrides:
+            save_planning.set()
+        return render_index(root, overrides)
+
+    monkeypatch.setattr(service, "_plan_taxonomy", pause_manual)
+    monkeypatch.setattr(wiki_service_module, "render_index", observe_save)
+    try:
+        base = second.read_article("concepts/base.md")
+        edited = base["markdown"].rstrip() + "\n\nSaved concurrently.\n"
+
+        def save_base():
+            save_started.set()
+            return second.save_article("concepts/base.md", edited, base["revision"])
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            manual_future = pool.submit(
+                service.create_article,
+                "Manual During Save",
+                "Manual body.",
+                category={"kind": "create", "name": "Manual Save Category"},
+                tags=[],
+            )
+            assert manual_planning.wait(timeout=5)
+            save_future = pool.submit(save_base)
+            assert save_started.wait(timeout=5)
+            assert not save_planning.wait(timeout=0.2)
+            release_manual.set()
+            manual_result = manual_future.result(timeout=5)
+            save_result = save_future.result(timeout=5)
+    finally:
+        release_manual.set()
+        second.close()
+
+    assert "Saved concurrently." in service.read_article("concepts/base.md")["markdown"]
+    index = (service.root / "wiki" / "index.md").read_text(encoding="utf-8")
+    log = (service.root / "wiki" / "log.md").read_text(encoding="utf-8")
+    assert "Manual During Save" in index
+    assert manual_result["operation_id"] in log and save_result["operation_id"] in log
+
+
+def test_manual_article_and_ingest_share_cross_instance_planning_lock(
+    service: WikiService, monkeypatch: pytest.MonkeyPatch,
+):
+    second = WikiService(service.root, start_worker=False)
+    raw_path = service.root / "raw" / "local" / "concurrent-ingest.txt"
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_path.write_text("# Concurrent source\n\nRaw body.\n", encoding="utf-8")
+    manual_planning = threading.Event()
+    release_manual = threading.Event()
+    ingest_started = threading.Event()
+    ingest_planning = threading.Event()
+    manual_plan = service._plan_taxonomy
+    ingest_plan = second._plan_taxonomy
+
+    def pause_manual(*args, **kwargs):
+        manual_planning.set()
+        assert release_manual.wait(timeout=5)
+        return manual_plan(*args, **kwargs)
+
+    def observe_ingest(*args, **kwargs):
+        ingest_planning.set()
+        return ingest_plan(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_plan_taxonomy", pause_manual)
+    monkeypatch.setattr(second, "_plan_taxonomy", observe_ingest)
+    try:
+        def ingest_source():
+            ingest_started.set()
+            return second.ingest_commit(
+                "raw/local/concurrent-ingest.txt",
+                "new",
+                title="Ingest During Manual",
+                category={"kind": "create", "name": "Ingest Shared Category"},
+                tags=["ingest"],
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            manual_future = pool.submit(
+                service.create_article,
+                "Manual During Ingest",
+                "Manual body.",
+                category={"kind": "create", "name": "Manual Ingest Category"},
+                tags=["manual"],
+            )
+            assert manual_planning.wait(timeout=5)
+            ingest_future = pool.submit(ingest_source)
+            assert ingest_started.wait(timeout=5)
+            assert not ingest_planning.wait(timeout=0.2)
+            release_manual.set()
+            manual_result = manual_future.result(timeout=5)
+            ingest_result = ingest_future.result(timeout=5)
+    finally:
+        release_manual.set()
+        second.close()
+
+    registry = dc.load_registry(service.root)
+    category_ids = {item["category_id"] for item in registry["categories"]}
+    assert manual_result["article"]["primary_category_id"] in category_ids
+    assert ingest_result["article"]["primary_category_id"] in category_ids
+    index = (service.root / "wiki" / "index.md").read_text(encoding="utf-8")
+    log = (service.root / "wiki" / "log.md").read_text(encoding="utf-8")
+    assert "Manual During Ingest" in index and "Ingest During Manual" in index
+    assert manual_result["operation_id"] in log and ingest_result["operation_id"] in log
 
 
 def test_inline_category_failure_rolls_back_directory_registry_and_article(service: WikiService, monkeypatch: pytest.MonkeyPatch):

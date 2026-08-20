@@ -235,8 +235,8 @@ class WikiApp:
                         self.platform.authorized_workspace_action(user_id, workspace_id, "wiki.write")
                     ),
                     require_task_actor=True,
-                    path_remap_callback=lambda path_map, workspace_id=context.workspace_id: (
-                        self.platform.remap_public_import_paths(workspace_id, path_map)
+                    path_remap_callback=lambda projections, workspace_id=context.workspace_id: (
+                        self.platform.remap_public_import_paths(workspace_id, projections)
                     ),
                 )
                 with self._service_lock:
@@ -1471,7 +1471,7 @@ def make_handler(app: WikiApp):
             content_write_paths = {
                 "/api/generate", "/api/meta", "/api/article/taxonomy", "/api/categories/preview",
                 "/api/categories/commit", "/api/reconciliation/scan", "/api/reconciliation/preview",
-                "/api/reconciliation/commit", "/api/governance", "/api/article/save", "/api/ingest/commit",
+                "/api/reconciliation/commit", "/api/governance", "/api/articles", "/api/article/save", "/api/ingest/commit",
                 "/api/ingest/upload", "/api/merge/commit", "/api/share-previews", "/api/submissions",
                 "/api/public/import",
             }
@@ -1647,6 +1647,25 @@ def make_handler(app: WikiApp):
                 _fields(data, set())
                 response, replay = self._idempotency(data, service.enqueue_governance)
                 return self._json(200, {**response, "replay": replay})
+            if path == "/api/articles":
+                _fields(data, {"title", "markdown", "category", "tags"}, {"title", "markdown", "category", "tags"})
+                category_selection = data.get("category")
+                tag_values = data.get("tags")
+                if not isinstance(category_selection, dict):
+                    raise ApiError(422, "category must be a taxonomy selection")
+                if not isinstance(tag_values, list) or not all(isinstance(item, str) for item in tag_values):
+                    raise ApiError(422, "tags must be an array of strings")
+                try:
+                    response, replay = self._idempotency(data, lambda: service.create_article(
+                        _string(data, "title", maximum=120, required=True),
+                        _string(data, "markdown", maximum=None, required=True),
+                        category=category_selection,
+                        tags=tag_values,
+                    ))
+                except FileExistsError as exc:
+                    raise ApiError(409, str(exc)) from exc
+                self.diagnostics.refresh()
+                return self._json(200 if replay or response.get("replayed") else 201, response)
             if path == "/api/article/save":
                 _fields(data, {"path", "markdown", "revision", "force", "category", "tags"}, {"path", "markdown", "revision"})
                 force = data.get("force", False)
