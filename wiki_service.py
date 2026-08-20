@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import contextlib
+import functools
 import json
 import os
 import re
@@ -30,6 +31,43 @@ from storage import FileStore, OperationExistsError, TransactionTargetExistsErro
 STATUS_VALUES = {"词条", "草稿", "过时", "有争议"}
 META_LINE_RE = re.compile(r"^>\s*([A-Za-z]+):\s*(.*?)\s*$", re.M)
 MD_LINK_RE = wiki_ops.MD_LINK_RE
+MANAGED_BODY_META_RE = re.compile(
+    r"^>\s*(?:Article-ID|Category-ID|Classification|Classification-Updated|Category|Status|Tags|Redirect):",
+    re.M | re.I,
+)
+
+
+def contains_h1(markdown: str) -> bool:
+    lines = markdown.splitlines()
+    fenced = False
+    fence_marker = ""
+    fence_length = 0
+    for index, line in enumerate(lines):
+        fence = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if fence:
+            marker_run = fence.group(1)
+            marker = marker_run[0]
+            remainder = fence.group(2)
+            if fenced:
+                if marker == fence_marker and len(marker_run) >= fence_length and not remainder.strip():
+                    fenced = False
+                    fence_marker = ""
+                    fence_length = 0
+                continue
+            if marker == "`" and "`" in remainder:
+                pass
+            else:
+                fenced = True
+                fence_marker = marker
+                fence_length = len(marker_run)
+                continue
+        if fenced:
+            continue
+        if re.match(r"^ {0,3}#(?:[ \t]+|$)", line):
+            return True
+        if index + 1 < len(lines) and line.strip() and re.match(r"^ {0,3}=+[ \t]*$", lines[index + 1]):
+            return True
+    return False
 
 
 def slugify(term: str) -> str:
@@ -166,6 +204,16 @@ def append_log_text(current: str, *, operation_id: str, kind: str, title: str, r
     )
 
 
+def serialized_wiki_write(method):
+    """Hold the cross-instance file lock across shared read-plan-commit writes."""
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._intent_lock:
+            with self.files.locked():
+                return method(self, *args, **kwargs)
+    return wrapped
+
+
 @dataclass
 class LLMConfig:
     provider: str = ""
@@ -192,7 +240,7 @@ class WikiService:
         authorize_actor: Callable[[str], bool] | None = None,
         actor_guard: Callable[[str], object] | None = None,
         require_task_actor: bool = False,
-        path_remap_callback: Callable[[dict[str, str]], None] | None = None,
+        path_remap_callback: Callable[[list[dict[str, str]]], None] | None = None,
     ):
         self.root = project_root.resolve()
         (self.root / "wiki").mkdir(exist_ok=True)
@@ -405,6 +453,10 @@ class WikiService:
 
     def _ensure_dynamic_registry(self) -> None:
         """Migrate existing first-level folders without moving user content."""
+        with self.files.locked():
+            self._ensure_dynamic_registry_file_locked()
+
+    def _ensure_dynamic_registry_file_locked(self) -> None:
         registry_path = self.root / dc.REGISTRY_REL
         if registry_path.is_file():
             return
@@ -448,7 +500,11 @@ class WikiService:
         current_log = log_path.read_text(encoding="utf-8") if log_path.is_file() else "# Wiki Log\n"
         changes["wiki/index.md"] = render_index(self.root, changes)
         changes["wiki/log.md"] = append_log_text(current_log, operation_id=operation_id, kind="dynamic-category-migration", title="workspace")
-        self.files.commit(changes, kind="dynamic-category-migration", metadata={"categories": len(registry["categories"])}, operation_id=operation_id)
+        self.files.commit(
+            changes, kind="dynamic-category-migration",
+            metadata={"categories": len(registry["categories"])},
+            operation_id=operation_id, _lock_held=True,
+        )
 
     def _recover_path_projections(self) -> None:
         """Finish path projections after a process exits between file commit and SQLite remap."""
@@ -459,34 +515,25 @@ class WikiService:
                 continue
             if manifest.get("status") != "committed":
                 continue
-            recovered_paths: dict[str, str] = {}
-            article_id = manifest.get("metadata", {}).get("article_id")
-            for old, new in manifest.get("metadata", {}).get("path_map", {}).items():
-                if not article_id and not (self.root / "wiki" / new).is_file():
-                    continue
+            identities = self._manifest_path_identities(manifest)
+            if identities:
                 try:
-                    resolved = self.resolve_article_id(article_id) if article_id else self.read_article(new)
-                    current = self.read_article(resolved["path"])
-                    if article_id and current.get("article_id") != article_id:
-                        continue
+                    self._current_article_path_projections(identities)
                 except (FileNotFoundError, RuntimeError, ValueError):
-                    current = None
-                if current is None:
                     continue
-                current_path = current["path"]
-                self.state.remap_article_path(old, current_path, base_revision=current["revision"])
-                recovered_paths[old] = current_path
-            if recovered_paths and self.path_remap_callback is not None:
-                self.path_remap_callback(recovered_paths)
+                self._project_current_article_paths(identities)
 
     def _remap_committed_paths(self, operation_id: str, path_map: dict[str, str]) -> None:
         remapped: list[tuple[str, str]] = []
         try:
-            for old, new in path_map.items():
-                self.state.remap_article_path(old, new, base_revision=self.read_article(new)["revision"])
-                remapped.append((old, new))
-            if self.path_remap_callback is not None:
-                self.path_remap_callback(path_map)
+            manifest = self.files.operation(operation_id)
+            identities = self._manifest_path_identities(manifest)
+            before_projection = self._current_article_path_projections(identities)
+            by_id = {item["article_id"]: item for item in before_projection}
+            for identity in identities:
+                item = by_id[identity["article_id"]]
+                remapped.append((identity["old_path"], item["private_path"]))
+            self._project_current_article_paths(identities)
         except BaseException:
             self.files.rollback(operation_id)
             for old, new in reversed(remapped):
@@ -496,6 +543,63 @@ class WikiService:
                     restored = None
                 self.state.remap_article_path(new, old, base_revision=restored["revision"] if restored else None)
             raise
+
+    def _manifest_path_identities(self, manifest: dict) -> list[dict[str, str]]:
+        metadata = manifest.get("metadata", {})
+        path_map = metadata.get("path_map", {})
+        stored = metadata.get("path_projections")
+        identities: list[dict[str, str]] = []
+        if isinstance(stored, list):
+            for item in stored:
+                if not isinstance(item, dict):
+                    continue
+                article_id, old_path = item.get("article_id"), item.get("old_path")
+                if isinstance(article_id, str) and isinstance(old_path, str) and old_path in path_map:
+                    identities.append({"article_id": article_id, "old_path": old_path})
+            if identities:
+                return identities
+        article_id = metadata.get("article_id")
+        for old, new in path_map.items():
+            candidate_id = article_id
+            if not candidate_id:
+                try:
+                    candidate_id = self.read_article(new).get("article_id")
+                except (FileNotFoundError, RuntimeError, ValueError):
+                    candidate_id = None
+            if isinstance(candidate_id, str) and candidate_id:
+                identities.append({"article_id": candidate_id, "old_path": old})
+        return identities
+
+    def _current_article_path_projections(self, identities: list[dict[str, str]]) -> list[dict[str, str]]:
+        projections: list[dict[str, str]] = []
+        for article_id in dict.fromkeys(item["article_id"] for item in identities):
+            resolved = self.resolve_article_id(article_id)
+            current = self.read_article(resolved["path"])
+            projections.append({
+                "article_id": article_id,
+                "private_path": current["path"],
+                "article_revision": current["revision"],
+            })
+        return projections
+
+    def _project_current_article_paths(self, identities: list[dict[str, str]]) -> list[dict[str, str]]:
+        if not identities:
+            return []
+        for _attempt in range(8):
+            desired = self._current_article_path_projections(identities)
+            by_id = {item["article_id"]: item for item in desired}
+            for identity in identities:
+                current = by_id[identity["article_id"]]
+                self.state.remap_article_path(
+                    identity["old_path"], current["private_path"],
+                    base_revision=current["article_revision"],
+                )
+            if self.path_remap_callback is not None:
+                self.path_remap_callback(desired)
+            observed = self._current_article_path_projections(identities)
+            if observed == desired:
+                return desired
+        raise RuntimeError("article path projection did not stabilize")
 
     def _available_operation_id(self, operation_base: str) -> str:
         operation_id = operation_base
@@ -646,6 +750,7 @@ class WikiService:
         lines.extend(f"- {source_link(rel, item['path'], item['title'])}" for item in sources)
         return "\n".join(lines).rstrip() + "\n"
 
+    @serialized_wiki_write
     def generate(
         self,
         keyword: str,
@@ -742,6 +847,7 @@ class WikiService:
                 metadata={"title": term, "path": rel},
                 operation_id=operation_id,
                 directories={f"wiki/{directory}": True},
+                _lock_held=True,
             )
         except BaseException:
             if task:
@@ -778,6 +884,44 @@ class WikiService:
             )
 
     def _apply_meta_locked(
+        self,
+        rel: str,
+        *,
+        category: str | dict,
+        status: str,
+        tags: list[str] | None = None,
+        expected_revision: str | None = None,
+        markdown: str | None = None,
+    ) -> dict:
+        with self.files.locked():
+            committed = self._commit_meta_file_locked(
+                rel,
+                category=category,
+                status=status,
+                tags=tags,
+                expected_revision=expected_revision,
+                markdown=markdown,
+            )
+        if committed.get("conflict"):
+            return committed
+        target_rel = committed["target_rel"]
+        old_rel = committed["old_rel"]
+        operation_id = committed["operation_id"]
+        path_map = committed["path_map"]
+        updated = self.read_article(target_rel)
+        if path_map:
+            self._remap_committed_paths(operation_id, path_map)
+        else:
+            self.state.remap_article_path(old_rel, target_rel, base_revision=updated["revision"])
+        return {
+            "conflict": False,
+            "operation_id": operation_id,
+            "article": updated,
+            "created_category": committed["created_category"],
+            "category": committed["category"],
+        }
+
+    def _commit_meta_file_locked(
         self,
         rel: str,
         *,
@@ -870,23 +1014,25 @@ class WikiService:
                 "target": target_rel,
                 "path_map": path_map,
                 "article_id": stable_article_id,
+                "path_projections": (
+                    [{"article_id": stable_article_id, "old_path": old_rel}] if path_map else []
+                ),
             },
             operation_id=operation_id,
             directories={f"wiki/{directory}": True},
+            _lock_held=True,
         )
-        updated = self.read_article(target_rel)
-        if path_map:
-            self._remap_committed_paths(operation_id, path_map)
-        else:
-            self.state.remap_article_path(old_rel, target_rel, base_revision=updated["revision"])
         return {
             "conflict": False,
             "operation_id": operation_id,
-            "article": updated,
+            "old_rel": old_rel,
+            "target_rel": target_rel,
+            "path_map": path_map,
             "created_category": created_category,
             "category": category_item,
         }
 
+    @serialized_wiki_write
     def save_article(
         self,
         rel: str,
@@ -934,9 +1080,175 @@ class WikiService:
             "wiki/index.md": render_index(self.root, {f"wiki/{rel}": markdown}),
             "wiki/log.md": append_log_text(log_path.read_text(encoding="utf-8") if log_path.exists() else "", operation_id=operation_id, kind="edit", title=title),
         }
-        self.files.commit(changes, kind="edit", metadata={"path": rel}, operation_id=operation_id)
+        self.files.commit(
+            changes, kind="edit", metadata={"path": rel},
+            operation_id=operation_id, _lock_held=True,
+        )
         return {"conflict": False, "operation_id": operation_id, "article": self.read_article(rel)}
 
+    def create_article(
+        self,
+        title: str,
+        body_markdown: str,
+        *,
+        category: dict | None = None,
+        tags: list[str] | None = None,
+    ) -> dict:
+        with self._intent_lock:
+            return self._create_article_locked(title, body_markdown, category=category, tags=tags)
+
+    def _create_article_locked(
+        self,
+        title: str,
+        body_markdown: str,
+        *,
+        category: dict | None,
+        tags: list[str] | None,
+    ) -> dict:
+        clean_title = unicodedata.normalize("NFKC", title).strip()
+        if (
+            not clean_title
+            or len(clean_title) > 120
+            or "\n" in clean_title
+            or "\r" in clean_title
+            or any(ord(ch) < 32 for ch in clean_title)
+        ):
+            raise ValueError("invalid title")
+        body = body_markdown.lstrip("\ufeff").strip()
+        if not body:
+            raise ValueError("markdown body is required")
+        if contains_h1(body):
+            raise ValueError("markdown body cannot contain an H1 title; use the title field")
+        if MANAGED_BODY_META_RE.search(body):
+            raise ValueError("article metadata is managed by the title and taxonomy fields")
+
+        request_payload = {
+            "version": 1,
+            "title": clean_title,
+            "body": body,
+            "category": category or {"kind": "inbox"},
+            "tags": tags or [],
+        }
+        request_hash = hashlib.sha256(
+            json.dumps(request_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        operation_base = f"manual-create-{request_hash[:20]}"
+
+        with self.files.locked():
+            return self._materialize_manual_article_locked(
+                clean_title,
+                body,
+                category=category,
+                tags=tags,
+                request_hash=request_hash,
+                operation_base=operation_base,
+            )
+
+    def _materialize_manual_article_locked(
+        self,
+        clean_title: str,
+        body: str,
+        *,
+        category: dict | None,
+        tags: list[str] | None,
+        request_hash: str,
+        operation_base: str,
+    ) -> dict:
+
+        attempt = 1
+        operation_id = operation_base
+        while self.files.operation_slot_exists(operation_id):
+            try:
+                manifest = self.files.operation(operation_id)
+            except FileNotFoundError:
+                manifest = None
+            if manifest and manifest.get("status") == "committed":
+                metadata = manifest.get("metadata") or {}
+                if metadata.get("request_hash") == request_hash:
+                    rel = metadata.get("target")
+                    article_id = metadata.get("article_id")
+                    if isinstance(rel, str) and isinstance(article_id, str):
+                        try:
+                            article = self.read_article(rel)
+                            target_markdown = self.files.resolve(f"wiki/{rel}").read_text(encoding="utf-8")
+                        except (FileNotFoundError, OSError, ValueError):
+                            article = None
+                            target_markdown = ""
+                        if (
+                            article
+                            and article.get("path") == rel
+                            and not article.get("redirected_from")
+                            and article.get("article_id") == article_id
+                            and not aliases.REDIRECT_RE.search(target_markdown[:4096])
+                        ):
+                            return {
+                                "operation_id": operation_id,
+                                "article": article,
+                                "created_category": bool(metadata.get("created_category")),
+                                "replayed": True,
+                            }
+                        raise RuntimeError("manual article requires repair")
+            attempt += 1
+            operation_id = f"{operation_base}-attempt-{attempt}"
+
+        registry = dc.load_registry(self.root)
+        category_item, selected_tags, created_category = self._plan_taxonomy(registry, category, tags)
+        directory = category_item["directory_name"] if category_item else "_inbox"
+        target = f"{directory}/{slugify(clean_title)}.md"
+        if aliases.resolve(self.root, clean_title) or (self.root / "wiki" / target).exists():
+            raise FileExistsError("an article with this title already exists")
+
+        markdown = f"# {clean_title}\n\n{body.rstrip()}\n"
+        markdown = cats.ensure_category_header(markdown, directory)
+        markdown = wiki_ops.ensure_status_header(markdown, "草稿")
+        markdown = dc.ensure_article_metadata(
+            markdown,
+            category_id=category_item["category_id"] if category_item else None,
+            status="confirmed" if category_item else "pending",
+            article_tags=selected_tags,
+        )
+        article_id = dc.article_id(markdown)
+        if not article_id:
+            raise RuntimeError("manual article metadata is incomplete")
+        if aliases.REDIRECT_RE.search(markdown[:4096]):
+            raise ValueError("article metadata is managed by the title and taxonomy fields")
+
+        changes = {f"wiki/{target}": markdown}
+        if created_category:
+            changes[dc.REGISTRY_REL] = dc.dump_registry(registry)
+        changes["wiki/index.md"] = render_index(self.root, changes)
+        log_path = self.root / "wiki" / "log.md"
+        changes["wiki/log.md"] = append_log_text(
+            log_path.read_text(encoding="utf-8") if log_path.exists() else "",
+            operation_id=operation_id,
+            kind="manual-create",
+            title=clean_title,
+        )
+        try:
+            self.files.commit(
+                changes,
+                kind="manual-create",
+                metadata={
+                    "request_hash": request_hash,
+                    "target": target,
+                    "article_id": article_id,
+                    "created_category": created_category,
+                },
+                operation_id=operation_id,
+                must_not_exist_paths={f"wiki/{target}"},
+                directories={f"wiki/{directory}": True},
+                _lock_held=True,
+            )
+        except TransactionTargetExistsError as exc:
+            raise FileExistsError("an article with this title already exists") from exc
+        return {
+            "operation_id": operation_id,
+            "article": self.read_article(target),
+            "created_category": created_category,
+            "replayed": False,
+        }
+
+    @serialized_wiki_write
     def import_public_article(self, intent: dict) -> dict:
         """Materialize one reserved public revision as an independent private draft."""
         with self._intent_lock:
@@ -996,6 +1308,7 @@ class WikiService:
                     changes, kind="public-import", operation_id=operation_id,
                     metadata={"public_entry_id": entry_id, "public_revision_id": revision_id},
                     must_not_exist_paths={f"wiki/{rel}"},
+                    _lock_held=True,
                 )
             except FileExistsError:
                 if target.is_file() and self.read_article(rel).get("article_id") == article_id:
@@ -1146,6 +1459,7 @@ class WikiService:
         md = replace_meta(md, "Evidence", "Raw 原文")
         return md.rstrip() + "\n"
 
+    @serialized_wiki_write
     def ingest_commit(
         self,
         raw_path: str,
@@ -1258,6 +1572,7 @@ class WikiService:
                     {f"wiki/{result_target}"} if disposition in {"seed", "new"} else None
                 ),
                 directories={f"wiki/{directory}": True} if disposition in {"seed", "new"} else None,
+                _lock_held=True,
             )
         except OperationExistsError:
             raise
@@ -1315,6 +1630,7 @@ class WikiService:
                     merged.append(normalized)
         return merged
 
+    @serialized_wiki_write
     def merge_commit(self, source: str, target: str) -> dict:
         preview = self.merge_preview(source, target)
         source_article, target_article = preview["source"], preview["target"]
@@ -1357,7 +1673,10 @@ class WikiService:
         log_path = self.root / "wiki" / "log.md"
         changes["wiki/index.md"] = render_index(self.root, changes)
         changes["wiki/log.md"] = append_log_text(log_path.read_text(encoding="utf-8") if log_path.exists() else "", operation_id=operation_id, kind="merge", title=f"{source_article['title']} -> {target_article['title']}")
-        self.files.commit(changes, kind="merge", metadata={"source": source_rel, "target": target_rel}, operation_id=operation_id)
+        self.files.commit(
+            changes, kind="merge", metadata={"source": source_rel, "target": target_rel},
+            operation_id=operation_id, _lock_held=True,
+        )
         return {"operation_id": operation_id, "article": self.read_article(target_rel)}
 
     def rollback(self, operation_id: str) -> dict:
@@ -1461,66 +1780,83 @@ class WikiService:
         stored = self.state.get_preview(preview_id, "category")
         payload = stored["payload"]
         with self._intent_lock:
-            registry = dc.load_registry(self.root)
-            if registry["revision"] != payload["taxonomy_revision"]:
-                raise RuntimeError("category preview is stale")
-            action = payload["action"]
-            if action not in {"rename", "archive", "restore", "delete", "reorder"}:
-                raise ValueError("invalid category action")
-            before, after = payload.get("before"), payload.get("after")
-            next_registry = json.loads(json.dumps(registry, ensure_ascii=False))
-            current = dc.category_by_id(next_registry, payload["category_id"])
-            if before != current:
-                raise RuntimeError("category changed after preview")
-            if action == "delete":
-                if any(item["primary_category_id"] == current["category_id"] for item in self.articles()):
-                    raise RuntimeError("category is not empty")
-                next_registry["categories"] = [item for item in next_registry["categories"] if item["category_id"] != current["category_id"]]
-            else:
-                dc.assert_unique(next_registry, after, ignore_id=current["category_id"])
-                next_registry["categories"] = [after if item["category_id"] == current["category_id"] else item for item in next_registry["categories"]]
-            next_registry["revision"] += 1
-            changes: dict[str, str | None] = {dc.REGISTRY_REL: dc.dump_registry(next_registry)}
-            directories: dict[str, bool] = {}
-            path_map: dict[str, str] = {}
-            if action == "delete":
-                folder = self.root / "wiki" / before["directory_name"]
-                if not folder.is_dir() or any(folder.iterdir()):
-                    raise RuntimeError("category directory is not empty")
-                directories[f"wiki/{before['directory_name']}"] = False
-            elif action == "rename" and before["directory_name"] != after["directory_name"]:
-                old_dir, new_dir = before["directory_name"], after["directory_name"]
-                target_dir = self.root / "wiki" / new_dir
-                if target_dir.exists():
-                    raise FileExistsError(new_dir)
-                directories[f"wiki/{new_dir}"] = True
-                for article in [item for item in self.articles() if item["primary_category_id"] == before["category_id"]]:
-                    old, new = article["path"], f"{new_dir}/{Path(article['path']).name}"
-                    current = self.read_article(old)
-                    md = cats.ensure_category_header(current["markdown"], new_dir)
-                    md = wiki_ops.rebase_wiki_hrefs(md, old, new)
-                    changes[f"wiki/{new}"] = md
-                    changes[f"wiki/{old}"] = None
-                    path_map[old] = new
-                for path in kw.iter_articles(self.root):
-                    rel = kw.rel_article(self.root, path)
-                    if rel in path_map:
-                        continue
-                    md = path.read_text(encoding="utf-8")
-                    updated = md
-                    for old, new in path_map.items():
-                        updated = wiki_ops.rewrite_wiki_hrefs(updated, rel, old, new)
-                    if updated != md:
-                        changes[f"wiki/{rel}"] = updated
-                directories[f"wiki/{old_dir}"] = False
-            operation_id = f"category-{action}-{uuid.uuid4().hex}"
-            log_path = self.root / "wiki" / "log.md"
-            changes["wiki/index.md"] = render_index(self.root, changes)
-            changes["wiki/log.md"] = append_log_text(log_path.read_text(encoding="utf-8") if log_path.exists() else "", operation_id=operation_id, kind=f"category-{action}", title=(after or before)["name"])
-            self.files.commit(changes, directories=directories, kind=f"category-{action}", metadata={"path_map": path_map, "category_id": (after or before)["category_id"]}, operation_id=operation_id)
-            self._remap_committed_paths(operation_id, path_map)
+            with self.files.locked():
+                committed = self._category_commit_file_locked(payload)
+            self._remap_committed_paths(committed["operation_id"], committed["path_map"])
             self.state.consume_preview(preview_id)
-            return {"operation_id": operation_id, "category": after, "path_map": path_map}
+            return committed
+
+    def _category_commit_file_locked(self, payload: dict) -> dict:
+        registry = dc.load_registry(self.root)
+        if registry["revision"] != payload["taxonomy_revision"]:
+            raise RuntimeError("category preview is stale")
+        action = payload["action"]
+        if action not in {"rename", "archive", "restore", "delete", "reorder"}:
+            raise ValueError("invalid category action")
+        before, after = payload.get("before"), payload.get("after")
+        next_registry = json.loads(json.dumps(registry, ensure_ascii=False))
+        current = dc.category_by_id(next_registry, payload["category_id"])
+        if before != current:
+            raise RuntimeError("category changed after preview")
+        if action == "delete":
+            if any(item["primary_category_id"] == current["category_id"] for item in self.articles()):
+                raise RuntimeError("category is not empty")
+            next_registry["categories"] = [item for item in next_registry["categories"] if item["category_id"] != current["category_id"]]
+        else:
+            dc.assert_unique(next_registry, after, ignore_id=current["category_id"])
+            next_registry["categories"] = [after if item["category_id"] == current["category_id"] else item for item in next_registry["categories"]]
+        next_registry["revision"] += 1
+        changes: dict[str, str | None] = {dc.REGISTRY_REL: dc.dump_registry(next_registry)}
+        directories: dict[str, bool] = {}
+        path_map: dict[str, str] = {}
+        path_projections: list[dict[str, str]] = []
+        if action == "delete":
+            folder = self.root / "wiki" / before["directory_name"]
+            if not folder.is_dir() or any(folder.iterdir()):
+                raise RuntimeError("category directory is not empty")
+            directories[f"wiki/{before['directory_name']}"] = False
+        elif action == "rename" and before["directory_name"] != after["directory_name"]:
+            old_dir, new_dir = before["directory_name"], after["directory_name"]
+            target_dir = self.root / "wiki" / new_dir
+            if target_dir.exists():
+                raise FileExistsError(new_dir)
+            directories[f"wiki/{new_dir}"] = True
+            for article in [item for item in self.articles() if item["primary_category_id"] == before["category_id"]]:
+                old, new = article["path"], f"{new_dir}/{Path(article['path']).name}"
+                current = self.read_article(old)
+                md = cats.ensure_category_header(current["markdown"], new_dir)
+                md = wiki_ops.rebase_wiki_hrefs(md, old, new)
+                changes[f"wiki/{new}"] = md
+                changes[f"wiki/{old}"] = None
+                path_map[old] = new
+                if not article.get("article_id"):
+                    raise RuntimeError("moved article has no stable Article-ID")
+                path_projections.append({"article_id": article["article_id"], "old_path": old})
+            for path in kw.iter_articles(self.root):
+                rel = kw.rel_article(self.root, path)
+                if rel in path_map:
+                    continue
+                md = path.read_text(encoding="utf-8")
+                updated = md
+                for old, new in path_map.items():
+                    updated = wiki_ops.rewrite_wiki_hrefs(updated, rel, old, new)
+                if updated != md:
+                    changes[f"wiki/{rel}"] = updated
+            directories[f"wiki/{old_dir}"] = False
+        operation_id = f"category-{action}-{uuid.uuid4().hex}"
+        log_path = self.root / "wiki" / "log.md"
+        changes["wiki/index.md"] = render_index(self.root, changes)
+        changes["wiki/log.md"] = append_log_text(log_path.read_text(encoding="utf-8") if log_path.exists() else "", operation_id=operation_id, kind=f"category-{action}", title=(after or before)["name"])
+        self.files.commit(
+            changes, directories=directories, kind=f"category-{action}",
+            metadata={
+                "path_map": path_map,
+                "path_projections": path_projections,
+                "category_id": (after or before)["category_id"],
+            },
+            operation_id=operation_id, _lock_held=True,
+        )
+        return {"operation_id": operation_id, "category": after, "path_map": path_map}
 
     def scan_reconciliation(self) -> dict:
         with self._intent_lock:
@@ -1595,29 +1931,37 @@ class WikiService:
 
     def reconciliation_commit(self, preview_id: str) -> dict:
         with self._intent_lock:
-            return self._reconciliation_commit_locked(preview_id)
-
-    def _reconciliation_commit_locked(self, preview_id: str) -> dict:
-        stored = self.state.get_preview(preview_id, "reconciliation")
-        payload = stored["payload"]
-        item = self.state.get_reconciliation(payload["item_id"])
-        if (
-            item["status"] != "pending"
-            or item["fingerprint"] != payload["fingerprint"]
-            or item["payload"] != payload["detected"]
-        ):
-            raise RuntimeError("reconciliation preview is stale")
-        decision = payload["decision"]
-        detected = item["payload"]
-        if decision == "defer":
-            result = self.state.resolve_reconciliation(item["id"], "deferred")
+            stored = self.state.get_preview(preview_id, "reconciliation")
+            payload = stored["payload"]
+            item = self.state.get_reconciliation(payload["item_id"])
+            if (
+                item["status"] != "pending"
+                or item["fingerprint"] != payload["fingerprint"]
+                or item["payload"] != payload["detected"]
+            ):
+                raise RuntimeError("reconciliation preview is stale")
+            decision = payload["decision"]
+            if decision == "defer":
+                result = self.state.resolve_reconciliation(item["id"], "deferred")
+                self.state.consume_preview(preview_id)
+                return {"operation_id": None, "item": result}
+            with self.files.locked():
+                committed = self._reconciliation_commit_file_locked(item, decision)
+            self._remap_committed_paths(committed["operation_id"], committed["path_map"])
+            result = self.state.resolve_reconciliation(
+                item["id"], "adopted" if decision == "adopt" else "restored",
+            )
             self.state.consume_preview(preview_id)
-            return {"operation_id": None, "item": result}
+            return {"operation_id": committed["operation_id"], "item": result}
+
+    def _reconciliation_commit_file_locked(self, item: dict, decision: str) -> dict:
+        detected = item["payload"]
         registry = dc.load_registry(self.root)
         next_registry = json.loads(json.dumps(registry, ensure_ascii=False))
         changes: dict[str, str | None] = {}
         directories: dict[str, bool] = {}
         path_map: dict[str, str] = {}
+        path_projections: list[dict[str, str]] = []
         if detected["kind"] == "new_directory" and decision == "adopt":
             folder = self.root / "wiki" / detected["path"]
             if not folder.is_dir() or folder.is_symlink():
@@ -1655,6 +1999,7 @@ class WikiService:
                 changes[f"wiki/{target}"] = md
                 changes[f"wiki/{article['path']}"] = None
                 path_map[article["path"]] = target
+                path_projections.append({"article_id": article["article_id"], "old_path": article["path"]})
         else:
             raise ValueError("unsupported reconciliation action")
         taxonomy_changed = detected["kind"] == "new_directory" and decision == "adopt"
@@ -1665,11 +2010,16 @@ class WikiService:
         log_path = self.root / "wiki" / "log.md"
         changes["wiki/index.md"] = render_index(self.root, changes)
         changes["wiki/log.md"] = append_log_text(log_path.read_text(encoding="utf-8") if log_path.exists() else "", operation_id=operation_id, kind="reconcile", title=detected["kind"])
-        self.files.commit(changes, directories=directories, kind="reconciliation", metadata={"path_map": path_map, "reconciliation_id": item["id"]}, operation_id=operation_id)
-        self._remap_committed_paths(operation_id, path_map)
-        result = self.state.resolve_reconciliation(item["id"], "adopted" if decision == "adopt" else "restored")
-        self.state.consume_preview(preview_id)
-        return {"operation_id": operation_id, "item": result}
+        self.files.commit(
+            changes, directories=directories, kind="reconciliation",
+            metadata={
+                "path_map": path_map,
+                "path_projections": path_projections,
+                "reconciliation_id": item["id"],
+            },
+            operation_id=operation_id, _lock_held=True,
+        )
+        return {"operation_id": operation_id, "path_map": path_map}
 
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
@@ -1820,6 +2170,7 @@ class WikiService:
             with self._guard_task_actor(task) as actor_authorized:
                 return self._commit_remote_article_task(task, payload, base_revision, proposal, raw_changes, actor_authorized)
 
+    @serialized_wiki_write
     def _commit_remote_article_task(
         self, task: dict, payload: dict, base_revision: str, proposal: str,
         raw_changes: dict[str, str], actor_authorized: bool,
@@ -1836,7 +2187,10 @@ class WikiService:
         log_path = self.root / "wiki" / "log.md"
         changes = {**raw_changes, f"wiki/{payload['path']}": proposal, "wiki/index.md": render_index(self.root, {f"wiki/{payload['path']}": proposal})}
         changes["wiki/log.md"] = append_log_text(log_path.read_text(encoding="utf-8") if log_path.exists() else "", operation_id=operation_id, kind="remote-complete", title=payload["keyword"])
-        self.files.commit(changes, kind="remote-complete", metadata={"task": task["id"], "path": payload["path"]}, operation_id=operation_id)
+        self.files.commit(
+            changes, kind="remote-complete", metadata={"task": task["id"], "path": payload["path"]},
+            operation_id=operation_id, _lock_held=True,
+        )
         result = {"conflict": False, "path": payload["path"], "operation_id": operation_id, "raw_paths": list(raw_changes)}
         try:
             finalized = self.state.complete_task(task["id"], result, expected_attempt=task["attempts"])
@@ -1931,6 +2285,7 @@ class WikiService:
             with self._guard_task_actor(task) as actor_authorized:
                 return self._commit_governance_task(task, payload, current, proposal, actor_authorized)
 
+    @serialized_wiki_write
     def _commit_governance_task(
         self, task: dict, payload: dict, current: dict, proposal: str, actor_authorized: bool,
     ) -> dict:
@@ -1960,6 +2315,7 @@ class WikiService:
             kind="ai-govern",
             metadata={"task": task["id"], "path": current["path"]},
             operation_id=operation_id,
+            _lock_held=True,
         )
         result = {
             "conflict": False,

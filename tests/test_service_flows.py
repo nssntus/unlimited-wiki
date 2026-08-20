@@ -32,11 +32,15 @@ def test_status_and_structure_are_independent(service: WikiService):
 
 
 def test_apply_meta_notifies_platform_path_projection(service: WikiService):
-    remaps: list[dict[str, str]] = []
+    remaps: list[list[dict[str, str]]] = []
     service.path_remap_callback = lambda value: remaps.append(value)
     result = service.apply_meta("concepts/base.md", category="tools", status="词条")
     assert result["article"]["path"] == "tools/base.md"
-    assert remaps == [{"concepts/base.md": "tools/base.md"}]
+    assert remaps == [[{
+        "article_id": result["article"]["article_id"],
+        "private_path": "tools/base.md",
+        "article_revision": result["article"]["revision"],
+    }]]
 
 
 def test_apply_meta_recovers_state_and_platform_path_projection_after_commit_crash(
@@ -62,11 +66,11 @@ def test_apply_meta_recovers_state_and_platform_path_projection_after_commit_cra
     assert first.state.raw_records()[0]["target_path"] == "concepts/base.md"
     first.close()
 
-    remaps: list[dict[str, str]] = []
+    remaps: list[list[dict[str, str]]] = []
     restarted = WikiService(kb_root, start_worker=False, path_remap_callback=remaps.append)
     try:
         assert restarted.state.raw_records()[0]["target_path"] == "tools/base.md"
-        assert remaps == [{"concepts/base.md": "tools/base.md"}]
+        assert remaps[0][0]["private_path"] == "tools/base.md"
         assert restarted.read_article("tools/base.md")["title"] == "Base"
     finally:
         restarted.close()
@@ -104,9 +108,8 @@ def test_apply_meta_recovery_resolves_reverse_ordered_move_chain_to_current_arti
 
     platform_path = {"value": "concepts/base.md"}
 
-    def remap_platform(path_map: dict[str, str]) -> None:
-        if platform_path["value"] in path_map:
-            platform_path["value"] = path_map[platform_path["value"]]
+    def remap_platform(projections: list[dict[str, str]]) -> None:
+        platform_path["value"] = projections[0]["private_path"]
 
     restarted = WikiService(kb_root, start_worker=False, path_remap_callback=remap_platform)
     try:
@@ -148,11 +151,11 @@ def test_apply_meta_generated_article_id_recovers_and_duplicate_later_fails_clos
     int(generated_id, 16)
     first.close()
 
-    remaps: list[dict[str, str]] = []
+    remaps: list[list[dict[str, str]]] = []
     restarted = WikiService(kb_root, start_worker=False, path_remap_callback=remaps.append)
     try:
         assert restarted.state.raw_records()[0]["target_path"] == "tools/base.md"
-        assert remaps == [{"concepts/base.md": "tools/base.md"}]
+        assert remaps[0][0]["private_path"] == "tools/base.md"
         restarted.state.remap_article_path("tools/base.md", "concepts/base.md")
         duplicate = restarted.root / "wiki" / "tools" / "duplicate.md"
         duplicate.write_bytes((restarted.root / "wiki" / "tools" / "base.md").read_bytes())
@@ -173,7 +176,7 @@ def test_apply_meta_callback_failure_can_retry_with_a_new_operation(
 ):
     calls = 0
 
-    def fail_once(_path_map: dict[str, str]) -> None:
+    def fail_once(_projections: list[dict[str, str]]) -> None:
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -206,7 +209,7 @@ def test_legacy_apply_meta_retry_keeps_operation_base_when_generated_id_changes(
     monkeypatch.setattr(dc, "now_iso", lambda: next(timestamps))
     calls = 0
 
-    def fail_once(_path_map: dict[str, str]) -> None:
+    def fail_once(_projections: list[dict[str, str]]) -> None:
         nonlocal calls
         calls += 1
         if calls == 1:

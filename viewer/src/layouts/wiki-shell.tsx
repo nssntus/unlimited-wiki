@@ -7,6 +7,7 @@ import {
   CheckCircle2Icon,
   ChevronsUpDownIcon,
   FilePenLineIcon,
+  FilePlus2Icon,
   InboxIcon,
   ListTodoIcon,
   LogOutIcon,
@@ -56,6 +57,8 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { GlobalSearch } from "@/features/global-search"
 import { useSession } from "@/features/session-context"
 import { WorkspaceSwitcher } from "@/features/workspace-switcher"
+import { UnsavedChangesProvider } from "@/features/unsaved-changes"
+import { useUnsavedChanges } from "@/features/unsaved-changes-context"
 
 const governanceRoutes = [
   ["/inbox", "原料箱", InboxIcon, "wiki.write"],
@@ -77,10 +80,15 @@ function articleHref(path: string) {
 }
 
 export function WikiShell() {
+  return <UnsavedChangesProvider><WikiShellContent /></UnsavedChangesProvider>
+}
+
+function WikiShellContent() {
   const location = useLocation()
   const navigate = useNavigate()
   const [searchOpen, setSearchOpen] = useState(false)
   const { session, signOut, hasPermission } = useSession()
+  const { runAfterDiscard } = useUnsavedChanges()
   const articles = useQuery({ queryKey: queryKeys.articles, queryFn: () => apiGet<ArticleSummary[]>("/api/articles") })
   const categories = useQuery({ queryKey: [...queryKeys.categories, "all"], queryFn: () => apiGet<Category[]>("/api/categories?status=all") })
   const notifications = useQuery({ queryKey: queryKeys.notifications, queryFn: () => apiGet<Notification[]>("/api/notifications"), refetchInterval: 15000 })
@@ -96,6 +104,7 @@ export function WikiShell() {
           </Link>
           <WorkspaceSwitcher />
           <div className="grid grid-cols-2 gap-2"><Button size="sm" variant="outline" render={<Link to="/square" />}><StoreIcon data-icon="inline-start" />广场</Button>{session?.user?.role === "admin" ? <Button size="sm" variant="outline" render={<Link to="/admin/reviews" />}><ShieldCheckIcon data-icon="inline-start" />审核</Button> : <span />}</div>
+          {hasPermission("wiki.write") && <Button className="w-full justify-start" render={<Link to="/new" />}><FilePlus2Icon data-icon="inline-start" />新建词条</Button>}
           <Button variant="outline" className="w-full justify-start text-muted-foreground" onClick={() => setSearchOpen(true)}>
             <SearchIcon data-icon="inline-start" />搜索标题、别名或正文
           </Button>
@@ -190,7 +199,7 @@ export function WikiShell() {
                 ))}
               </DropdownMenuGroup>
               <DropdownMenuSeparator />
-              <DropdownMenuItem variant="destructive" className="min-h-9 px-2" onClick={() => void signOut()}>
+              <DropdownMenuItem variant="destructive" className="min-h-9 px-2" onClick={() => void runAfterDiscard(signOut)}>
                 <LogOutIcon />
                 <span>退出登录</span>
               </DropdownMenuItem>

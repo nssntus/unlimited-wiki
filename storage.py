@@ -84,6 +84,7 @@ class FileStore:
         self.history_root.mkdir(parents=True, exist_ok=True)
         self.lock_path = self.state_root / "write.lock"
         self.lock_path.touch(exist_ok=True)
+        self._lock_state = threading.local()
         self.recover()
 
     def resolve(self, rel: str) -> Path:
@@ -96,11 +97,21 @@ class FileStore:
     @contextlib.contextmanager
     def locked(self) -> Iterator[None]:
         with _PROCESS_LOCK:
-            with self.lock_path.open("a+b") as handle:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            depth = getattr(self._lock_state, "depth", 0)
+            if depth > 0:
+                self._lock_state.depth = depth + 1
                 try:
                     yield
                 finally:
+                    self._lock_state.depth -= 1
+                return
+            with self.lock_path.open("a+b") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                self._lock_state.depth = 1
+                try:
+                    yield
+                finally:
+                    self._lock_state.depth = 0
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _write_manifest(self, directory: Path, manifest: dict) -> None:
@@ -119,6 +130,7 @@ class FileStore:
         must_not_exist: bool = False,
         must_not_exist_paths: set[str] | None = None,
         directories: dict[str, bool] | None = None,
+        _lock_held: bool = False,
     ) -> dict:
         normalized: dict[str, bytes | None] = {}
         for rel, value in changes.items():
@@ -140,7 +152,10 @@ class FileStore:
         exclusive_paths = {safe_project_rel(path) for path in (must_not_exist_paths or set())}
         if not exclusive_paths.issubset(normalized):
             raise ValueError("exclusive transaction target is not part of changes")
-        with self.locked():
+        if _lock_held and getattr(self._lock_state, "depth", 0) <= 0:
+            raise RuntimeError("commit marked lock-held without owning the file lock")
+        lock_context = contextlib.nullcontext() if _lock_held else self.locked()
+        with lock_context:
             if must_not_exist and any(self.resolve(rel).exists() for rel in normalized):
                 raise TransactionTargetExistsError("transaction target already exists")
             if any(self.resolve(rel).exists() for rel in exclusive_paths):

@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Link, useLocation, useNavigate } from "react-router-dom"
-import { Clock3Icon, CopyIcon, EllipsisIcon, ExternalLinkIcon, FilePenLineIcon, InfoIcon, MergeIcon, RefreshCwIcon, SendIcon, Settings2Icon } from "lucide-react"
+import { Clock3Icon, CopyIcon, EllipsisIcon, ExternalLinkIcon, FilePenLineIcon, FilePlus2Icon, InfoIcon, MergeIcon, RefreshCwIcon, SendIcon, Settings2Icon } from "lucide-react"
 import { toast } from "sonner"
 
 import { apiGet, apiPost, type Article, type ArticleSummary, queryKeys, type Task } from "@/lib/api"
@@ -177,7 +177,7 @@ export function ArticlePage() {
   })
 
   if (articles.isLoading || (articlePath && article.isLoading)) return <PageFrame><div className="mx-auto max-w-3xl"><Skeleton className="h-6 w-40" /><Skeleton className="mt-8 h-12 w-3/5" /><Skeleton className="mt-12 h-72 w-full" /></div></PageFrame>
-  if (!articlePath) return <PageFrame><Empty className="min-h-[60svh]"><EmptyHeader><EmptyMedia variant="icon"><FilePenLineIcon /></EmptyMedia><EmptyTitle>知识库还是空的</EmptyTitle><EmptyDescription>{canWrite ? "将 Markdown 放入 Raw 后，从原料箱创建第一篇正本。" : "当前空间还没有可阅读的词条。"}</EmptyDescription></EmptyHeader>{canWrite && <EmptyContent><Button render={<Link to="/inbox" />}>打开原料箱</Button></EmptyContent>}</Empty></PageFrame>
+  if (!articlePath) return <PageFrame><Empty className="min-h-[60svh]"><EmptyHeader><EmptyMedia variant="icon"><FilePenLineIcon /></EmptyMedia><EmptyTitle>知识库还是空的</EmptyTitle><EmptyDescription>{canWrite ? "创建第一篇私人词条，或从原料箱整理已有资料。" : "当前空间还没有可阅读的词条。"}</EmptyDescription></EmptyHeader>{canWrite && <EmptyContent><Button render={<Link to="/new" />}><FilePlus2Icon data-icon="inline-start" />新建词条</Button><Button variant="outline" render={<Link to="/inbox" />}>打开原料箱</Button></EmptyContent>}</Empty></PageFrame>
   if (article.isError || !article.data) return <PageFrame><Empty className="min-h-[60svh]"><EmptyHeader><EmptyMedia variant="icon"><FilePenLineIcon /></EmptyMedia><EmptyTitle>找不到这篇词条</EmptyTitle><EmptyDescription>{article.error?.message || articlePath}</EmptyDescription></EmptyHeader><EmptyContent><Button variant="outline" onClick={() => navigate("/")}>返回词库</Button></EmptyContent></Empty></PageFrame>
   const data = article.data
   const updatePromptKey = publicationDismissalKey(data, session?.user?.id, session?.workspace?.id) || data.revision
