@@ -43,6 +43,7 @@ from platform_store import (
     AccountWorkspaceSetChanged,
     PlatformIdempotencyError,
     PlatformStore,
+    RegistrationClosedError,
     SessionContext,
 )
 from platform_review import PlatformReviewWorker
@@ -1163,15 +1164,30 @@ def make_handler(app: WikiApp):
                 invite_token = _string(data, "invite_token", maximum=256)
                 if app.deployment.registration_mode == "invite" and not invite_token:
                     raise ApiError(422, "invite_token is required")
-                user, recovery = app.platform.register(
-                    _string(data, "email", maximum=254, required=True),
-                    _string(data, "nickname", maximum=80, required=True),
-                    _string(data, "password", maximum=1024, required=True),
-                    first_user_only=app.deployment.registration_mode == "bootstrap",
-                    invite_token=invite_token,
-                )
-                migration = migrate_legacy_workspace(app.platform, user["id"]) if user["role"] == "admin" else {"status": "not_needed"}
-                token, context = app.platform.create_session(user["id"])
+                try:
+                    user, recovery, token, context = app.platform.register(
+                        _string(data, "email", maximum=254, required=True),
+                        _string(data, "nickname", maximum=80, required=True),
+                        _string(data, "password", maximum=1024, required=True),
+                        first_user_only=app.deployment.registration_mode == "bootstrap",
+                        invite_token=invite_token,
+                        initial_session=True,
+                    )
+                except RegistrationClosedError as exc:
+                    raise ApiError(409, "registration is closed", details={"code": "registration_closed"}) from exc
+                migration = {"status": "not_needed"}
+                if user["role"] == "admin":
+                    try:
+                        migration = migrate_legacy_workspace(app.platform, user["id"])
+                    except Exception:
+                        migration = {"status": "retry_required"}
+                        try:
+                            app.platform.audit(
+                                user["id"], "workspace.migrate_legacy_failed", "workspace",
+                                user["workspace_id"], {"code": "legacy_migration_failed"},
+                            )
+                        except Exception:
+                            pass
                 self.context = context
                 self._set_session_cookie(token)
                 return self._json(201, {"authenticated": True, **context.public(), "recovery_code": recovery, "migration": {"status": migration["status"]}})
@@ -1461,6 +1477,20 @@ def make_handler(app: WikiApp):
                 app.platform.revoke_all_sessions(self.account_context.user_id)
                 self._set_session_cookie("", clear=True)
                 return self._json(200, {"authenticated": False})
+            if path == "/api/account/recovery-code":
+                _fields(data, {"password"}, {"password"})
+                self._rate_limit(
+                    f"recovery-code:ip:{self._client_ip()}", limit=5, window_seconds=3600,
+                )
+                self._rate_limit(
+                    f"recovery-code:account:{self.account_context.user_id}", limit=5,
+                    window_seconds=3600,
+                )
+                recovery = app.platform.rotate_recovery_code(
+                    self.account_context.user_id,
+                    _string(data, "password", maximum=1024, required=True),
+                )
+                return self._json(200, {"recovery_code": recovery, "expires_in_hours": 24})
             if path == "/api/account/delete":
                 _fields(data, {"password"}, {"password"})
                 app.delete_account(self.context or self.account_context, _string(data, "password", maximum=1024, required=True))

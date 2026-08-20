@@ -740,10 +740,134 @@ def test_legacy_migration_hashes_backups_encrypts_model_and_rolls_back(tmp_path:
 
     manifest = migrate_legacy_workspace(platform, user["id"])
     assert manifest["status"] == "committed"
+    assert (tmp_path / ".runtime" / "legacy-migration.lock").is_file()
+    assert not (tmp_path / ".wiki-state" / "write.lock").exists()
     assert (target / "wiki" / "concepts" / "legacy.md").read_bytes() == source_hash
     assert (tmp_path / manifest["backup"] / "wiki" / "concepts" / "legacy.md").read_bytes() == source_hash
     assert platform.load_model(user["workspace_id"])["api_key"] == "legacy-secret"
     assert b"legacy-secret" not in (platform.state_root / "platform.sqlite3").read_bytes()
+
+
+@pytest.mark.parametrize("failure_stage", ["record", "audit"])
+def test_legacy_migration_recovers_when_finalization_fails_after_publish(
+    tmp_path: Path, monkeypatch, failure_stage: str,
+):
+    (tmp_path / "wiki" / "concepts").mkdir(parents=True)
+    article = tmp_path / "wiki" / "concepts" / "legacy.md"
+    article.write_text("# Legacy\n\n> Category: concepts\n> Status: 词条\n", encoding="utf-8")
+    platform = PlatformStore(tmp_path)
+    user, _recovery = platform.register("owner@example.com", "Owner", "correct-horse-123")
+    target = platform.workspace_root(user["workspace_root_name"])
+    failed = False
+
+    if failure_stage == "record":
+        original_finalize = platform.finalize_migration
+
+        def fail_once(*args, **kwargs):
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise OSError("injected migration record failure")
+            return original_finalize(*args, **kwargs)
+
+        monkeypatch.setattr(platform, "finalize_migration", fail_once)
+    else:
+        original_audit = platform._audit
+
+        def fail_once(*args, **kwargs):
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise OSError("injected migration audit failure")
+            return original_audit(*args, **kwargs)
+
+        monkeypatch.setattr(platform, "_audit", fail_once)
+
+    with pytest.raises(OSError, match=f"injected migration {failure_stage} failure"):
+        migrate_legacy_workspace(platform, user["id"])
+
+    pending = platform.migration("legacy-single-workspace")
+    assert pending["status"] == "prepared"
+    assert (target / "wiki" / "concepts" / "legacy.md").read_bytes() == article.read_bytes()
+    with platform.connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE action='workspace.migrate_legacy'"
+        ).fetchone()[0] == 0
+
+    recovered = migrate_legacy_workspace(platform, user["id"])
+    assert recovered["status"] == "committed"
+    assert recovered["id"] == pending["id"]
+    assert migrate_legacy_workspace(platform, user["id"]) == recovered
+    with platform.connect() as db:
+        row = db.execute("SELECT id,status,manifest_json FROM migrations WHERE kind='legacy-single-workspace'").fetchone()
+        assert row["id"] == pending["id"] and row["status"] == "committed"
+        assert json.loads(row["manifest_json"]) == recovered
+        assert db.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE action='workspace.migrate_legacy'"
+        ).fetchone()[0] == 1
+
+
+def test_legacy_migration_recovery_rejects_a_changed_published_target(tmp_path: Path, monkeypatch):
+    (tmp_path / "wiki" / "concepts").mkdir(parents=True)
+    (tmp_path / "wiki" / "concepts" / "legacy.md").write_text("# Legacy\n", encoding="utf-8")
+    platform = PlatformStore(tmp_path)
+    user, _recovery = platform.register("owner@example.com", "Owner", "correct-horse-123")
+    original_finalize = platform.finalize_migration
+    monkeypatch.setattr(
+        platform, "finalize_migration",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("injected finalization failure")),
+    )
+    with pytest.raises(OSError, match="injected finalization failure"):
+        migrate_legacy_workspace(platform, user["id"])
+    target = platform.workspace_root(user["workspace_root_name"])
+    (target / "wiki" / "concepts" / "legacy.md").write_text("# Changed\n", encoding="utf-8")
+    monkeypatch.setattr(platform, "finalize_migration", original_finalize)
+
+    with pytest.raises(RuntimeError, match="repair is required"):
+        migrate_legacy_workspace(platform, user["id"])
+    assert platform.migration("legacy-single-workspace")["status"] == "prepared"
+
+
+@pytest.mark.parametrize("changed_copy", ["target", "backup"])
+def test_committed_legacy_migration_replay_rejects_changed_files(tmp_path: Path, changed_copy: str):
+    (tmp_path / "wiki" / "concepts").mkdir(parents=True)
+    (tmp_path / "wiki" / "concepts" / "legacy.md").write_text("# Legacy\n", encoding="utf-8")
+    platform = PlatformStore(tmp_path)
+    user, _recovery = platform.register("owner@example.com", "Owner", "correct-horse-123")
+    manifest = migrate_legacy_workspace(platform, user["id"])
+    target = platform.workspace_root(user["workspace_root_name"])
+    root = target if changed_copy == "target" else tmp_path / manifest["backup"]
+    changed = root / "wiki" / "concepts" / "legacy.md"
+    changed.write_text("# Changed\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="repair is required"):
+        migrate_legacy_workspace(platform, user["id"])
+    assert changed.read_text(encoding="utf-8") == "# Changed\n"
+    assert platform.migration("legacy-single-workspace")["status"] == "committed"
+
+
+@pytest.mark.parametrize("linked_root", ["target", "backup"])
+def test_committed_legacy_migration_replay_rejects_symlinked_roots(tmp_path: Path, linked_root: str):
+    (tmp_path / "wiki" / "concepts").mkdir(parents=True)
+    (tmp_path / "wiki" / "concepts" / "legacy.md").write_text("# Legacy\n", encoding="utf-8")
+    platform = PlatformStore(tmp_path)
+    user, _recovery = platform.register("owner@example.com", "Owner", "correct-horse-123")
+    manifest = migrate_legacy_workspace(platform, user["id"])
+    target = platform.spaces_root / user["workspace_root_name"]
+    backup = tmp_path / manifest["backup"]
+
+    if linked_root == "target":
+        real_target = target.with_name(target.name + ".real")
+        target.rename(real_target)
+        target.symlink_to(real_target.name, target_is_directory=True)
+    else:
+        real_backup = backup.with_name("backup.real")
+        backup.rename(real_backup)
+        backup.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="repair is required"):
+        migrate_legacy_workspace(platform, user["id"])
+    assert platform.migration("legacy-single-workspace")["status"] == "committed"
 
 
 def test_platform_ai_worker_reads_snapshot_only_and_recovers_to_admin_queue(tmp_path: Path):

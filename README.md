@@ -100,6 +100,8 @@ WIKI_PORT=8765
 
 `WIKI_PUBLIC_ORIGIN` 必须是单一、规范的 HTTPS Origin，不能带路径、查询参数或凭据。LAN 模式会强制使用 `__Host-wiki_session`、`Secure`、`HttpOnly` 和 `SameSite=Strict` Cookie，并启用 HSTS；Host、Origin 或代理协议不匹配时请求会被拒绝。`WIKI_REGISTRATION_MODE=bootstrap` 只允许创建第一个管理员，成功后自动关闭注册。确认管理员可以登录后，将模式改为 `invite`；管理员在部署机生成绑定邮箱、限时且只能使用一次的邀请令牌：
 
+首位管理员的账号、个人空间、初始会话、恢复码哈希和注册审计在同一个平台事务中提交。全新部署没有 legacy `wiki/`、`raw/` 或 `.wiki-state/` 数据时，注册不会写项目根；只有检测到 legacy 数据时才使用 `.runtime/legacy-migration.lock` 串行迁移。迁移失败不会把已经成功的注册伪装成 HTTP 失败：注册仍返回会话和一次性恢复码，并将迁移状态标为 `retry_required`。文件发布前失败会回滚；文件已原子发布但数据库收尾失败时，保留 `prepared` manifest，下次调用校验目标与备份的完整文件集合和哈希后，将迁移记录与成功审计在同一事务中收敛为 `committed`。设置页可在再次验证当前密码后轮换自己的 24 小时恢复码；轮换会立即撤销旧码，明文新码只显示一次且不会写入数据库或幂等响应缓存。
+
 ```bash
 python3 account_invites.py create --project-root . --email member@example.com --hours 72
 ```
@@ -279,7 +281,7 @@ viewer/                             前端源码与构建配置
 - 网页补证拒绝本地、私网、带凭据 URL 和 HTTPS 降级跳转。
 - 广场公共 Markdown、结构化来源和纠错证据只允许无凭据的 `http`/`https` 公网目标；拒绝 localhost、本地或私网域名、非全局 IP、保留地址及浏览器可解释为这些地址的数字主机。平台不会抓取、预取或跟随来源 URL；不安全正文链接不可点击，HTTP 外链会明确标记为非加密连接。
 - 公共 API 使用字段白名单，不返回私人 Workspace、文件路径、Raw 来源、内部用户 ID 或 AI 审核解释。公共分类、标签和专题只引用当前公开且未隔离的 revision；作者撤回、Admin 下架、账号注销和版本隔离后，搜索、版本、主页、专题、关系与缓存均不得继续提供被隐藏正文。
-- 本机开发默认开放注册；LAN 模式禁止开放注册，只允许首位管理员 bootstrap、邮箱绑定的单次邀请或完全关闭。bootstrap 的首位用户判定、邀请令牌消费与账号创建都在 SQLite 写事务中完成。
+- 本机开发默认开放注册；LAN 模式禁止开放注册，只允许首位管理员 bootstrap、邮箱绑定的单次邀请或完全关闭。bootstrap 的首位用户判定、邀请令牌消费、账号关系、初始会话、恢复码哈希与注册审计都在同一 SQLite 写事务中完成；已关闭的 bootstrap 返回明确的 `registration_closed` 冲突。
 - 项目依赖 Unix 文件锁，当前不声明原生 Windows 支持。
 
 ## 验证
