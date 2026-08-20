@@ -9,6 +9,7 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC = ROOT / "viewer" / "public"
+SITE = ROOT / "site"
 
 
 def test_favicon_svg_is_self_contained_brand_artwork() -> None:
@@ -51,3 +52,13 @@ def test_index_declares_all_brand_icons() -> None:
     assert '<link rel="icon" type="image/svg+xml" href="/favicon.svg?v=1" />' in index
     assert '<link rel="icon" href="/favicon.ico?v=1" sizes="any" />' in index
     assert '<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png?v=1" />' in index
+
+
+def test_github_pages_reuses_the_exact_brand_assets() -> None:
+    for name in ("favicon.svg", "favicon.ico", "apple-touch-icon.png"):
+        assert (SITE / name).read_bytes() == (PUBLIC / name).read_bytes()
+
+    index = (SITE / "index.html").read_text(encoding="utf-8")
+    assert 'href="./favicon.svg"' in index
+    assert 'href="./favicon.ico"' in index
+    assert 'href="./apple-touch-icon.png"' in index
