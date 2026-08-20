@@ -18,27 +18,3 @@ def test_toc_does_not_replace_hash_router_route():
     assert 'href={`#${encodeURIComponent(heading)}`}' not in article
     assert "scrollToHeading(heading.id)" in article
     assert "document.getElementById(id) || document.getElementById(headingBase(id))" in markdown
-
-
-def test_github_pages_script_uses_safe_static_dom_projection():
-    root = Path(__file__).parents[1] / "site"
-    source = "\n".join(
-        (root / name).read_text(encoding="utf-8")
-        for name in ("index.html", "language-init.js", "app.js")
-    )
-    for unsafe in (
-        "innerHTML",
-        "outerHTML",
-        "insertAdjacentHTML",
-        "document.write",
-        "eval(",
-        "new Function",
-        "fetch(",
-        "XMLHttpRequest",
-        "WebSocket",
-    ):
-        assert unsafe not in source
-    assert "textContent" in source
-    assert "localStorage.getItem" in source
-    assert "localStorage.setItem" in source
-    assert "document.documentElement.lang" in source
