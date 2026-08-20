@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="zh-CN" data-locale="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; manifest-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'"
+    />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#ffffff" />
+    <meta name="robots" content="index,follow" />
+    <meta
+      name="description"
+      content="Unlimited Wiki 是一个本地优先、默认私有、可控分享的 Markdown 知识平台。"
+      data-i18n-content="meta.description"
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:locale" content="zh_CN" data-locale-meta />
+    <meta property="og:title" content="Unlimited Wiki" />
+    <meta
+      property="og:description"
+      content="让知识在私有空间里生长，在公共广场中被看见。"
+      data-i18n-content="meta.ogDescription"
+    />
+    <meta property="og:url" content="https://nssntus.github.io/unlimited-wiki/" />
+    <meta
+      property="og:image"
+      content="https://nssntus.github.io/unlimited-wiki/apple-touch-icon.png"
+    />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="Unlimited Wiki" />
+    <meta
+      name="twitter:description"
+      content="让知识在私有空间里生长，在公共广场中被看见。"
+      data-i18n-content="meta.ogDescription"
+    />
+    <link rel="canonical" href="https://nssntus.github.io/unlimited-wiki/" />
+    <link rel="alternate" hreflang="zh-CN" href="https://nssntus.github.io/unlimited-wiki/" />
+    <link rel="alternate" hreflang="en" href="https://nssntus.github.io/unlimited-wiki/" />
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <link rel="icon" href="./favicon.ico" sizes="any" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./apple-touch-icon.png" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./language-init.js"></script>
+    <script src="./app.js" defer></script>
+    <title>Unlimited Wiki</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main" data-i18n="nav.skip">跳到正文</a>
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="Unlimited Wiki">
+        <img src="./favicon.svg" width="36" height="36" alt="" />
+        <span>Unlimited Wiki</span>
+      </a>
+      <nav class="primary-nav" id="primary-nav" aria-label="主导航" data-i18n-aria="nav.label">
+        <a href="#workflow" data-i18n="nav.workflow">工作流</a>
+        <a href="#boundaries" data-i18n="nav.boundaries">安全边界</a>
+        <a href="#stack" data-i18n="nav.stack">技术栈</a>
+      </nav>
+      <div class="header-actions">
+        <button
+          type="button"
+          class="menu-toggle"
+          aria-controls="primary-nav"
+          aria-expanded="false"
+          aria-label="打开导航"
+          data-i18n-aria="nav.openMenu"
+        >
+          <span aria-hidden="true">☰</span>
+        </button>
+        <div class="locale-switcher" role="group" aria-label="语言" data-i18n-aria="language.label">
+          <button type="button" data-locale-choice="zh-CN" aria-pressed="true">中</button>
+          <span aria-hidden="true">/</span>
+          <button type="button" data-locale-choice="en" aria-pressed="false">EN</button>
+        </div>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="hero" id="top" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <h1 id="hero-title">Unlimited Wiki</h1>
+          <p class="hero-statement" data-i18n="hero.statement">
+            让知识在私有空间里生长，<br />在公共广场中被看见。
+          </p>
+          <p class="hero-summary" data-i18n="hero.summary">
+            整理 Raw 原料，沉淀 Markdown 正本，协作治理，并通过 AI 预审与人工审核安全公开。
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="https://github.com/nssntus/unlimited-wiki" data-i18n="cta.github">
+              在 GitHub 查看源码
+            </a>
+            <a class="button button-secondary" href="#workflow" data-i18n="cta.workflow">探索工作流</a>
+          </div>
+          <p class="hero-footnote" data-i18n="hero.footnote">
+            本地优先 · 默认私有 · Markdown 可携带
+          </p>
+        </div>
+
+        <div class="product-window" aria-label="Unlimited Wiki 产品界面预览" data-i18n-aria="hero.previewLabel">
+          <div class="window-topbar">
+            <span class="window-brand">Unlimited Wiki</span>
+            <span class="window-search" data-i18n="preview.search">搜索页面…</span>
+            <span class="window-user" aria-hidden="true">LW</span>
+          </div>
+          <div class="window-body">
+            <aside class="preview-tree" aria-hidden="true">
+              <strong data-i18n="preview.knowledge">知识库</strong>
+              <span data-i18n="preview.guides">01 指南</span>
+              <span class="tree-open" data-i18n="preview.product">02 产品</span>
+              <span class="tree-active" data-i18n="preview.entry">产品愿景与原则</span>
+              <span data-i18n="preview.engineering">03 工程</span>
+              <span data-i18n="preview.operations">04 运营</span>
+            </aside>
+            <div class="preview-editor">
+              <div class="editor-tabs">
+                <strong data-i18n="preview.edit">编辑 Markdown</strong>
+                <span data-i18n="preview.safePreview">安全预览</span>
+              </div>
+              <div class="editor-sheet">
+                <code># <span data-i18n="preview.title">产品愿景与原则</span></code>
+                <p data-i18n="preview.body">
+                  Unlimited Wiki 为团队提供一个本地优先、默认私有、可控分享的知识平台。
+                </p>
+                <code>## <span data-i18n="preview.principles">核心原则</span></code>
+                <ul>
+                  <li data-i18n="preview.local">本地优先，数据可控</li>
+                  <li data-i18n="preview.private">默认私有，最小公开</li>
+                  <li data-i18n="preview.markdown">Markdown 优先，开放可携带</li>
+                </ul>
+              </div>
+              <div class="source-strip">
+                <strong data-i18n="preview.sources">原始资料</strong>
+                <span>product-notes.pdf</span>
+                <span>research.md</span>
+              </div>
+            </div>
+            <aside class="preview-release" aria-hidden="true">
+              <strong data-i18n="preview.release">发布流程</strong>
+              <ol>
+                <li class="is-current"><span>1</span><b data-i18n="preview.draft">草稿</b></li>
+                <li><span>2</span><b data-i18n="preview.preflight">AI 预审</b></li>
+                <li><span>3</span><b data-i18n="preview.human">人工审核</b></li>
+                <li><span>4</span><b data-i18n="preview.publish">公开发布</b></li>
+              </ol>
+            </aside>
+          </div>
+        </div>
+
+        <a class="section-cue" href="#workflow" aria-label="继续到工作流" data-i18n-aria="hero.next">
+          <span data-i18n="hero.nextLabel">下一节：从原料到知识正本</span>
+          <span aria-hidden="true">↓</span>
+        </a>
+      </section>
+
+      <section class="section workflow-section" id="workflow" aria-labelledby="workflow-title">
+        <div class="section-heading">
+          <img src="./favicon.svg" width="40" height="40" alt="" />
+          <div>
+            <h2 id="workflow-title" data-i18n="workflow.title">从原料到知识正本</h2>
+            <p data-i18n="workflow.lead">一条可追溯、可恢复、可持续治理的知识工作流。</p>
+          </div>
+        </div>
+        <div class="workflow-rail" aria-label="知识工作流" data-i18n-aria="workflow.label">
+          <article class="flow-step">
+            <div class="flow-index">01</div>
+            <h3 data-i18n="workflow.rawTitle">收集 Raw</h3>
+            <p data-i18n="workflow.rawBody">原料进入私有收件箱，保留来源标识。</p>
+            <div class="mini-ui raw-ui" aria-hidden="true">
+              <div><b>product-notes.pdf</b><span>PDF</span></div>
+              <div><b>research.md</b><span>MD</span></div>
+              <div><b>architecture.png</b><span>OCR</span></div>
+            </div>
+          </article>
+          <article class="flow-step">
+            <div class="flow-index">02</div>
+            <h3 data-i18n="workflow.markdownTitle">沉淀 Markdown</h3>
+            <p data-i18n="workflow.markdownBody">整理为可编辑、可链接、可迁移的正本。</p>
+            <div class="mini-ui markdown-ui" aria-hidden="true">
+              <span># Product principles</span>
+              <span>## Context</span>
+              <span>- Local-first</span>
+              <span>- Private by default</span>
+            </div>
+          </article>
+          <article class="flow-step">
+            <div class="flow-index">03</div>
+            <h3 data-i18n="workflow.governTitle">协作治理</h3>
+            <p data-i18n="workflow.governBody">权限、健康检查、版本与任务保持可见。</p>
+            <div class="mini-ui govern-ui" aria-hidden="true">
+              <div><span data-i18n="workflow.permissions">权限</span><b>Owner · Editor · Viewer</b></div>
+              <div><span data-i18n="workflow.health">健康检查</span><b class="success">PASS</b></div>
+              <div><span data-i18n="workflow.history">版本历史</span><b>v3 · v2 · v1</b></div>
+            </div>
+          </article>
+          <article class="flow-step">
+            <div class="flow-index">04</div>
+            <h3 data-i18n="workflow.publishTitle">预审与人工审核</h3>
+            <p data-i18n="workflow.publishBody">不可变快照依次经过 AI 预审和人工审核。</p>
+            <div class="mini-ui publish-ui" aria-hidden="true">
+              <div class="done"><span>1</span><b data-i18n="preview.preflight">AI 预审</b></div>
+              <div class="current"><span>2</span><b data-i18n="preview.human">人工审核</b></div>
+            </div>
+          </article>
+          <article class="flow-step">
+            <div class="flow-index">05</div>
+            <h3 data-i18n="workflow.square">Wiki 广场</h3>
+            <p data-i18n="workflow.squareBody">发布不可变公开版本，保留来源、版本历史与纠错入口。</p>
+            <div class="mini-ui square-ui" aria-hidden="true">
+              <strong data-i18n="workflow.publicRevision">Public revision</strong>
+              <span>v3 · published</span>
+              <span data-i18n="workflow.publicFacts">来源 · 历史 · 纠错</span>
+            </div>
+          </article>
+        </div>
+        <p class="section-note" data-i18n="workflow.note">
+          失败可见，任务可重试，审核流程不会静默改写私有正本。
+        </p>
+      </section>
+
+      <section class="section boundary-section" id="boundaries" aria-labelledby="boundaries-title">
+        <div class="section-heading">
+          <img src="./favicon.svg" width="40" height="40" alt="" />
+          <div>
+            <h2 id="boundaries-title" data-i18n="boundary.title">边界清楚，协作才安心</h2>
+            <p data-i18n="boundary.lead">私有正本、投稿快照与公开版本分开管理。</p>
+          </div>
+        </div>
+        <div class="boundary-map">
+          <article class="boundary-column private-column">
+            <div class="column-number">01</div>
+            <h3 data-i18n="boundary.privateTitle">私有 Workspace</h3>
+            <ul>
+              <li data-i18n="boundary.markdownFiles">Markdown 文件</li>
+              <li data-i18n="boundary.rawSources">Raw 原料</li>
+              <li data-i18n="boundary.roles">Owner / Editor / Viewer 权限</li>
+            </ul>
+            <strong data-i18n="boundary.privateRule">默认私有</strong>
+          </article>
+          <div class="boundary-arrow" aria-hidden="true">→</div>
+          <article class="boundary-column review-column">
+            <div class="column-number">02</div>
+            <h3 data-i18n="boundary.reviewTitle">投稿与审核</h3>
+            <ul>
+              <li data-i18n="boundary.snapshot">精确、不可变的投稿快照</li>
+              <li data-i18n="boundary.ai">统一规则的 AI 预审</li>
+              <li data-i18n="boundary.human">管理员人工审核</li>
+            </ul>
+            <strong data-i18n="boundary.reviewRule">只披露确认内容</strong>
+          </article>
+          <div class="boundary-arrow" aria-hidden="true">→</div>
+          <article class="boundary-column public-column">
+            <div class="column-number">03</div>
+            <h3 data-i18n="boundary.publicTitle">Wiki 广场</h3>
+            <ul>
+              <li data-i18n="boundary.publicRevision">公开版本与历史</li>
+              <li data-i18n="boundary.publicSources">公开来源</li>
+              <li data-i18n="boundary.corrections">纠错、订阅与治理</li>
+            </ul>
+            <strong data-i18n="boundary.publicRule">公开版本不反向改写私有正本</strong>
+          </article>
+        </div>
+        <div class="assurances">
+          <span data-i18n="boundary.tenant">强租户隔离</span>
+          <span data-i18n="boundary.credentials">模型凭据加密保存</span>
+          <span data-i18n="boundary.retry">任务可重试与恢复</span>
+          <span data-i18n="boundary.atomic">跨文件原子写入与条件回滚</span>
+        </div>
+        <p class="deployment-truth" data-i18n="boundary.deployment">
+          面向本机或同机 HTTPS 反向代理的单节点部署；不是托管 SaaS，也不支持多节点集群。
+        </p>
+      </section>
+
+      <section class="section stack-section" id="stack" aria-labelledby="stack-title">
+        <div class="section-heading stack-heading">
+          <div>
+            <h2 id="stack-title" data-i18n="stack.title">Markdown 是正本，工具链保持简单</h2>
+            <p data-i18n="stack.lead">自托管、可审计、可迁移。</p>
+          </div>
+        </div>
+        <div class="stack-layout">
+          <article class="architecture">
+            <h3 data-i18n="stack.architecture">开放架构</h3>
+            <div class="stack-row">
+              <b>React 19 + TypeScript + Vite</b>
+              <span data-i18n="stack.browser">浏览器</span>
+            </div>
+            <div class="stack-row">
+              <b>Python + SQLite</b>
+              <span data-i18n="stack.service">同源 Python 服务</span>
+            </div>
+            <div class="stack-row">
+              <b>Markdown files</b>
+              <span data-i18n="stack.workspace">每个 Workspace 独立</span>
+            </div>
+            <div class="stack-row stack-row-last">
+              <b>OpenAI · DeepSeek · OpenAI-compatible</b>
+              <span data-i18n="stack.providers">可选模型服务</span>
+            </div>
+          </article>
+
+          <article class="quickstart">
+            <div class="quickstart-heading">
+              <h3 data-i18n="quickstart.title">快速开始</h3>
+              <button type="button" class="copy-button" data-copy-target="quickstart-code" data-i18n="quickstart.copy">
+                复制命令
+              </button>
+            </div>
+            <pre><code id="quickstart-code">git clone https://github.com/nssntus/unlimited-wiki.git
+cd unlimited-wiki
+
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+
+npm --prefix viewer ci
+npm --prefix viewer run build
+
+python3 serve.py</code></pre>
+            <p data-i18n="quickstart.address">默认访问 http://127.0.0.1:8765</p>
+            <span class="copy-status" role="status" aria-live="polite"></span>
+          </article>
+        </div>
+      </section>
+
+      <section class="closing" aria-labelledby="closing-title">
+        <h2 id="closing-title" data-i18n="closing.title">把分散资料变成自己的知识系统。</h2>
+        <p data-i18n="closing.body">从本地 Markdown 开始，在清晰边界内协作与分享。</p>
+        <div class="closing-actions">
+          <a class="text-link text-link-red" href="https://github.com/nssntus/unlimited-wiki" data-i18n="closing.github">
+            在 GitHub 探索 Unlimited Wiki
+          </a>
+          <a class="text-link text-link-green" href="https://github.com/nssntus/unlimited-wiki#readme" data-i18n="closing.readme">
+            阅读 README
+          </a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <a class="footer-brand" href="#top">
+        <img src="./favicon.svg" width="30" height="30" alt="" />
+        <strong>Unlimited Wiki</strong>
+      </a>
+      <span>MIT License</span>
+      <a href="https://github.com/nssntus/unlimited-wiki">GitHub</a>
+      <button type="button" class="footer-locale" data-cycle-locale data-i18n="language.switch">English</button>
+    </footer>
+  </body>
+</html>
