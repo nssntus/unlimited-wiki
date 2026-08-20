@@ -1,10 +1,11 @@
 import { useState } from "react"
 import { useQuery } from "@tanstack/react-query"
-import { Link, Outlet, useLocation } from "react-router-dom"
+import { Link, Outlet, useLocation, useNavigate } from "react-router-dom"
 import {
   ArchiveIcon,
   BellIcon,
   CheckCircle2Icon,
+  ChevronsUpDownIcon,
   FilePenLineIcon,
   InboxIcon,
   ListTodoIcon,
@@ -16,12 +17,22 @@ import {
   StoreIcon,
   WorkflowIcon,
   RefreshCcwDotIcon,
+  UserRoundIcon,
   UsersIcon,
 } from "lucide-react"
 
 import { apiGet, type ArticleSummary, type Category, type Notification, queryKeys } from "@/lib/api"
 import { CategoryGovernanceMenu } from "@/features/category-governance-menu"
 import { Button } from "@/components/ui/button"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import {
   Sidebar,
@@ -46,12 +57,15 @@ import { GlobalSearch } from "@/features/global-search"
 import { useSession } from "@/features/session-context"
 import { WorkspaceSwitcher } from "@/features/workspace-switcher"
 
-const routes = [
+const governanceRoutes = [
   ["/inbox", "原料箱", InboxIcon, "wiki.write"],
   ["/reconciliation", "文件对账", RefreshCcwDotIcon, "wiki.write"],
   ["/todo", "待写概念", ListTodoIcon, "wiki.write"],
   ["/health", "健康检查", CheckCircle2Icon, "wiki.read"],
   ["/tasks", "任务", WorkflowIcon, "wiki.read"],
+] as const
+
+const accountRoutes = [
   ["/submissions", "我的投稿", SendIcon, "wiki.write"],
   ["/notifications", "通知", BellIcon, "wiki.read"],
   ["/workspace", "团队与空间", UsersIcon, "wiki.read"],
@@ -64,6 +78,7 @@ function articleHref(path: string) {
 
 export function WikiShell() {
   const location = useLocation()
+  const navigate = useNavigate()
   const [searchOpen, setSearchOpen] = useState(false)
   const { session, signOut, hasPermission } = useSession()
   const articles = useQuery({ queryKey: queryKeys.articles, queryFn: () => apiGet<ArticleSummary[]>("/api/articles") })
@@ -92,12 +107,11 @@ export function WikiShell() {
               <SidebarGroupLabel>治理</SidebarGroupLabel>
               <SidebarGroupContent>
                 <SidebarMenu>
-                  {routes.filter(([, , , permission]) => hasPermission(permission)).map(([to, label, Icon]) => (
+                  {governanceRoutes.filter(([, , , permission]) => hasPermission(permission)).map(([to, label, Icon]) => (
                     <SidebarMenuItem key={to}>
                       <SidebarMenuButton render={<Link to={to} />} isActive={location.pathname === to} tooltip={label}>
                         <Icon /><span>{label}</span>
                       </SidebarMenuButton>
-                      {to === "/notifications" && unreadNotifications > 0 && <SidebarMenuBadge>{unreadNotifications}</SidebarMenuBadge>}
                     </SidebarMenuItem>
                   ))}
                 </SidebarMenu>
@@ -140,8 +154,48 @@ export function WikiShell() {
             {hasPermission("wiki.govern") && categories.data?.some((category) => category.status === "archived") && <SidebarGroup><SidebarGroupLabel>已归档分类</SidebarGroupLabel><SidebarGroupContent><SidebarMenu>{categories.data.filter((category) => category.status === "archived").map((category) => <SidebarMenuItem key={category.category_id}><SidebarMenuButton tooltip={category.name}><ArchiveIcon /><span>{category.name}</span></SidebarMenuButton><CategoryGovernanceMenu category={category} /></SidebarMenuItem>)}</SidebarMenu></SidebarGroupContent></SidebarGroup>}
           </ScrollArea>
         </SidebarContent>
-        <SidebarFooter className="border-t px-4 py-3 text-xs text-muted-foreground">
-          <div className="flex items-center justify-between gap-2"><div className="min-w-0"><div className="truncate font-medium text-foreground">{session?.user?.nickname}</div><div>{articles.data?.length ?? 0} 篇正本</div></div><Button size="icon-sm" variant="ghost" aria-label="退出登录" onClick={() => void signOut()}><LogOutIcon /></Button></div>
+        <SidebarFooter className="border-t p-2">
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={<Button variant="ghost" className="h-auto w-full justify-start gap-2 px-2 py-2 text-left" aria-label="打开用户菜单" />}
+            >
+              <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground"><UserRoundIcon className="size-4" /></span>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-sm font-medium text-foreground">{session?.user?.nickname}</span>
+                <span className="block text-xs font-normal text-muted-foreground">{articles.data?.length ?? 0} 篇正本</span>
+              </span>
+              {unreadNotifications > 0 && <span className="flex min-w-5 items-center justify-center rounded-full bg-primary px-1.5 text-xs font-medium text-primary-foreground" aria-label={`${unreadNotifications} 条未读通知`}>{unreadNotifications}</span>}
+              <ChevronsUpDownIcon className="size-4 shrink-0 text-muted-foreground" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent side="top" align="start" sideOffset={8} className="min-w-56">
+              <DropdownMenuGroup>
+                <DropdownMenuLabel className="px-2 py-1.5">
+                  <span className="block truncate text-sm font-medium text-foreground">{session?.user?.nickname}</span>
+                  <span className="block font-normal">个人与账号</span>
+                </DropdownMenuLabel>
+              </DropdownMenuGroup>
+              <DropdownMenuSeparator />
+              <DropdownMenuGroup>
+                {accountRoutes.filter(([, , , permission]) => hasPermission(permission)).map(([to, label, Icon]) => (
+                  <DropdownMenuItem
+                    key={to}
+                    className="min-h-9 px-2"
+                    aria-current={location.pathname === to ? "page" : undefined}
+                    onClick={() => navigate(to)}
+                  >
+                    <Icon />
+                    <span>{label}</span>
+                    {to === "/notifications" && unreadNotifications > 0 && <span className="ml-auto rounded-full bg-primary px-1.5 text-xs text-primary-foreground">{unreadNotifications}</span>}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuGroup>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem variant="destructive" className="min-h-9 px-2" onClick={() => void signOut()}>
+                <LogOutIcon />
+                <span>退出登录</span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </SidebarFooter>
       </Sidebar>
       <SidebarInset className="min-w-0 overflow-x-hidden">
