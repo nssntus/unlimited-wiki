@@ -71,6 +71,10 @@ class PlatformIdempotencyError(RuntimeError):
     pass
 
 
+class RegistrationClosedError(PermissionError):
+    pass
+
+
 class AccountWorkspaceSetChanged(RuntimeError):
     def __init__(self, workspace_ids: set[str]):
         super().__init__("account workspace set changed")
@@ -833,7 +837,8 @@ class PlatformStore(SquareMixin):
         *,
         first_user_only: bool = False,
         invite_token: str = "",
-    ) -> tuple[dict, str]:
+        initial_session: bool = False,
+    ) -> tuple[dict, str] | tuple[dict, str, str, SessionContext]:
         email = email.strip().casefold()
         nickname = nickname.strip()
         if not EMAIL_RE.fullmatch(email) or len(email) > 254:
@@ -846,12 +851,18 @@ class PlatformStore(SquareMixin):
         root_name = workspace_id
         recovery = secrets.token_urlsafe(24)
         created = now_iso()
+        session_token = secrets.token_urlsafe(32) if initial_session else ""
+        session_csrf = self.vault.derive(session_token, scope="session-csrf") if initial_session else ""
+        session_expires = future_iso(hours=12) if initial_session else ""
+        workspace_name = f"{nickname} 的 Wiki"
+        root = self.workspace_root(root_name)
+        root_created = False
         with self._lock, self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             existing_users = int(db.execute("SELECT COUNT(*) FROM users").fetchone()[0])
             if first_user_only and existing_users != 0:
                 db.rollback()
-                raise PermissionError("registration is closed")
+                raise RegistrationClosedError("registration is closed")
             if invite_token and existing_users == 0:
                 db.rollback()
                 raise PermissionError("administrator bootstrap is required before invitation registration")
@@ -867,6 +878,10 @@ class PlatformStore(SquareMixin):
                     raise PermissionError("registration invitation is invalid or expired")
             role = "admin" if existing_users == 0 else "user"
             try:
+                root.mkdir(mode=0o700)
+                root_created = True
+                (root / "wiki").mkdir(mode=0o700)
+                (root / "raw").mkdir(mode=0o700)
                 db.execute("INSERT INTO users VALUES(?,?,?,?,?,?,?)", (user_id, email, nickname, password_hash, role, "active", created))
                 db.execute("""
                     INSERT INTO organizations
@@ -882,13 +897,23 @@ class PlatformStore(SquareMixin):
                     INSERT INTO workspaces(
                         id,owner_id,organization_id,root_name,display_name,status,created_at,updated_at
                     ) VALUES(?,?,?,?,?,'active',?,?)
-                """, (workspace_id, user_id, organization_id, root_name, f"{nickname} 的 Wiki", created, created))
+                """, (workspace_id, user_id, organization_id, root_name, workspace_name, created, created))
                 db.execute("""
                     INSERT INTO workspace_members
                         (organization_id,workspace_id,user_id,role,status,is_default,added_by,created_at,updated_at)
                     VALUES(?,?,?,'owner','active',1,?,?,?)
                 """, (organization_id, workspace_id, user_id, user_id, created, created))
                 db.execute("INSERT INTO recovery_codes VALUES(?,?,?,NULL)", (hash_token(recovery), user_id, future_iso(hours=24)))
+                if initial_session:
+                    db.execute(
+                        """INSERT INTO sessions(
+                            token_hash,user_id,csrf_hash,current_workspace_id,expires_at,created_at
+                        ) VALUES(?,?,?,?,?,?)""",
+                        (
+                            hash_token(session_token), user_id, hash_token(session_csrf),
+                            workspace_id, session_expires, created,
+                        ),
+                    )
                 if invite is not None:
                     changed = db.execute(
                         """UPDATE account_registration_invites SET status='used',used_at=?
@@ -897,15 +922,36 @@ class PlatformStore(SquareMixin):
                     ).rowcount
                     if changed != 1:
                         raise sqlite3.IntegrityError("registration invitation was already used")
+                self._audit(db, user_id, "user.register", "user", user_id, {"role": role})
+                if initial_session:
+                    self._audit(db, user_id, "session.create", "user", user_id)
                 db.commit()
-            except sqlite3.IntegrityError as exc:
+            except Exception as exc:
                 db.rollback()
-                raise ValueError("registration could not be completed") from exc
-        root = self.workspace_root(root_name)
-        (root / "wiki").mkdir(parents=True, exist_ok=True)
-        (root / "raw").mkdir(parents=True, exist_ok=True)
-        self.audit(user_id, "user.register", "user", user_id, {"role": role})
-        return {"id": user_id, "workspace_id": workspace_id, "workspace_root_name": root_name, "role": role}, recovery
+                if root_created:
+                    shutil.rmtree(root, ignore_errors=True)
+                if isinstance(exc, sqlite3.IntegrityError):
+                    raise ValueError("registration could not be completed") from exc
+                raise
+        user = {"id": user_id, "workspace_id": workspace_id, "workspace_root_name": root_name, "role": role}
+        if not initial_session:
+            return user, recovery
+        context = SessionContext(
+            user_id=user_id,
+            email=email,
+            nickname=nickname,
+            role=role,
+            workspace_id=workspace_id,
+            workspace_root_name=root_name,
+            workspace_name=workspace_name,
+            workspace_kind="personal",
+            organization_id=organization_id,
+            organization_role="owner",
+            workspace_role="owner",
+            csrf_token=session_csrf,
+            expires_at=session_expires,
+        )
+        return user, recovery, session_token, context
 
     def create_registration_invite(self, email: str, *, hours: int = 72) -> tuple[dict, str]:
         email = email.strip().casefold()
@@ -1967,6 +2013,33 @@ class PlatformStore(SquareMixin):
         self.audit(row["user_id"], "user.password_reset", "user", row["user_id"])
         return True
 
+    def rotate_recovery_code(self, user_id: str, password: str) -> str:
+        recovery = secrets.token_urlsafe(24)
+        created = now_iso()
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            user = db.execute(
+                "SELECT password_hash FROM users WHERE id=? AND status='active'",
+                (user_id,),
+            ).fetchone()
+            if user is None:
+                db.rollback()
+                raise PermissionError("account is unavailable")
+            if not verify_password(password, user["password_hash"]):
+                db.rollback()
+                raise ValueError("password is invalid")
+            db.execute(
+                "UPDATE recovery_codes SET used_at=? WHERE user_id=? AND used_at IS NULL",
+                (created, user_id),
+            )
+            db.execute(
+                "INSERT INTO recovery_codes VALUES(?,?,?,NULL)",
+                (hash_token(recovery), user_id, future_iso(hours=24)),
+            )
+            self._audit(db, user_id, "user.recovery_code.rotate", "user", user_id)
+            db.commit()
+        return recovery
+
     def set_role(self, user_id: str, role: str, *, actor_id: str | None = None) -> None:
         if role not in ROLES:
             raise ValueError("invalid role")
@@ -2222,6 +2295,27 @@ class PlatformStore(SquareMixin):
                 INSERT INTO migrations VALUES(?,?,?,?,?,?,?)
                 ON CONFLICT(kind) DO UPDATE SET status=excluded.status,manifest_json=excluded.manifest_json,updated_at=excluded.updated_at
             """, (migration_id, kind, workspace_id, status, json.dumps(manifest, ensure_ascii=False), now, now))
+
+    def finalize_migration(
+        self, migration_id: str, kind: str, workspace_id: str, manifest: dict,
+        *, actor_id: str, file_count: int,
+    ) -> None:
+        now = now_iso()
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""
+                INSERT INTO migrations VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(kind) DO UPDATE SET
+                    id=excluded.id,workspace_id=excluded.workspace_id,status=excluded.status,
+                    manifest_json=excluded.manifest_json,updated_at=excluded.updated_at
+            """, (
+                migration_id, kind, workspace_id, "committed",
+                json.dumps(manifest, ensure_ascii=False), now, now,
+            ))
+            self._audit(db, actor_id, "workspace.migrate_legacy", "workspace", workspace_id, {
+                "migration_id": migration_id, "files": file_count,
+            })
+            db.commit()
 
     def user_workspace(self, user_id: str) -> dict:
         with self.connect() as db:

@@ -1,6 +1,6 @@
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { DownloadIcon, EyeIcon, EyeOffIcon, LogOutIcon, MoonIcon, RefreshCwIcon, SaveIcon, Settings2Icon, SunIcon, Trash2Icon, TriangleAlertIcon } from "lucide-react"
+import { CopyIcon, DownloadIcon, EyeIcon, EyeOffIcon, KeyRoundIcon, LogOutIcon, MoonIcon, RefreshCwIcon, SaveIcon, Settings2Icon, SunIcon, Trash2Icon, TriangleAlertIcon } from "lucide-react"
 import { toast } from "sonner"
 
 import { apiGet, apiPost, queryKeys, setCsrfToken, type ModelSettings } from "@/lib/api"
@@ -21,6 +21,7 @@ import { useSession } from "@/features/session-context"
 type Status = { configured: boolean; provider: string | null; model: string | null; web_fake_ip_allowed: boolean; network: string; queue: { active: number } }
 type ModelCatalog = { models: string[] }
 type ModelForm = { provider?: string; base_url?: string; api_key?: string; model?: string }
+type RecoveryCodeResponse = { recovery_code: string; expires_in_hours: number }
 
 const providers = [
   { value: "openai", label: "OpenAI", baseUrl: "https://api.openai.com/v1" },
@@ -39,6 +40,8 @@ export function SettingsPage() {
   const [form, setForm] = useState<ModelForm>({})
   const [models, setModels] = useState<string[]>([])
   const [showKey, setShowKey] = useState(false)
+  const [recoveryPassword, setRecoveryPassword] = useState("")
+  const [issuedRecoveryCode, setIssuedRecoveryCode] = useState("")
   const [deletePassword, setDeletePassword] = useState("")
   const provider = form.provider ?? settings.data?.provider ?? ""
   const baseUrl = form.base_url ?? settings.data?.base_url ?? ""
@@ -69,7 +72,25 @@ export function SettingsPage() {
   })
   const leaveAccount = () => { setCsrfToken(""); client.clear(); window.location.hash = "/login" }
   const revokeSessions = useMutation({ mutationFn: () => apiPost("/api/auth/sessions/revoke-all", {}), onSuccess: leaveAccount, onError: (error) => toast.error(error.message) })
+  const rotateRecoveryCode = useMutation({
+    mutationFn: () => apiPost<RecoveryCodeResponse>("/api/account/recovery-code", { password: recoveryPassword }, false),
+    onSuccess: (result) => {
+      setRecoveryPassword("")
+      setIssuedRecoveryCode(result.recovery_code)
+      toast.success("新的恢复码已生成，旧恢复码已失效")
+    },
+    onError: (error) => toast.error(error.message),
+  })
   const deleteAccount = useMutation({ mutationFn: () => apiPost("/api/account/delete", { password: deletePassword }), onSuccess: leaveAccount, onError: (error) => toast.error(error.message) })
+
+  const copyRecoveryCode = async () => {
+    try {
+      await navigator.clipboard.writeText(issuedRecoveryCode)
+      toast.success("恢复码已复制")
+    } catch {
+      toast.error("无法访问剪贴板，请手动复制")
+    }
+  }
 
   const selectTheme = (values: string[]) => {
     const value = values[0]
@@ -103,6 +124,8 @@ export function SettingsPage() {
 
       <FieldSet><FieldLegend>账号与数据</FieldLegend><FieldGroup>
         {canManageWorkspace && <Field orientation="responsive"><div><FieldLabel>导出私有空间</FieldLabel><FieldDescription>ZIP 只包含 Wiki 正本与 Raw 原料，不包含会话或模型密钥。</FieldDescription></div><Button variant="outline" render={<a href="/api/account/export" download />}><DownloadIcon data-icon="inline-start" />下载导出</Button></Field>}
+        <Field><FieldLabel htmlFor="recovery-code-password">重新生成恢复码</FieldLabel><FieldDescription>输入当前密码后生成新的 24 小时恢复码。旧恢复码会立即失效，新码只显示这一次。</FieldDescription><Input id="recovery-code-password" type="password" autoComplete="current-password" value={recoveryPassword} onChange={(event) => setRecoveryPassword(event.target.value)} />{rotateRecoveryCode.isError && <FieldError>{rotateRecoveryCode.error.message}</FieldError>}<div className="mt-2 flex justify-end"><Button variant="outline" disabled={!recoveryPassword || rotateRecoveryCode.isPending} onClick={() => rotateRecoveryCode.mutate()}>{rotateRecoveryCode.isPending ? <Spinner data-icon="inline-start" /> : <KeyRoundIcon data-icon="inline-start" />}生成新恢复码</Button></div></Field>
+        {issuedRecoveryCode && <Alert><KeyRoundIcon /><AlertTitle>请立即保存恢复码</AlertTitle><AlertDescription><p>关闭或刷新页面后不会再次显示。</p><div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center"><code className="min-w-0 flex-1 break-all rounded border bg-muted px-3 py-2 text-sm select-all">{issuedRecoveryCode}</code><Button type="button" variant="outline" onClick={copyRecoveryCode}><CopyIcon data-icon="inline-start" />复制</Button></div></AlertDescription></Alert>}
         <Field orientation="responsive"><div><FieldLabel>撤销全部会话</FieldLabel><FieldDescription>包括当前设备在内的所有登录会立即失效。</FieldDescription></div><Button variant="outline" disabled={revokeSessions.isPending} onClick={() => revokeSessions.mutate()}><LogOutIcon data-icon="inline-start" />全部退出</Button></Field>
         <Field><FieldLabel htmlFor="delete-account-password">删除账号</FieldLabel><FieldDescription>将撤回公开内容并删除私有空间和模型配置。请输入当前密码确认。</FieldDescription><Input id="delete-account-password" type="password" autoComplete="current-password" value={deletePassword} onChange={(event) => setDeletePassword(event.target.value)} /><div className="mt-2 flex justify-end"><Button variant="destructive" disabled={!deletePassword || deleteAccount.isPending} onClick={() => deleteAccount.mutate()}><Trash2Icon data-icon="inline-start" />永久删除账号</Button></div></Field>
       </FieldGroup></FieldSet>

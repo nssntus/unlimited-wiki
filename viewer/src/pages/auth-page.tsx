@@ -24,6 +24,7 @@ export function AuthPage({ mode }: { mode: Mode }) {
   const [inviteToken, setInviteToken] = useState("")
   const [recoveryCode, setRecoveryCode] = useState("")
   const [issuedCode, setIssuedCode] = useState("")
+  const [migrationRetryRequired, setMigrationRetryRequired] = useState(false)
   const [error, setError] = useState("")
   const [pending, setPending] = useState(false)
   const title = mode === "login" ? "登录我的 Wiki" : mode === "register" ? "创建私有 Wiki" : "使用恢复码重置密码"
@@ -40,12 +41,16 @@ export function AuthPage({ mode }: { mode: Mode }) {
       const payload = mode === "register"
         ? { email, nickname, password, ...(inviteToken ? { invite_token: inviteToken } : {}) }
         : { email, password }
-      const result = await apiPost<Session & { recovery_code?: string }>(`/api/auth/${mode}`, payload, false)
+      const result = await apiPost<Session & {
+        recovery_code?: string
+        migration?: { status?: string }
+      }>(`/api/auth/${mode}`, payload, false)
       setCsrfToken(result.csrf_token ?? "")
       client.clear()
       client.setQueryData(queryKeys.session, result)
       if (result.recovery_code) {
         setIssuedCode(result.recovery_code)
+        setMigrationRetryRequired(result.migration?.status === "retry_required")
         return
       }
       const from = (location.state as { from?: string } | null)?.from || "/"
@@ -57,6 +62,7 @@ export function AuthPage({ mode }: { mode: Mode }) {
 
   if (issuedCode) return <main className="grid min-h-svh place-items-center px-4"><div className="w-full max-w-md space-y-6">
     <Alert><KeyRoundIcon /><AlertTitle>请保存一次性恢复码</AlertTitle><AlertDescription className="mt-3 break-all font-mono">{issuedCode}</AlertDescription></Alert>
+    {migrationRetryRequired && <Alert variant="destructive"><ArchiveIcon /><AlertTitle>旧数据迁移尚未确认完成</AlertTitle><AlertDescription>账号已经创建，但迁移仍需恢复确认。请保留原始目录、暂勿编辑新空间，并联系运维完成处理。</AlertDescription></Alert>}
     <p className="text-sm text-muted-foreground">恢复码只显示这一次，24 小时内有效。它不会上传到 Wiki 或广场。</p>
     <Button className="w-full" onClick={() => navigate("/", { replace: true })}>进入我的 Wiki</Button>
   </div></main>

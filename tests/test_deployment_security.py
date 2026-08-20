@@ -9,8 +9,9 @@ from pathlib import Path
 
 import pytest
 
+import serve as serve_module
 from deployment import DeploymentConfig
-from platform_store import PlatformStore
+from platform_store import PlatformStore, hash_token
 from serve import BoundedThreadingHTTPServer, create_app, create_server
 
 
@@ -98,6 +99,8 @@ def test_lan_host_origin_cookie_and_bootstrap_registration(lan_server):
         "email": "owner@example.com", "nickname": "Owner", "password": "correct-horse-123",
     })
     assert status == 201 and registered["user"]["role"] == "admin"
+    assert registered["migration"] == {"status": "not_needed"}
+    assert registered["recovery_code"]
     cookie = response_headers["Set-Cookie"]
     assert cookie.startswith("__Host-wiki_session=")
     assert "; Secure" in cookie and "; HttpOnly" in cookie and "; SameSite=Strict" in cookie
@@ -105,10 +108,155 @@ def test_lan_host_origin_cookie_and_bootstrap_registration(lan_server):
     assert app.platform.user_count() == 1
 
     assert request(server, "GET", "/api/platform/config", headers=headers)[2]["registration_enabled"] is False
-    assert request(server, "POST", "/api/auth/register", headers=headers, body={
+    status, _response_headers, closed = request(server, "POST", "/api/auth/register", headers=headers, body={
         "email": "second@example.com", "nickname": "Second", "password": "correct-horse-123",
-    })[0] == 403
+    })
+    assert status == 409
+    assert closed == {"error": "registration is closed", "code": "registration_closed"}
     assert app.platform.user_count() == 1
+    with app.platform.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM audit_events WHERE action='user.register'").fetchone()[0] == 1
+
+
+def test_bootstrap_registration_succeeds_with_read_only_project_root(lan_server):
+    app, server = lan_server
+    root = app.project_root
+    original_mode = root.stat().st_mode & 0o777
+    root.chmod(0o555)
+    try:
+        status, response_headers, registered = request(
+            server, "POST", "/api/auth/register", headers=proxy_headers(), body={
+                "email": "readonly@example.com", "nickname": "Read Only", "password": "correct-horse-123",
+            },
+        )
+    finally:
+        root.chmod(original_mode)
+    assert status == 201
+    assert registered["migration"] == {"status": "not_needed"}
+    assert registered["recovery_code"]
+    assert "Set-Cookie" in response_headers
+    assert not (root / ".wiki-state").exists()
+    assert not (root / ".runtime").exists()
+
+
+def test_concurrent_bootstrap_http_has_one_clear_winner(lan_server):
+    app, server = lan_server
+    barrier = threading.Barrier(3)
+    results: list[tuple[int, dict]] = []
+
+    def register(index: int):
+        barrier.wait()
+        status, _headers, payload = request(
+            server, "POST", "/api/auth/register", headers=proxy_headers(), body={
+                "email": f"owner{index}@example.com", "nickname": f"Owner {index}",
+                "password": "correct-horse-123",
+            },
+        )
+        results.append((status, payload))
+
+    threads = [threading.Thread(target=register, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert sorted(status for status, _payload in results) == [201, 409]
+    loser = next(payload for status, payload in results if status == 409)
+    assert loser == {"error": "registration is closed", "code": "registration_closed"}
+    assert app.platform.user_count() == 1
+    with app.platform.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM recovery_codes WHERE used_at IS NULL").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
+
+
+def test_bootstrap_migration_failure_is_reported_without_failing_registration(lan_server, monkeypatch):
+    app, server = lan_server
+    monkeypatch.setattr(
+        serve_module, "migrate_legacy_workspace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("injected migration failure")),
+    )
+    status, response_headers, registered = request(
+        server, "POST", "/api/auth/register", headers=proxy_headers(), body={
+            "email": "migration@example.com", "nickname": "Migration", "password": "correct-horse-123",
+        },
+    )
+    assert status == 201
+    assert registered["migration"] == {"status": "retry_required"}
+    assert registered["recovery_code"]
+    assert "Set-Cookie" in response_headers
+    with app.platform.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
+        audit = db.execute(
+            "SELECT detail_json FROM audit_events WHERE action='workspace.migrate_legacy_failed'"
+        ).fetchone()
+    assert json.loads(audit["detail_json"]) == {"code": "legacy_migration_failed"}
+
+
+def test_authenticated_user_rotates_recovery_code_with_password(lan_server):
+    app, server = lan_server
+    status, response_headers, registered = request(
+        server, "POST", "/api/auth/register", headers=proxy_headers(), body={
+            "email": "recovery@example.com", "nickname": "Recovery", "password": "correct-horse-123",
+        },
+    )
+    assert status == 201
+    old_code = registered["recovery_code"]
+    authenticated_headers = proxy_headers(**{
+        "Cookie": response_headers["Set-Cookie"].split(";", 1)[0],
+        "X-CSRF-Token": registered["csrf_token"],
+    })
+    assert request(
+        server, "POST", "/api/account/recovery-code", headers=proxy_headers(),
+        body={"password": "correct-horse-123"},
+    )[0] == 401
+    assert request(
+        server, "POST", "/api/account/recovery-code",
+        headers=proxy_headers(Cookie=authenticated_headers["Cookie"]),
+        body={"password": "correct-horse-123"},
+    )[0] == 403
+    with app.platform.connect() as db:
+        db.execute(
+            "UPDATE sessions SET current_workspace_id=NULL WHERE user_id=?",
+            (registered["user"]["id"],),
+        )
+
+    assert request(
+        server, "POST", "/api/account/recovery-code", headers=authenticated_headers,
+        body={"password": "wrong-password"},
+    )[0] == 422
+    with app.platform.connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM recovery_codes WHERE used_at IS NULL"
+        ).fetchone()[0] == 1
+
+    status, _headers, rotated = request(
+        server, "POST", "/api/account/recovery-code", headers=authenticated_headers,
+        body={"password": "correct-horse-123"},
+    )
+    assert status == 200
+    assert rotated["expires_in_hours"] == 24
+    assert rotated["recovery_code"] != old_code
+    with app.platform.connect() as db:
+        active = db.execute(
+            "SELECT code_hash FROM recovery_codes WHERE used_at IS NULL"
+        ).fetchall()
+        assert [row["code_hash"] for row in active] == [hash_token(rotated["recovery_code"])]
+        assert db.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE action='user.recovery_code.rotate'"
+        ).fetchone()[0] == 1
+    assert old_code.encode() not in app.platform.db_path.read_bytes()
+    assert rotated["recovery_code"].encode() not in app.platform.db_path.read_bytes()
+
+    assert request(server, "POST", "/api/auth/recover", headers=proxy_headers(), body={
+        "email": "recovery@example.com", "recovery_code": old_code,
+        "new_password": "new-password-123",
+    })[0] == 400
+    assert request(server, "POST", "/api/auth/recover", headers=proxy_headers(), body={
+        "email": "recovery@example.com", "recovery_code": rotated["recovery_code"],
+        "new_password": "new-password-123",
+    })[0] == 200
 
 
 def test_lan_rejects_wrong_host_origin_and_proxy_scheme(lan_server):
@@ -174,6 +322,52 @@ def test_bootstrap_registration_allows_exactly_one_user(tmp_path: Path):
         thread.join(timeout=3)
     assert sorted(results) == ["closed", "created"]
     assert store.user_count() == 1
+
+
+def test_register_rolls_back_database_and_workspace_when_audit_fails(tmp_path: Path, monkeypatch):
+    store = PlatformStore(tmp_path)
+
+    def fail_audit(*_args, **_kwargs):
+        raise OSError("injected audit failure")
+
+    monkeypatch.setattr(store, "_audit", fail_audit)
+    with pytest.raises(OSError, match="injected audit failure"):
+        store.register("owner@example.com", "Owner", "correct-horse-123", initial_session=True)
+    assert store.user_count() == 0
+    assert list(store.spaces_root.iterdir()) == []
+    with store.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM recovery_codes").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 0
+
+
+def test_concurrent_recovery_code_rotation_leaves_one_active_code(tmp_path: Path):
+    store = PlatformStore(tmp_path)
+    user, _old_code = store.register("owner@example.com", "Owner", "correct-horse-123")
+    barrier = threading.Barrier(3)
+    issued: list[str] = []
+
+    def rotate():
+        barrier.wait()
+        issued.append(store.rotate_recovery_code(user["id"], "correct-horse-123"))
+
+    threads = [threading.Thread(target=rotate) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=3)
+    assert len(issued) == 2
+    with store.connect() as db:
+        active = db.execute(
+            "SELECT code_hash FROM recovery_codes WHERE user_id=? AND used_at IS NULL",
+            (user["id"],),
+        ).fetchall()
+        assert len(active) == 1
+        assert active[0]["code_hash"] in {hash_token(value) for value in issued}
+        assert db.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE action='user.recovery_code.rotate'"
+        ).fetchone()[0] == 2
 
 
 def test_readiness_reports_missing_frontend_without_leaking_paths(tmp_path: Path):
