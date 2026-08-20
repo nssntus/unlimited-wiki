@@ -3,38 +3,71 @@ name: Deploy GitHub Pages
 on:
   push:
     branches:
-      - main
+      - codex/github-pages-site
     paths:
       - "site/**"
       - ".github/workflows/pages.yml"
-  workflow_dispatch:
+      - "tests/test_github_pages.py"
+      - "README.md"
+      - "viewer/index.html"
+      - "viewer/public/**"
+      - "viewer/src/**"
+      - "viewer/package-lock.json"
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
+permissions: {}
 
 concurrency:
   group: pages
   cancel-in-progress: true
 
 jobs:
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
+  validate_and_upload:
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Configure Pages
-        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+      - name: Validate static scripts
+        run: |
+          node --check site/language-init.js
+          node --check site/app.js
+      - name: Validate Pages contract
+        run: |
+          python3 -c 'import sys; assert sys.version_info[:2] == (3, 12)'
+          python3 tests/test_github_pages.py
       - name: Upload static site
         uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
           path: ./site
+
+  deploy:
+    needs: validate_and_upload
+    if: github.event_name == 'push' && github.ref == 'refs/heads/codex/github-pages-site'
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Verify deployment is still the branch tip
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest_sha="$(gh api -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/${GITHUB_REPOSITORY}/git/ref/heads/codex/github-pages-site" \
+            --jq .object.sha)"
+          test "$latest_sha" = "$EXPECTED_SHA"
+      - name: Configure Pages
+        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
       - name: Deploy
         id: deployment
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import ast
 import json
 import re
+import struct
+import sys
+import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse
@@ -17,6 +21,77 @@ ACTION_PINS = {
     "actions/upload-pages-artifact": "56afc609e74202658d3ffba0e8f6dda462b719fa",
     "actions/deploy-pages": "d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e",
 }
+
+
+def test_validator_uses_only_the_python_standard_library() -> None:
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    imports = {
+        alias.name.split(".", 1)[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    imports.update(
+        node.module.split(".", 1)[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    )
+    assert imports <= sys.stdlib_module_names
+
+
+def test_pages_reuse_valid_brand_assets() -> None:
+    public = ROOT / "viewer" / "public"
+    for name in ("favicon.svg", "favicon.ico", "apple-touch-icon.png"):
+        assert (SITE / name).read_bytes() == (public / name).read_bytes()
+
+    svg_path = SITE / "favicon.svg"
+    svg = ET.fromstring(svg_path.read_text(encoding="utf-8"))
+    assert svg.tag == "{http://www.w3.org/2000/svg}svg"
+    assert svg.attrib["viewBox"] == "0 0 64 64"
+    assert {node.tag.rsplit("}", 1)[-1] for node in svg.iter()} <= {"svg", "rect", "path"}
+
+    with (SITE / "favicon.ico").open("rb") as handle:
+        reserved, image_type, count = struct.unpack("<HHH", handle.read(6))
+        entries = [struct.unpack("<BBBBHHII", handle.read(16)) for _ in range(count)]
+    assert (reserved, image_type) == (0, 1)
+    assert {(entry[0] or 256, entry[1] or 256) for entry in entries} == {
+        (16, 16),
+        (32, 32),
+        (48, 48),
+    }
+
+    png = (SITE / "apple-touch-icon.png").read_bytes()
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    assert png[12:16] == b"IHDR"
+    assert struct.unpack(">II", png[16:24]) == (180, 180)
+    assert png[25] == 2
+
+    index = (SITE / "index.html").read_text(encoding="utf-8")
+    for name in ("favicon.svg", "favicon.ico", "apple-touch-icon.png"):
+        assert f'href="./{name}"' in index
+
+
+def test_pages_scripts_use_safe_static_dom_projection() -> None:
+    source = "\n".join(
+        (SITE / name).read_text(encoding="utf-8")
+        for name in ("index.html", "language-init.js", "app.js")
+    )
+    for unsafe in (
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+        "eval(",
+        "new Function",
+        "fetch(",
+        "XMLHttpRequest",
+        "WebSocket",
+    ):
+        assert unsafe not in source
+    assert "textContent" in source
+    assert "localStorage.getItem" in source
+    assert "localStorage.setItem" in source
+    assert "document.documentElement.lang" in source
 
 
 class DocumentParser(HTMLParser):
@@ -224,13 +299,189 @@ def test_styles_include_focus_responsive_and_reduced_motion_contracts() -> None:
     assert "gradient(" not in styles
 
 
+def _workflow_step_block(workflow: str, name: str) -> list[str]:
+    marker = f"      - name: {name}"
+    lines = workflow.splitlines()
+    positions = [index for index, line in enumerate(lines) if line == marker]
+    assert len(positions) == 1
+    step = [marker]
+    for line in lines[positions[0] + 1 :]:
+        if line.startswith("      - name: ") or re.fullmatch(r"  [A-Za-z0-9_-]+:", line):
+            break
+        step.append(line)
+    while step and not step[-1].strip():
+        step.pop()
+    return step
+
+
+def _workflow_job_block(workflow: str, name: str) -> list[str]:
+    marker = f"  {name}:"
+    lines = workflow.splitlines()
+    positions = [index for index, line in enumerate(lines) if line == marker]
+    assert len(positions) == 1
+    job = [marker]
+    for line in lines[positions[0] + 1 :]:
+        if re.fullmatch(r"  [A-Za-z0-9_-]+:", line):
+            break
+        job.append(line)
+    while job and not job[-1].strip():
+        job.pop()
+    return job
+
+
+def _workflow_step_run(workflow: str, name: str) -> list[str]:
+    step = _workflow_step_block(workflow, name)
+
+    run_positions = [index for index, line in enumerate(step) if line == "        run: |"]
+    assert len(run_positions) == 1
+    commands: list[str] = []
+    for line in step[run_positions[0] + 1 :]:
+        if not line.strip():
+            continue
+        assert line.startswith("          ")
+        command = line.strip()
+        assert not command.startswith("#")
+        commands.append(command)
+    return commands
+
+
+def _validate_active_workflow_commands(workflow: str) -> None:
+    lines = workflow.splitlines()
+    jobs_position = lines.index("jobs:")
+    job_names = [
+        match.group(1)
+        for line in lines[jobs_position + 1 :]
+        if (match := re.fullmatch(r"  ([A-Za-z0-9_-]+):", line))
+    ]
+    assert job_names == ["validate_and_upload", "deploy"]
+    validate_job = _workflow_job_block(workflow, "validate_and_upload")
+    deploy_job = _workflow_job_block(workflow, "deploy")
+    assert [
+        match.group(1)
+        for line in validate_job
+        if (match := re.fullmatch(r"    ([A-Za-z0-9_-]+):(?:\s.*)?", line))
+    ] == ["permissions", "runs-on", "timeout-minutes", "steps"]
+    assert [
+        match.group(1)
+        for line in deploy_job
+        if (match := re.fullmatch(r"    ([A-Za-z0-9_-]+):(?:\s.*)?", line))
+    ] == ["needs", "if", "permissions", "environment", "runs-on", "timeout-minutes", "steps"]
+    assert [line.removeprefix("      - name: ") for line in validate_job if line.startswith("      - name: ")] == [
+        "Checkout",
+        "Validate static scripts",
+        "Validate Pages contract",
+        "Upload static site",
+    ]
+    assert [line.removeprefix("      - name: ") for line in deploy_job if line.startswith("      - name: ")] == [
+        "Verify deployment is still the branch tip",
+        "Configure Pages",
+        "Deploy",
+    ]
+    assert all(
+        line.startswith("      - name: ")
+        for line in validate_job + deploy_job
+        if line.startswith("      - ")
+    )
+    forbidden_control = re.compile(r"(?:|    )(?:defaults|env|container|services):(?:\s.*)?$")
+    assert not any(forbidden_control.fullmatch(line) for line in lines)
+    assert "continue-on-error:" not in workflow
+    assert "if: always()" not in workflow
+    assert _workflow_step_block(workflow, "Validate static scripts") == [
+        "      - name: Validate static scripts",
+        "        run: |",
+        "          node --check site/language-init.js",
+        "          node --check site/app.js",
+    ]
+    assert _workflow_step_block(workflow, "Validate Pages contract") == [
+        "      - name: Validate Pages contract",
+        "        run: |",
+        "          python3 -c 'import sys; assert sys.version_info[:2] == (3, 12)'",
+        "          python3 tests/test_github_pages.py",
+    ]
+    assert _workflow_step_block(workflow, "Verify deployment is still the branch tip") == [
+        "      - name: Verify deployment is still the branch tip",
+        "        env:",
+        "          EXPECTED_SHA: ${{ github.sha }}",
+        "          GH_TOKEN: ${{ github.token }}",
+        "        run: |",
+        "          latest_sha=\"$(gh api -H 'X-GitHub-Api-Version: 2022-11-28' \\",
+        '            "repos/${GITHUB_REPOSITORY}/git/ref/heads/codex/github-pages-site" \\',
+        "            --jq .object.sha)\"",
+        '          test "$latest_sha" = "$EXPECTED_SHA"',
+    ]
+    assert _workflow_step_block(workflow, "Checkout") == [
+        "      - name: Checkout",
+        "        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
+        "        with:",
+        "          persist-credentials: false",
+    ]
+    assert _workflow_step_block(workflow, "Upload static site") == [
+        "      - name: Upload static site",
+        "        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3",
+        "        with:",
+        "          path: ./site",
+    ]
+    assert _workflow_step_block(workflow, "Configure Pages") == [
+        "      - name: Configure Pages",
+        "        uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5",
+    ]
+    assert _workflow_step_block(workflow, "Deploy") == [
+        "      - name: Deploy",
+        "        id: deployment",
+        "        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4",
+    ]
+    assert _workflow_step_run(workflow, "Validate Pages contract") == [
+        "python3 -c 'import sys; assert sys.version_info[:2] == (3, 12)'",
+        "python3 tests/test_github_pages.py",
+    ]
+    assert _workflow_step_run(workflow, "Verify deployment is still the branch tip") == [
+        "latest_sha=\"$(gh api -H 'X-GitHub-Api-Version: 2022-11-28' \\",
+        '"repos/${GITHUB_REPOSITORY}/git/ref/heads/codex/github-pages-site" \\',
+        "--jq .object.sha)\"",
+        'test "$latest_sha" = "$EXPECTED_SHA"',
+    ]
+
+
 def test_pages_workflow_only_deploys_the_static_site() -> None:
     workflow = (ROOT / ".github" / "workflows" / "pages.yml").read_text(encoding="utf-8")
-    assert "workflow_dispatch:" in workflow
-    assert "branches:\n      - main" in workflow
-    assert "contents: read" in workflow
-    assert "pages: write" in workflow
-    assert "id-token: write" in workflow
+    _validate_active_workflow_commands(workflow)
+    assert "workflow_dispatch:" not in workflow
+    assert "pull_request_target:" not in workflow
+    assert "secrets." not in workflow
+    assert "permissions: {}" in workflow
+    assert "branches:\n      - codex/github-pages-site" in workflow
+    assert "needs: validate_and_upload" in workflow
+    assert "if: github.event_name == 'push' && github.ref == 'refs/heads/codex/github-pages-site'" in workflow
+    assert "cancel-in-progress: true" in workflow
+    assert 'node --check site/language-init.js' in workflow
+    assert 'node --check site/app.js' in workflow
+    for path in (
+        '"tests/test_github_pages.py"',
+        '"README.md"',
+        '"viewer/index.html"',
+        '"viewer/public/**"',
+        '"viewer/src/**"',
+        '"viewer/package-lock.json"',
+    ):
+        assert path in workflow
+    assert workflow.count("runs-on: ubuntu-24.04") == 2
+    assert "ubuntu-latest" not in workflow
+    assert "pip install" not in workflow
+    assert "python3 -m pytest" not in workflow
+    contract = "python3 tests/test_github_pages.py"
+    tip_lookup = '"repos/${GITHUB_REPOSITORY}/git/ref/heads/codex/github-pages-site"'
+    tip_fence = 'test "$latest_sha" = "$EXPECTED_SHA"'
+    for command in (contract, tip_lookup, tip_fence):
+        assert command in workflow
+    validate_job = workflow.split("  validate_and_upload:", 1)[1].split("\n  deploy:", 1)[0]
+    deploy_job = workflow.split("\n  deploy:", 1)[1]
+    assert "contents: read" in validate_job
+    assert "pages: write" not in validate_job
+    assert "id-token: write" not in validate_job
+    assert "contents: read" in deploy_job
+    assert "pages: write" in deploy_job
+    assert "id-token: write" in deploy_job
+    assert "GH_TOKEN: ${{ github.token }}" in deploy_job
     uses = re.findall(r"^\s*uses:\s*([^\s#]+)", workflow, flags=re.MULTILINE)
     assert len(uses) == len(ACTION_PINS)
     assert set(uses) == {f"{owner}@{sha}" for owner, sha in ACTION_PINS.items()}
@@ -238,4 +489,107 @@ def test_pages_workflow_only_deploys_the_static_site() -> None:
     assert all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in ACTION_PINS.values())
     assert "persist-credentials: false" in workflow
     assert "path: ./site" in workflow
-    assert "viewer" not in workflow
+    assert "path: ./viewer" not in workflow
+    assert "npm " not in workflow
+    assert workflow.index(contract) < workflow.index("path: ./site")
+    assert workflow.index("path: ./site") < workflow.index(tip_lookup)
+    assert workflow.index(tip_fence) < workflow.index("actions/configure-pages@")
+    assert workflow.index(tip_fence) < workflow.index("actions/deploy-pages@")
+
+
+def test_workflow_commands_reject_comment_and_success_bypasses() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "pages.yml").read_text(encoding="utf-8")
+    mutations = (
+        workflow.replace(
+            "          python3 tests/test_github_pages.py",
+            "          # python3 tests/test_github_pages.py",
+            1,
+        ),
+        workflow.replace(
+            "          python3 tests/test_github_pages.py",
+            "          true # python3 tests/test_github_pages.py",
+            1,
+        ),
+        workflow.replace(
+            '          test "$latest_sha" = "$EXPECTED_SHA"',
+            '          true # test "$latest_sha" = "$EXPECTED_SHA"',
+            1,
+        ),
+        workflow.replace(
+            '          test "$latest_sha" = "$EXPECTED_SHA"',
+            '          test "$latest_sha" = "$EXPECTED_SHA" || true',
+            1,
+        ),
+        workflow.replace(
+            "          python3 tests/test_github_pages.py",
+            "          python3 tests/test_github_pages.py\n          exit 0",
+            1,
+        ),
+        workflow.replace(
+            "      - name: Validate Pages contract",
+            "      - name: Validate Pages contract\n        continue-on-error: true",
+            1,
+        ),
+        workflow.replace(
+            "      - name: Upload static site",
+            "      - name: Upload static site\n        if: always()",
+            1,
+        ),
+        workflow.replace(
+            "      - name: Validate Pages contract",
+            "      - name: Validate Pages contract\n        if: false",
+            1,
+        ),
+        workflow.replace(
+            "      - name: Verify deployment is still the branch tip",
+            "      - name: Verify deployment is still the branch tip\n        if: false",
+            1,
+        ),
+        workflow.replace(
+            "          node --check site/language-init.js",
+            "          printf 'pass' > tests/test_github_pages.py\n          node --check site/language-init.js",
+            1,
+        ),
+        workflow.replace(
+            "  validate_and_upload:\n",
+            "  validate_and_upload:\n    defaults:\n      run:\n        shell: true {0}\n",
+            1,
+        ),
+        workflow.replace(
+            "  deploy:\n",
+            "  deploy:\n    defaults:\n      run:\n        shell: true {0}\n",
+            1,
+        ),
+        workflow.replace(
+            "permissions: {}\n",
+            "permissions: {}\nenv:\n  BASH_ENV: /tmp/bypass\n",
+            1,
+        ),
+        workflow.replace(
+            "  validate_and_upload:\n",
+            "  validate_and_upload:\n    container: attacker/image\n",
+            1,
+        ),
+        workflow.replace(
+            "  deploy:\n",
+            "  deploy:\n    services:\n      bypass:\n        image: attacker/image\n",
+            1,
+        ),
+    )
+    for mutated in mutations:
+        try:
+            _validate_active_workflow_commands(mutated)
+        except AssertionError:
+            continue
+        raise AssertionError("workflow command bypass was accepted")
+
+
+if __name__ == "__main__":
+    checks = [
+        value
+        for name, value in sorted(globals().items())
+        if name.startswith("test_") and callable(value)
+    ]
+    for check in checks:
+        check()
+    print(f"GitHub Pages contract: {len(checks)} checks passed")
