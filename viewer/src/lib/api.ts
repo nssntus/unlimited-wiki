@@ -88,6 +88,36 @@ export type ModelSettings = {
   insecure_http: boolean
 }
 
+export type WorkerQueue = {
+  queued: number
+  running: number
+  by_kind?: Record<string, Record<string, number>>
+}
+
+export type SystemStatus = {
+  configured: boolean
+  provider: string | null
+  model: string | null
+  web_fake_ip_allowed: boolean
+  network: string
+  queue: WorkerQueue & { active: number }
+  remote_tasks: {
+    enabled: boolean
+    allowed_kinds: string[]
+    queue: WorkerQueue
+    blocked_queued: number
+  }
+  platform_review: {
+    enabled: boolean
+    queue: { queued: number; running: number }
+    blocked_queued: number
+  }
+}
+
+export function currentSystemStatus(query: { data?: SystemStatus; isError: boolean }) {
+  return query.isError ? undefined : query.data
+}
+
 export type Session = {
   authenticated: boolean
   user?: { id: string; email: string; nickname: string; role: "user" | "admin" }

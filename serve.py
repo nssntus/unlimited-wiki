@@ -14,6 +14,7 @@ import mimetypes
 import os
 import re
 import signal
+import sqlite3
 import stat
 import shutil
 import socket
@@ -28,6 +29,8 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+
+from cryptography.exceptions import InvalidTag
 
 import categories as cats
 import keywords as kw
@@ -52,7 +55,7 @@ from platform_review import PlatformReviewWorker
 from publication import public_markdown, snapshot_fingerprint
 from square_v2 import PublicIndexWorker, REUSE_POLICY_VERSION, canonical_public_url
 from state_store import StateStore
-from wiki_service import LLMConfig, WikiService, article_summary
+from wiki_service import REMOTE_TASK_KINDS, LLMConfig, RemoteTaskUnavailable, WikiService, article_summary
 
 ROOT = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
@@ -135,6 +138,7 @@ class WikiApp:
     dev_origins: set[str] = field(default_factory=set)
     platform: PlatformStore | None = None
     start_worker: bool = True
+    remote_tasks_enabled: bool = True
     start_public_index_worker: bool | None = None
     remote_search: object = None
     remote_task_kinds: set[str] | None = None
@@ -155,9 +159,11 @@ class WikiApp:
             self.diagnostics = DiagnosticCache(self.service)
         if self.platform is not None:
             self._reconcile_workspace_storage_states()
+            if self.start_worker and self.remote_tasks_enabled:
+                self._start_queued_workspace_workers()
         self.review_worker = PlatformReviewWorker(
             self.platform, self.platform_reviewer,
-        ) if self.platform is not None and self.start_worker else None
+        ) if self.platform is not None and self.start_worker and self.remote_tasks_enabled else None
         start_public_index = self.start_worker if self.start_public_index_worker is None else self.start_public_index_worker
         self.public_index_worker = PublicIndexWorker(self.platform) if self.platform is not None and start_public_index else None
 
@@ -211,7 +217,125 @@ class WikiApp:
                 checks["vault"] = self.platform.vault.path.stat().st_size == 32
             except OSError:
                 checks["vault"] = False
-        return all(checks.values()), {"status": "ready" if all(checks.values()) else "not_ready", "checks": checks}
+        try:
+            capabilities = self._instance_worker_capabilities()
+            checks["queue_inspection"] = True
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            capabilities = {
+                "remote_tasks": {
+                    **self._remote_task_capability({"queued": 0, "running": 0, "by_kind": {}}),
+                    "inspection_error": True,
+                },
+                "platform_review": {
+                    **self._platform_review_capability({"queued": 0, "running": 0}),
+                    "inspection_error": True,
+                },
+            }
+            checks["queue_inspection"] = False
+        checks["remote_tasks"] = (
+            checks["queue_inspection"] and capabilities["remote_tasks"]["blocked_queued"] == 0
+        )
+        checks["platform_review"] = (
+            checks["queue_inspection"] and capabilities["platform_review"]["blocked_queued"] == 0
+        )
+        ready = all(checks.values())
+        return ready, {"status": "ready" if ready else "not_ready", "checks": checks, "capabilities": capabilities}
+
+    def _remote_task_capability(self, counts: dict, *, unserved_queued: int = 0) -> dict:
+        allowed = sorted(self.remote_task_kinds if self.remote_task_kinds is not None else REMOTE_TASK_KINDS)
+        blocked = 0
+        for kind, statuses in counts["by_kind"].items():
+            if not self.remote_tasks_enabled or kind not in allowed:
+                blocked += int(statuses.get("queued", 0))
+        return {
+            "enabled": self.remote_tasks_enabled,
+            "allowed_kinds": allowed,
+            "queue": counts,
+            "blocked_queued": blocked + unserved_queued,
+        }
+
+    def _platform_review_capability(self, counts: dict) -> dict:
+        return {
+            "enabled": self.remote_tasks_enabled,
+            "queue": counts,
+            "blocked_queued": counts["queued"] if not self.remote_tasks_enabled else 0,
+        }
+
+    def _instance_worker_capabilities(self) -> dict:
+        wiki_counts = {"queued": 0, "running": 0, "by_kind": {}}
+        review_counts = {"queued": 0, "running": 0}
+        unserved_queued = 0
+        if self.platform is not None:
+            with self._service_lock:
+                served_workspaces = set(self._services)
+            for workspace in self.platform.active_workspace_roots():
+                counts = StateStore.task_counts_at(self.platform.workspace_root(workspace["root_name"]))
+                wiki_counts["queued"] += counts["queued"]
+                wiki_counts["running"] += counts["running"]
+                for kind, statuses in counts["by_kind"].items():
+                    target = wiki_counts["by_kind"].setdefault(kind, {})
+                    for status, count in statuses.items():
+                        target[status] = target.get(status, 0) + count
+                    if (
+                        self.remote_tasks_enabled
+                        and kind in (self.remote_task_kinds if self.remote_task_kinds is not None else REMOTE_TASK_KINDS)
+                        and workspace["id"] not in served_workspaces
+                    ):
+                        unserved_queued += int(statuses.get("queued", 0))
+            review_counts = self.platform.submission_queue_counts()
+        elif self.service is not None:
+            wiki_counts = self.service.state.task_counts()
+        return {
+            "remote_tasks": self._remote_task_capability(wiki_counts, unserved_queued=unserved_queued),
+            "platform_review": self._platform_review_capability(review_counts),
+        }
+
+    def _new_workspace_service(self, workspace_id: str, root_name: str) -> WikiService:
+        try:
+            values = self.platform.load_model(workspace_id)
+            config = build_config(**values, allow_private=False) if values else LLMConfig()
+        except (binascii.Error, InvalidTag, TypeError, UnicodeDecodeError, ValueError):
+            config = LLMConfig()
+            print(f"Workspace model unavailable during worker startup workspace={workspace_id}", file=sys.stderr)
+        return WikiService(
+            self.platform.workspace_root(root_name),
+            llm_config=config,
+            remote_search=self.remote_search,
+            start_worker=self.start_worker,
+            remote_tasks_enabled=self.remote_tasks_enabled,
+            remote_task_kinds=self.remote_task_kinds,
+            authorize_actor=lambda user_id, workspace_id=workspace_id: bool(
+                self.platform.authorize_workspace(user_id, workspace_id, "wiki.write")
+            ),
+            actor_guard=lambda user_id, workspace_id=workspace_id: (
+                self.platform.authorized_workspace_action(user_id, workspace_id, "wiki.write")
+            ),
+            require_task_actor=True,
+            path_remap_callback=lambda projections, workspace_id=workspace_id: (
+                self.platform.remap_public_import_paths(workspace_id, projections)
+            ),
+        )
+
+    def _ensure_workspace_service(self, workspace: dict) -> WikiService:
+        workspace_id = str(workspace["id"])
+        with self._workspace_gate(workspace_id):
+            with self._service_lock:
+                service = self._services.get(workspace_id)
+            if service is None:
+                service = self._new_workspace_service(workspace_id, str(workspace["root_name"]))
+                with self._service_lock:
+                    self._services[workspace_id] = service
+            return service
+
+    def _start_queued_workspace_workers(self) -> None:
+        allowed = self.remote_task_kinds if self.remote_task_kinds is not None else REMOTE_TASK_KINDS
+        for workspace in self.platform.active_workspace_roots():
+            counts = StateStore.task_counts_at(self.platform.workspace_root(workspace["root_name"]))
+            if any(
+                kind in allowed and int(statuses.get("queued", 0)) > 0
+                for kind, statuses in counts["by_kind"].items()
+            ):
+                self._ensure_workspace_service(workspace)
 
     def workspace_service(self, context: SessionContext) -> WikiService:
         if self.platform is None:
@@ -223,27 +347,7 @@ class WikiApp:
             with self._service_lock:
                 service = self._services.get(context.workspace_id)
             if service is None:
-                values = self.platform.load_model(context.workspace_id)
-                config = build_config(**values, allow_private=False) if values else LLMConfig()
-                service = WikiService(
-                    self.platform.workspace_root(workspace["root_name"]),
-                    llm_config=config,
-                    remote_search=self.remote_search,
-                    start_worker=self.start_worker,
-                    remote_task_kinds=self.remote_task_kinds,
-                    authorize_actor=lambda user_id, workspace_id=context.workspace_id: bool(
-                        self.platform.authorize_workspace(user_id, workspace_id, "wiki.write")
-                    ),
-                    actor_guard=lambda user_id, workspace_id=context.workspace_id: (
-                        self.platform.authorized_workspace_action(user_id, workspace_id, "wiki.write")
-                    ),
-                    require_task_actor=True,
-                    path_remap_callback=lambda projections, workspace_id=context.workspace_id: (
-                        self.platform.remap_public_import_paths(workspace_id, projections)
-                    ),
-                )
-                with self._service_lock:
-                    self._services[context.workspace_id] = service
+                service = self._ensure_workspace_service(workspace)
             backfill_key = (context.workspace_id, context.user_id)
             with self._service_lock:
                 needs_backfill = backfill_key not in self._publication_backfills
@@ -404,8 +508,11 @@ class WikiApp:
                         shutil.rmtree(root)
                 return
 
-    def status(self, service: WikiService) -> dict:
+    def status(self, service: WikiService, workspace_id: str | None = None) -> dict:
         config = service.llm
+        queue = service.state.task_counts()
+        remote_tasks = self._remote_task_capability(queue)
+        review_queue = self.platform.submission_queue_counts(workspace_id) if self.platform is not None else {"queued": 0, "running": 0}
         return {
             "configured": config.configured,
             "model": config.model or None,
@@ -415,8 +522,14 @@ class WikiApp:
             "insecure_http_llm_allowed": config.allow_insecure_http,
             "web_fake_ip_allowed": websearch.FETCHER.allow_fake_ip,
             "network": "available",
-            "queue": {"active": sum(task["status"] in {"queued", "running"} for task in service.state.list_tasks())},
+            "queue": {"active": queue["queued"] + queue["running"], **queue},
+            "remote_tasks": remote_tasks,
+            "platform_review": self._platform_review_capability(review_queue),
         }
+
+    def require_platform_review(self) -> None:
+        if not self.remote_tasks_enabled:
+            raise RemoteTaskUnavailable("platform_review", "disabled")
 
     def model_settings(self, service: WikiService) -> dict:
         return public_model_settings(service.llm)
@@ -466,6 +579,7 @@ def create_app(
     llm_config: LLMConfig | None = None,
     remote_search=None,
     start_worker: bool = True,
+    remote_tasks_enabled: bool = True,
     start_public_index_worker: bool | None = None,
     remote_task_kinds: set[str] | None = None,
     load_environment: bool = False,
@@ -484,6 +598,7 @@ def create_app(
         llm_config=llm_config or load_model_settings(root),
         remote_search=remote_search,
         start_worker=start_worker,
+        remote_tasks_enabled=remote_tasks_enabled,
         remote_task_kinds=remote_task_kinds,
     )
     platform = PlatformStore(root) if multi_user else None
@@ -495,6 +610,7 @@ def create_app(
         dev_origins=dev_origins or set(),
         platform=platform,
         start_worker=start_worker,
+        remote_tasks_enabled=remote_tasks_enabled,
         start_public_index_worker=start_public_index_worker,
         remote_search=remote_search,
         remote_task_kinds=remote_task_kinds,
@@ -1071,7 +1187,7 @@ def make_handler(app: WikiApp):
             if permission == "wiki.write" and self.context is not None:
                 service.set_request_actor(self.context.user_id)
             if path == "/api/status":
-                return self._json(200, app.status(service))
+                return self._json(200, app.status(service, self.context.workspace_id if self.context else None))
             if path == "/api/settings/model":
                 self._require_workspace_permission("model.manage")
                 return self._json(200, app.model_settings(service))
@@ -1644,11 +1760,18 @@ def make_handler(app: WikiApp):
                     raise ApiError(422, "category must be a taxonomy selection")
                 if tag_values is not None and (not isinstance(tag_values, list) or not all(isinstance(item, str) for item in tag_values)):
                     raise ApiError(422, "tags must be an array of strings")
+                keyword = _string(data, "keyword", maximum=120, required=True)
+                from_path = _string(data, "from_path", maximum=512)
+                heading = _string(data, "heading", maximum=200)
+                passage = _string(data, "passage", maximum=800)
+                service.require_generation_task(service.preflight_generate(
+                    keyword, from_path=from_path, heading=heading, passage=passage,
+                ))
                 response, replay = self._idempotency(data, lambda: service.generate(
-                    _string(data, "keyword", maximum=120, required=True),
-                    from_path=_string(data, "from_path", maximum=512),
-                    heading=_string(data, "heading", maximum=200),
-                    passage=_string(data, "passage", maximum=800),
+                    keyword,
+                    from_path=from_path,
+                    heading=heading,
+                    passage=passage,
                     category=category_selection,
                     tags=tag_values,
                 ))
@@ -1720,6 +1843,7 @@ def make_handler(app: WikiApp):
                 return self._json(200 if replay else 201, response)
             if path == "/api/governance":
                 _fields(data, set())
+                service.require_remote_task("governance")
                 response, replay = self._idempotency(data, service.enqueue_governance)
                 return self._json(200, {**response, "replay": replay})
             if path == "/api/articles":
@@ -1770,9 +1894,12 @@ def make_handler(app: WikiApp):
                     raise ApiError(422, "category must be a taxonomy selection")
                 if tag_values is not None and (not isinstance(tag_values, list) or not all(isinstance(item, str) for item in tag_values)):
                     raise ApiError(422, "tags must be an array of strings")
+                disposition = _string(data, "disposition", maximum=20, required=True)
+                if disposition in {"new", "supplement"} and service.llm.configured:
+                    service.require_remote_task("governance")
                 response, _ = self._idempotency(data, lambda: service.ingest_commit(
                     _string(data, "path", maximum=512, required=True),
-                    _string(data, "disposition", maximum=20, required=True),
+                    disposition,
                     title=_string(data, "title", maximum=120, required=True),
                     category=category_selection,
                     tags=tag_values,
@@ -1813,6 +1940,8 @@ def make_handler(app: WikiApp):
             if match:
                 _fields(data, set())
                 task_id, action = match.group(1), match.group("action")
+                if action == "retry":
+                    service.require_remote_task(service.state.get_task(task_id)["kind"])
                 response, _ = self._idempotency(data, lambda: service.cancel_task(task_id) if action == "cancel" else service.retry_task(task_id))
                 service._wake.set()
                 return self._json(200, response)
@@ -1905,6 +2034,7 @@ def make_handler(app: WikiApp):
                 return self._json(201, response)
             if path == "/api/submissions":
                 _fields(data, {"preview_id"}, {"preview_id"})
+                app.require_platform_review()
                 response, replay = self._idempotency(data, lambda: app.platform.submit_preview(self.context, _string(data, "preview_id", maximum=64, required=True)))
                 if app.review_worker is not None:
                     app.review_worker.wake()
@@ -1913,6 +2043,8 @@ def make_handler(app: WikiApp):
             if match:
                 _fields(data, set())
                 action = match.group("action")
+                if action == "ai-retry":
+                    app.require_platform_review()
                 response, _ = self._idempotency(data, lambda: app.platform.retry_ai(self.context, match.group(1)) if action == "ai-retry" else app.platform.withdraw(self.context, match.group(1)))
                 return self._json(200, response)
             match = re.fullmatch(r"/api/notifications/([a-f0-9]{32})/read", path)
@@ -2022,6 +2154,13 @@ def make_handler(app: WikiApp):
             except ValueError as exc:
                 status = 409 if "idempotency" in str(exc) else 422
                 self._json(status, {"error": str(exc)})
+            except RemoteTaskUnavailable as exc:
+                self._json(503, {
+                    "error": "remote worker is unavailable",
+                    "code": "remote_worker_unavailable",
+                    "kind": exc.kind,
+                    "reason": exc.reason,
+                })
             except RuntimeError as exc:
                 self._json(409, {"error": str(exc)})
             except PermissionError:
@@ -2131,6 +2270,7 @@ def main() -> None:
             load_environment=True,
             dev_origins=dev_origins,
             start_worker=remote_worker_enabled,
+            remote_tasks_enabled=remote_worker_enabled,
             start_public_index_worker=True,
             remote_task_kinds=configured_kinds or None,
             multi_user=True,
@@ -2150,7 +2290,7 @@ def main() -> None:
             print(f"Wiki public origin: {deployment.public_origin}")
         print("LLM: configured independently per private workspace")
         if not remote_worker_enabled:
-            print("Remote worker: disabled; queued tasks will remain local")
+            print("Remote worker: disabled; new remote tasks will be rejected")
         elif configured_kinds:
             print("Remote worker task kinds: " + ", ".join(sorted(configured_kinds)))
         try:

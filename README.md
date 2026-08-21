@@ -82,6 +82,10 @@ python3 serve.py
 
 `PublicIndexWorker` 是本地补偿工作器，不调用远端模型，并且在 `WIKI_DISABLE_REMOTE_WORKER=1` 时仍会启动。索引任务持久保存在 `public_index_jobs`，瞬时失败按退避策略进入 `retry`，达到上限后进入 `dead`；Admin 可在“公开索引补偿”页查看并重试失败任务。服务重启会回收过期的 `running` lease，单条损坏任务会被隔离，不能终止整个索引工作器。
 
+远端生成/补证/治理 Worker 与广场 AI 预审 Worker 使用同一部署开关。仓库的正式 systemd 单元读取 `/etc/unlimited-wiki.env`，根目录 `.env.example` 是该文件以及外部 Compose 的受支持环境合同：正常服务不得设置 `WIKI_DISABLE_REMOTE_WORKER`（代码默认启用），并明确允许 `generate,supplement,governance`。当 Worker 被关闭或某个 task kind 被排除时，服务端会在业务写入和幂等记录之前拒绝新的远端任务或投稿，不再制造永久排队；既有队列保持原样，等待运维决策。
+
+`WIKI_DISABLE_REMOTE_WORKER=1` 只用于恢复后的隔离冒烟或明确的维护窗口。重新启用会立即开始消费所有 Workspace 的 `queued` 生成/补证/治理任务，以及平台 `ai_queued` 投稿，并可能产生网页抓取、第三方模型调用、费用和数据外发。启用前必须先只读检查 `/readyz` 的 `capabilities` 和各 Workspace `/api/status`，盘点两类队列，再由有权限的运维人员决定保留、取消或恢复处理；代码发布不会自动重放、取消或改写历史任务。`/healthz` 仅表示进程存活；存在当前配置无法消费的 queued 工作时，`/readyz` 返回 `503 not_ready`。
+
 ## 公司内网部署
 
 唯一受支持的内网拓扑是“浏览器 -> HTTPS Caddy/nginx -> 同机 `127.0.0.1:8765` 后端”。反向代理必须保留外部 `Host`，设置 `X-Forwarded-Proto: https` 和标准 `X-Forwarded-For`。应用只信任 `WIKI_TRUSTED_PROXY_CIDRS` 中的代理地址，并从代理链右侧剥离受信跳点；不要配置整个公司网段。
@@ -172,7 +176,7 @@ sudo python3 backup_restore.py restore /var/backups/unlimited-wiki/wiki-20260817
 sudo -u unlimited-wiki WIKI_DISABLE_REMOTE_WORKER=1 python3 serve.py
 ```
 
-备份、恢复和服务进程共用 `.runtime/instance.lock`；备份取得锁后若发现 `.restore/` 会拒绝运行，不能从半恢复实例生成灾备副本。高权限恢复要求项目根由 root 管理且不能被服务账号、组或其他用户写入；恢复的 journal、staging 和待发布副本只放在恢复进程拥有的项目根 `.restore/`（`0700`）中，不放入服务账号可写的 `.runtime/`。恢复会校验 manifest、主密钥以及固定位置的平台/Workspace SQLite 数据库，撤销备份中的浏览器会话，并在未发布副本上通过 fd 锚定、不跟随符号链接、子项优先而根目录最后的方式应用 `--owner`；journal 同时绑定 owner 名称和解析后的 UID/GID，续做时任一项变化都会拒绝。再次校验后才原子发布 `.platform/` 与 `spaces/`。最终数据发布完成后才把稳定的 `.runtime/` 和 `instance.lock` 交给服务账号，再原子将 `.restore/` 标记为 `.restore-complete-*` 并清理。`.restore/` 表示恢复未完成并阻断服务和备份；`.restore-complete-*` 仅表示数据与属主均已发布、最后的清理被中断，不阻断服务或新备份，但目录仍含敏感副本，保持 root 私有且由运维在确认不存在 `.restore/` 后清除。两类目录均已从 Git 排除。复制、校验或属主交接失败会保留私有 journal，必须使用同一备份、owner 名称和 UID/GID 重试。完成只读冒烟检查后停止临时进程，再通过 systemd 正常启动。至少每季度在隔离目录进行一次恢复演练；没有经过恢复验证的备份不能视为可用。
+备份、恢复和服务进程共用 `.runtime/instance.lock`；备份取得锁后若发现 `.restore/` 会拒绝运行，不能从半恢复实例生成灾备副本。高权限恢复要求项目根由 root 管理且不能被服务账号、组或其他用户写入；恢复的 journal、staging 和待发布副本只放在恢复进程拥有的项目根 `.restore/`（`0700`）中，不放入服务账号可写的 `.runtime/`。恢复会校验 manifest、主密钥以及固定位置的平台/Workspace SQLite 数据库，撤销备份中的浏览器会话，并在未发布副本上通过 fd 锚定、不跟随符号链接、子项优先而根目录最后的方式应用 `--owner`；journal 同时绑定 owner 名称和解析后的 UID/GID，续做时任一项变化都会拒绝。再次校验后才原子发布 `.platform/` 与 `spaces/`。最终数据发布完成后才把稳定的 `.runtime/` 和 `instance.lock` 交给服务账号，再原子将 `.restore/` 标记为 `.restore-complete-*` 并清理。`.restore/` 表示恢复未完成并阻断服务和备份；`.restore-complete-*` 仅表示数据与属主均已发布、最后的清理被中断，不阻断服务或新备份，但目录仍含敏感副本，保持 root 私有且由运维在确认不存在 `.restore/` 后清除。两类目录均已从 Git 排除。复制、校验或属主交接失败会保留私有 journal，必须使用同一备份、owner 名称和 UID/GID 重试。完成只读冒烟检查后停止临时进程；确认 `/readyz` 不再有不可消费队列，并完成模型调用、费用和数据外发授权后，移除临时 `WIKI_DISABLE_REMOTE_WORKER=1` 覆盖，再通过 systemd 正常启动。至少每季度在隔离目录进行一次恢复演练；没有经过恢复验证的备份不能视为可用。
 
 ## 前端开发
 
@@ -258,7 +262,7 @@ viewer/                             前端源码与构建配置
 | `WIKI_MAX_CONCURRENT_REQUESTS` | 后端同时处理的请求上限 | `64` |
 | `WIKI_REQUEST_TIMEOUT_SECONDS` | 单连接 socket 超时 | `30` |
 | `WIKI_MIN_FREE_BYTES` | readiness 要求的数据盘最小剩余字节数 | `536870912` |
-| `WIKI_DISABLE_REMOTE_WORKER` | 设为 `1` 时不启动远端模型任务工作器；本地 `PublicIndexWorker` 仍运行 | `0` |
+| `WIKI_DISABLE_REMOTE_WORKER` | 正常运行时不设置；仅在隔离冒烟或维护窗口设为 `1`，此时不启动远端模型任务工作器，本地 `PublicIndexWorker` 仍运行 | 未设置（Worker 启用） |
 | `WIKI_REMOTE_TASK_KINDS` | 限制远端工作器处理的任务类型，逗号分隔 | 全部支持类型 |
 | `WIKI_SECURE_COOKIES` | 设为 `1` 时为会话 Cookie 添加 `Secure` | `0` |
 | `WEB_ALLOW_FAKE_IP` | 兼容透明代理将域名解析到 `198.18.0.0/15` 的场景 | `0` |

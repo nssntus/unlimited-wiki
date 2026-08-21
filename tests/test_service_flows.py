@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import dynamic_categories as dc
-from wiki_service import WikiService
+from wiki_service import RemoteTaskUnavailable, WikiService
 from wiki_service import LLMConfig, extract_markdown_article, model_message_text
 
 
@@ -279,6 +279,67 @@ def test_generate_is_local_first_and_creates_one_canonical(service: WikiService)
     replay = service.generate("隔离概念")
     assert replay["created"] is False
     assert [item["title"] for item in service.articles()].count("隔离概念") == 1
+
+
+def test_disabled_remote_tasks_reject_before_generate_or_ingest_writes(kb_root: Path, snapshot, monkeypatch: pytest.MonkeyPatch):
+    service = WikiService(
+        kb_root,
+        llm_config=LLMConfig(base_url="https://models.example/v1", model="test"),
+        start_worker=False,
+        remote_tasks_enabled=False,
+    )
+    raw_path = kb_root / "raw" / "local" / "disabled.txt"
+    raw_path.write_text("# Disabled\n\nEnough local source text for an ingest test.", encoding="utf-8")
+    before = snapshot(kb_root)
+    try:
+        with pytest.raises(RemoteTaskUnavailable) as generated:
+            service.generate("Worker disabled concept")
+        assert (generated.value.kind, generated.value.reason) == ("supplement", "disabled")
+        assert service.state.task_counts()["queued"] == 0
+        assert snapshot(kb_root) == before
+
+        with pytest.raises(RemoteTaskUnavailable) as ingested:
+            service.ingest_commit("raw/local/disabled.txt", "new", title="Disabled ingest")
+        assert (ingested.value.kind, ingested.value.reason) == ("governance", "disabled")
+        assert service.state.raw_records() == []
+        assert snapshot(kb_root) == before
+
+        preflight = {
+            "keyword": "Local only",
+            "existing_path": None,
+            "local_coverage": {"sufficient": True},
+            "context": {"from_path": "", "heading": "", "passage": ""},
+            "excerpts": [],
+            "plan": "local_generate",
+        }
+        service.configure_llm(LLMConfig())
+        monkeypatch.setattr(service, "preflight_generate", lambda *args, **kwargs: preflight)
+        local = service.generate("Local only")
+        assert local["created"] is True and local["task"] is None
+    finally:
+        service.close()
+
+
+def test_kind_disabled_rejects_governance_and_retry_without_mutation(kb_root: Path):
+    service = WikiService(
+        kb_root,
+        llm_config=LLMConfig(base_url="https://models.example/v1", model="test"),
+        start_worker=False,
+        remote_task_kinds={"generate", "supplement"},
+    )
+    try:
+        with pytest.raises(RemoteTaskUnavailable) as governance:
+            service.enqueue_governance()
+        assert (governance.value.kind, governance.value.reason) == ("governance", "kind_disabled")
+        task, _ = service.state.enqueue_task("governance", "Base", {"path": "concepts/base.md"})
+        claimed = service.state.claim_task({"governance"})
+        service.state.fail_task(claimed["id"], "model_error", "failed", retry=False)
+        before = service.state.get_task(task["id"])
+        with pytest.raises(RemoteTaskUnavailable):
+            service.retry_task(task["id"])
+        assert service.state.get_task(task["id"]) == before
+    finally:
+        service.close()
 
 
 def test_raw_ingest_keeps_source_immutable_and_is_duplicate_safe(service: WikiService, kb_root: Path):

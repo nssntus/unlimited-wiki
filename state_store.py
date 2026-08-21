@@ -250,6 +250,43 @@ class StateStore:
             ).fetchall()
         return [self._task(row) for row in rows]
 
+    def task_counts(self) -> dict:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT kind,status,COUNT(*) count FROM tasks GROUP BY kind,status"
+            ).fetchall()
+        return self._task_count_summary(rows)
+
+    @staticmethod
+    def task_counts_at(project_root: Path) -> dict:
+        path = Path(project_root) / ".wiki-state" / "state.sqlite3"
+        if not path.is_file():
+            return {"queued": 0, "running": 0, "by_kind": {}}
+        uri = f"file:{path.resolve().as_posix()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=2) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA query_only=ON")
+            rows = db.execute(
+                "SELECT kind,status,COUNT(*) count FROM tasks GROUP BY kind,status"
+            ).fetchall()
+        return StateStore._task_count_summary(rows)
+
+    @staticmethod
+    def _task_count_summary(rows) -> dict:
+        by_kind: dict[str, dict[str, int]] = {}
+        queued = 0
+        running = 0
+        for row in rows:
+            kind = str(row["kind"])
+            status = str(row["status"])
+            count = int(row["count"])
+            by_kind.setdefault(kind, {})[status] = count
+            if status == "queued":
+                queued += count
+            elif status == "running":
+                running += count
+        return {"queued": queued, "running": running, "by_kind": by_kind}
+
     def get_task(self, task_id: str) -> dict:
         with self.connect() as db:
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
