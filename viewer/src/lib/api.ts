@@ -137,6 +137,17 @@ export type WorkspaceInvitation = {
   invited_by_nickname: string
 }
 
+export type RegistrationInvite = {
+  id: string
+  email: string
+  status: "pending" | "used" | "revoked" | "expired"
+  expires_at: string
+  created_at: string
+  used_at: string | null
+}
+
+export type IssuedRegistrationInvite = RegistrationInvite & { token: string }
+
 export type Submission = {
   id: string
   status: string
@@ -299,6 +310,7 @@ export const queryKeys = {
   publicProfile: (id: string) => ["square", "profile", id] as const,
   publicLibrary: ["square", "me", "library"] as const,
   adminReviews: ["admin-reviews"] as const,
+  adminRegistrationInvites: ["admin-registration-invites"] as const,
   adminSquare: ["admin-square"] as const,
   adminPublicEntries: (status: string) => ["admin-public-entries", status] as const,
 }

@@ -75,6 +75,14 @@ class RegistrationClosedError(PermissionError):
     pass
 
 
+class RegistrationInviteError(PermissionError):
+    pass
+
+
+class AdministratorBootstrapRequiredError(PermissionError):
+    pass
+
+
 class AccountWorkspaceSetChanged(RuntimeError):
     def __init__(self, workspace_ids: set[str]):
         super().__init__("account workspace set changed")
@@ -865,7 +873,9 @@ class PlatformStore(SquareMixin):
                 raise RegistrationClosedError("registration is closed")
             if invite_token and existing_users == 0:
                 db.rollback()
-                raise PermissionError("administrator bootstrap is required before invitation registration")
+                raise AdministratorBootstrapRequiredError(
+                    "administrator bootstrap is required before invitation registration"
+                )
             invite = None
             if invite_token:
                 invite = db.execute(
@@ -875,7 +885,7 @@ class PlatformStore(SquareMixin):
                 ).fetchone()
                 if invite is None:
                     db.rollback()
-                    raise PermissionError("registration invitation is invalid or expired")
+                    raise RegistrationInviteError("registration invitation is invalid or expired")
             role = "admin" if existing_users == 0 else "user"
             try:
                 root.mkdir(mode=0o700)
@@ -953,42 +963,135 @@ class PlatformStore(SquareMixin):
         )
         return user, recovery, session_token, context
 
-    def create_registration_invite(self, email: str, *, hours: int = 72) -> tuple[dict, str]:
+    @staticmethod
+    def _registration_invite_input(email: str, hours: int) -> str:
         email = email.strip().casefold()
         if not EMAIL_RE.fullmatch(email) or len(email) > 254:
             raise ValueError("invalid email address")
-        if hours < 1 or hours > 24 * 30:
+        if type(hours) is not int or hours < 1 or hours > 24 * 30:
             raise ValueError("invite lifetime must be between 1 hour and 30 days")
+        return email
+
+    @staticmethod
+    def _expire_registration_invites(db: sqlite3.Connection, created: str) -> None:
+        db.execute(
+            "UPDATE account_registration_invites SET status='expired' "
+            "WHERE status='pending' AND expires_at<=?",
+            (created,),
+        )
+
+    def _create_registration_invite_in_transaction(
+        self,
+        db: sqlite3.Connection,
+        email: str,
+        hours: int,
+        *,
+        actor_id: str | None,
+    ) -> tuple[dict, str]:
         token = secrets.token_urlsafe(32)
         invite_id = uuid.uuid4().hex
         created = now_iso()
         expires_at = future_iso(hours=hours)
-        with self._lock, self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            db.execute(
-                "UPDATE account_registration_invites SET status='expired' WHERE status='pending' AND expires_at<=?",
-                (created,),
-            )
-            if db.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone() is not None:
-                db.rollback()
-                raise ValueError("account already exists")
-            db.execute(
-                """INSERT INTO account_registration_invites
-                   (id,token_hash,email,status,expires_at,created_at,used_at)
-                   VALUES(?,?,?,'pending',?,?,NULL)""",
-                (invite_id, hash_token(token), email, expires_at, created),
-            )
-            db.execute(
-                "INSERT INTO audit_events VALUES(?,?,?,?,?,?,?)",
-                (uuid.uuid4().hex, None, "registration_invite.create", "registration_invite", invite_id, "{}", created),
-            )
-            db.commit()
+        self._expire_registration_invites(db, created)
+        if db.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone() is not None:
+            raise ValueError("account already exists")
+        db.execute(
+            "UPDATE account_registration_invites SET status='revoked' "
+            "WHERE email=? AND status='pending'",
+            (email,),
+        )
+        db.execute(
+            """INSERT INTO account_registration_invites
+               (id,token_hash,email,status,expires_at,created_at,used_at)
+               VALUES(?,?,?,'pending',?,?,NULL)""",
+            (invite_id, hash_token(token), email, expires_at, created),
+        )
+        self._audit(
+            db, actor_id, "registration_invite.create", "registration_invite", invite_id,
+            {"expires_at": expires_at},
+        )
         return {
             "id": invite_id,
             "email": email,
             "status": "pending",
             "expires_at": expires_at,
+            "created_at": created,
+            "used_at": None,
         }, token
+
+    def create_registration_invite(self, email: str, *, hours: int = 72) -> tuple[dict, str]:
+        email = self._registration_invite_input(email, hours)
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            invite, token = self._create_registration_invite_in_transaction(
+                db, email, hours, actor_id=None,
+            )
+            db.commit()
+        return invite, token
+
+    def admin_create_registration_invite(
+        self,
+        context: SessionContext | AccountSessionContext,
+        email: str,
+        *,
+        hours: int = 72,
+    ) -> tuple[dict, str]:
+        email = self._registration_invite_input(email, hours)
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._authorize_admin_in_transaction(db, context.user_id)
+            invite, token = self._create_registration_invite_in_transaction(
+                db, email, hours, actor_id=context.user_id,
+            )
+            db.commit()
+        return invite, token
+
+    def admin_list_registration_invites(
+        self, context: SessionContext | AccountSessionContext,
+    ) -> list[dict]:
+        created = now_iso()
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._authorize_admin_in_transaction(db, context.user_id)
+            self._expire_registration_invites(db, created)
+            rows = db.execute(
+                """SELECT id,email,status,expires_at,created_at,used_at
+                   FROM account_registration_invites
+                   ORDER BY created_at DESC,id DESC LIMIT 200"""
+            ).fetchall()
+            db.commit()
+        return [dict(row) for row in rows]
+
+    def admin_revoke_registration_invite(
+        self, context: SessionContext | AccountSessionContext, invite_id: str,
+    ) -> dict:
+        created = now_iso()
+        with self._lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._authorize_admin_in_transaction(db, context.user_id)
+            self._expire_registration_invites(db, created)
+            row = db.execute(
+                """SELECT id,email,status,expires_at,created_at,used_at
+                   FROM account_registration_invites WHERE id=?""",
+                (invite_id,),
+            ).fetchone()
+            if row is None:
+                db.rollback()
+                raise FileNotFoundError(invite_id)
+            if row["status"] != "pending":
+                db.rollback()
+                raise ValueError("registration invitation is no longer pending")
+            db.execute(
+                "UPDATE account_registration_invites SET status='revoked' "
+                "WHERE id=? AND status='pending'",
+                (invite_id,),
+            )
+            self._audit(
+                db, context.user_id, "registration_invite.revoke", "registration_invite",
+                invite_id, {},
+            )
+            db.commit()
+        return {**dict(row), "status": "revoked"}
 
     def user_count(self) -> int:
         with self.connect() as db:
