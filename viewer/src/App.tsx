@@ -46,6 +46,7 @@ const AdminReportsPage = lazy(() => import("@/pages/admin-page").then((module) =
 const AdminContentPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminContentPage })))
 const AdminCurationPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminCurationPage })))
 const AdminPublicIndexPage = lazy(() => import("@/pages/admin-page").then((module) => ({ default: module.AdminPublicIndexPage })))
+const AdminAccountsPage = lazy(() => import("@/pages/admin-accounts-page").then((module) => ({ default: module.AdminAccountsPage })))
 
 function AppRoot() {
   return (
@@ -107,6 +108,7 @@ const router = createHashRouter(createRoutesFromElements(
               <Route path="/admin/content" element={<AdminContentPage />} />
               <Route path="/admin/public-index" element={<AdminPublicIndexPage />} />
               <Route path="/admin/curation" element={<AdminCurationPage />} />
+              <Route path="/admin/accounts" element={<AdminAccountsPage />} />
             </Route>
   </Route>,
 ))

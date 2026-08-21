@@ -18,7 +18,7 @@ type SwitchState =
   | { kind: "error"; target: string | null; message: string }
 
 const UNCOMMITTED_SWITCH_STATUSES = new Set([400, 403, 404, 422])
-const ACCOUNT_LEVEL_PATHS = new Set(["/admin/curation"])
+const ACCOUNT_LEVEL_PATHS = new Set(["/admin/curation", "/admin/accounts"])
 
 export function SessionProvider({ children }: { children: ReactNode }) {
   const client = useQueryClient()

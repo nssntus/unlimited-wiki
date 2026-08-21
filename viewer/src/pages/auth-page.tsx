@@ -1,6 +1,6 @@
-import { useState, type FormEvent } from "react"
+import { useEffect, useState, type FormEvent } from "react"
 import { useQueryClient } from "@tanstack/react-query"
-import { Link, useLocation, useNavigate } from "react-router-dom"
+import { Link, useLocation, useNavigate, useSearchParams } from "react-router-dom"
 import { ArchiveIcon, KeyRoundIcon } from "lucide-react"
 
 import { apiPost, queryKeys, setCsrfToken, type Session } from "@/lib/api"
@@ -18,16 +18,26 @@ export function AuthPage({ mode }: { mode: Mode }) {
   const client = useQueryClient()
   const navigate = useNavigate()
   const location = useLocation()
-  const [email, setEmail] = useState("")
+  const [searchParams, setSearchParams] = useSearchParams()
+  const [inviteLink] = useState(() => ({
+    email: searchParams.get("email")?.trim() ?? "",
+    token: searchParams.get("invite_token")?.trim() ?? "",
+  }))
+  const invitedFromLink = mode === "register" && Boolean(inviteLink.email && inviteLink.token)
+  const [email, setEmail] = useState(invitedFromLink ? inviteLink.email : "")
   const [nickname, setNickname] = useState("")
   const [password, setPassword] = useState("")
-  const [inviteToken, setInviteToken] = useState("")
+  const [inviteToken, setInviteToken] = useState(invitedFromLink ? inviteLink.token : "")
   const [recoveryCode, setRecoveryCode] = useState("")
   const [issuedCode, setIssuedCode] = useState("")
   const [migrationRetryRequired, setMigrationRetryRequired] = useState(false)
   const [error, setError] = useState("")
   const [pending, setPending] = useState(false)
   const title = mode === "login" ? "登录我的 Wiki" : mode === "register" ? "创建私有 Wiki" : "使用恢复码重置密码"
+
+  useEffect(() => {
+    if (invitedFromLink && searchParams.size) setSearchParams({}, { replace: true })
+  }, [invitedFromLink, searchParams, setSearchParams])
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
@@ -67,7 +77,7 @@ export function AuthPage({ mode }: { mode: Mode }) {
     <Button className="w-full" onClick={() => navigate("/", { replace: true })}>进入我的 Wiki</Button>
   </div></main>
 
-  if (mode === "register" && !loading && session?.registration_enabled === false) {
+  if (mode === "register" && !invitedFromLink && !loading && session?.registration_enabled === false) {
     return <main className="grid min-h-svh place-items-center px-4"><div className="w-full max-w-sm space-y-5">
       <Alert><KeyRoundIcon /><AlertTitle>注册已关闭</AlertTitle><AlertDescription>此部署不接受自助注册。请联系管理员开通账号。</AlertDescription></Alert>
       <Button className="w-full" render={<Link to="/login" />}>返回登录</Button>
@@ -78,10 +88,11 @@ export function AuthPage({ mode }: { mode: Mode }) {
     <Link to="/square" className="mb-10 flex items-center justify-center gap-2 font-semibold"><span className="grid size-9 place-items-center rounded-md bg-primary text-primary-foreground"><ArchiveIcon /></span>知库</Link>
     <h1 className="text-2xl font-semibold">{title}</h1>
     <p className="mt-2 text-sm text-muted-foreground">每个账号只进入自己的私有空间；公开内容需另行投稿审核。</p>
+    {invitedFromLink && <Alert className="mt-6"><KeyRoundIcon /><AlertTitle>管理员已邀请你创建账号</AlertTitle><AlertDescription>邀请与 {inviteLink.email} 绑定，只能使用一次。注册后仍需团队 Owner 单独邀请，才能访问团队空间。</AlertDescription></Alert>}
     <form className="mt-8" onSubmit={submit}><FieldGroup>
-      <Field><FieldLabel htmlFor="auth-email">邮箱</FieldLabel><Input id="auth-email" type="email" autoComplete="email" required value={email} onChange={(event) => setEmail(event.target.value)} /></Field>
+      <Field><FieldLabel htmlFor="auth-email">邮箱</FieldLabel><Input id="auth-email" type="email" autoComplete="email" required readOnly={invitedFromLink} value={email} onChange={(event) => setEmail(event.target.value)} />{invitedFromLink && <FieldDescription>该邮箱由邀请固定，不能在注册时更改。</FieldDescription>}</Field>
       {mode === "register" && <Field><FieldLabel htmlFor="auth-nickname">昵称</FieldLabel><Input id="auth-nickname" autoComplete="nickname" required value={nickname} onChange={(event) => setNickname(event.target.value)} /></Field>}
-      {mode === "register" && session?.registration_mode === "invite" && <Field><FieldLabel htmlFor="invite-token">邀请令牌</FieldLabel><Input id="invite-token" autoComplete="off" required value={inviteToken} onChange={(event) => setInviteToken(event.target.value)} /><FieldDescription>令牌与受邀邮箱绑定，只能使用一次。</FieldDescription></Field>}
+      {mode === "register" && !invitedFromLink && session?.registration_mode === "invite" && <Field><FieldLabel htmlFor="invite-token">邀请令牌</FieldLabel><Input id="invite-token" autoComplete="off" required value={inviteToken} onChange={(event) => setInviteToken(event.target.value)} /><FieldDescription>令牌与受邀邮箱绑定，只能使用一次。</FieldDescription></Field>}
       {mode === "recover" && <Field><FieldLabel htmlFor="recovery-code">恢复码</FieldLabel><Input id="recovery-code" required value={recoveryCode} onChange={(event) => setRecoveryCode(event.target.value)} /></Field>}
       <Field><FieldLabel htmlFor="auth-password">{mode === "recover" ? "新密码" : "密码"}</FieldLabel><Input id="auth-password" type="password" autoComplete={mode === "login" ? "current-password" : "new-password"} minLength={10} required value={password} onChange={(event) => setPassword(event.target.value)} /><FieldDescription>至少 10 个字符。</FieldDescription></Field>
       {error && <FieldError>{error}</FieldError>}

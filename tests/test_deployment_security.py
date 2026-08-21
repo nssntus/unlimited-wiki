@@ -11,7 +11,7 @@ import pytest
 
 import serve as serve_module
 from deployment import DeploymentConfig
-from platform_store import PlatformStore, hash_token
+from platform_store import PlatformStore, RegistrationInviteError, hash_token
 from serve import BoundedThreadingHTTPServer, create_app, create_server
 
 
@@ -117,6 +117,178 @@ def test_lan_host_origin_cookie_and_bootstrap_registration(lan_server):
     with app.platform.connect() as db:
         assert db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM audit_events WHERE action='user.register'").fetchone()[0] == 1
+
+
+def test_admin_account_invite_completes_bootstrap_registration_flow(lan_server):
+    app, server = lan_server
+    status, response_headers, admin = request(
+        server, "POST", "/api/auth/register", headers=proxy_headers(), body={
+            "email": "owner@example.com", "nickname": "Owner", "password": "correct-horse-123",
+        },
+    )
+    assert status == 201
+    admin_headers = proxy_headers(**{
+        "Cookie": response_headers["Set-Cookie"].split(";", 1)[0],
+        "X-CSRF-Token": admin["csrf_token"],
+    })
+    with app.platform.connect() as db:
+        db.execute(
+            "UPDATE sessions SET current_workspace_id=NULL WHERE user_id=?",
+            (admin["user"]["id"],),
+        )
+
+    assert request(
+        server, "GET", "/api/admin/registration-invites", headers=admin_headers,
+    )[2] == []
+    assert request(
+        server, "POST", "/api/admin/registration-invites",
+        headers=proxy_headers(Cookie=admin_headers["Cookie"]),
+        body={"email": "member@example.com", "hours": 24},
+    )[0] == 403
+    for invalid_hours in (True, 1.5, "24", 0, 721):
+        assert request(
+            server, "POST", "/api/admin/registration-invites", headers=admin_headers,
+            body={"email": "member@example.com", "hours": invalid_hours},
+        )[0] == 422
+
+    status, _headers, issued = request(
+        server, "POST", "/api/admin/registration-invites", headers=admin_headers,
+        body={"email": "member@example.com", "hours": 24},
+    )
+    assert status == 201
+    assert issued["email"] == "member@example.com" and issued["status"] == "pending"
+    assert issued["token"]
+    listed = request(
+        server, "GET", "/api/admin/registration-invites", headers=admin_headers,
+    )[2]
+    assert listed == [{key: issued[key] for key in (
+        "id", "email", "status", "expires_at", "created_at", "used_at",
+    )}]
+    assert issued["token"] not in json.dumps(listed)
+    with app.platform.connect() as db:
+        row = db.execute(
+            "SELECT token_hash FROM account_registration_invites WHERE id=?", (issued["id"],),
+        ).fetchone()
+        audit = db.execute(
+            "SELECT actor_id,detail_json FROM audit_events "
+            "WHERE action='registration_invite.create' AND object_id=?", (issued["id"],),
+        ).fetchone()
+        assert row["token_hash"] == hash_token(issued["token"])
+        assert issued["token"] not in row["token_hash"]
+        assert audit["actor_id"] == admin["user"]["id"]
+        assert issued["token"] not in audit["detail_json"]
+        assert db.execute("SELECT COUNT(*) FROM platform_idempotency").fetchone()[0] == 0
+
+    status, _headers, wrong_email = request(
+        server, "POST", "/api/auth/register", headers=proxy_headers(), body={
+            "email": "other@example.com", "nickname": "Other", "password": "correct-horse-123",
+            "invite_token": issued["token"],
+        },
+    )
+    assert status == 403
+    assert wrong_email["code"] == "invite_invalid_or_expired"
+
+    status, member_response_headers, member = request(
+        server, "POST", "/api/auth/register", headers=proxy_headers(), body={
+            "email": "member@example.com", "nickname": "Member", "password": "correct-horse-123",
+            "invite_token": issued["token"],
+        },
+    )
+    assert status == 201 and member["user"]["role"] == "user"
+    member_headers = proxy_headers(**{
+        "Cookie": member_response_headers["Set-Cookie"].split(";", 1)[0],
+        "X-CSRF-Token": member["csrf_token"],
+    })
+    assert request(
+        server, "GET", "/api/admin/registration-invites", headers=member_headers,
+    )[0] == 403
+    assert request(
+        server, "POST", "/api/admin/registration-invites", headers=member_headers,
+        body={"email": "blocked@example.com", "hours": 24},
+    )[0] == 403
+
+    status, _headers, revocable = request(
+        server, "POST", "/api/admin/registration-invites", headers=admin_headers,
+        body={"email": "revoked@example.com", "hours": 24},
+    )
+    assert status == 201
+    status, _headers, revoked = request(
+        server, "POST", f"/api/admin/registration-invites/{revocable['id']}/revoke",
+        headers=admin_headers, body={},
+    )
+    assert status == 200 and revoked["status"] == "revoked"
+    status, _headers, invalid = request(
+        server, "POST", "/api/auth/register", headers=proxy_headers(), body={
+            "email": "revoked@example.com", "nickname": "Revoked", "password": "correct-horse-123",
+            "invite_token": revocable["token"],
+        },
+    )
+    assert status == 403 and invalid["code"] == "invite_invalid_or_expired"
+
+
+def test_closed_registration_rejects_admin_invite_without_side_effects(lan_server):
+    app, server = lan_server
+    status, response_headers, admin = request(
+        server, "POST", "/api/auth/register", headers=proxy_headers(), body={
+            "email": "owner@example.com", "nickname": "Owner", "password": "correct-horse-123",
+        },
+    )
+    assert status == 201
+    admin_headers = proxy_headers(**{
+        "Cookie": response_headers["Set-Cookie"].split(";", 1)[0],
+        "X-CSRF-Token": admin["csrf_token"],
+    })
+    app.deployment = DeploymentConfig(
+        public_origin="https://wiki.intra.test",
+        trusted_proxy_cidrs=("127.0.0.1/32",),
+        registration_mode="closed",
+        min_free_bytes=0,
+    )
+
+    status, _headers, rejected = request(
+        server, "POST", "/api/admin/registration-invites", headers=admin_headers,
+        body={"email": "blocked@example.com", "hours": 24},
+    )
+    assert status == 409
+    assert rejected == {"error": "registration is closed", "code": "registration_closed"}
+    with app.platform.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM account_registration_invites").fetchone()[0] == 0
+        assert db.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE action='registration_invite.create'",
+        ).fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM platform_idempotency").fetchone()[0] == 0
+
+
+def test_admin_registration_invite_reissue_and_realtime_role_fence(tmp_path: Path):
+    store = PlatformStore(tmp_path)
+    _user, _recovery, _token, context = store.register(
+        "admin@example.com", "Admin", "correct-horse-123", initial_session=True,
+    )
+    first, first_token = store.admin_create_registration_invite(
+        context, "member@example.com", hours=24,
+    )
+    second, second_token = store.admin_create_registration_invite(
+        context, "member@example.com", hours=48,
+    )
+    assert first_token != second_token
+    rows = store.admin_list_registration_invites(context)
+    statuses = {row["id"]: row["status"] for row in rows}
+    assert statuses == {second["id"]: "pending", first["id"]: "revoked"}
+    with pytest.raises(RegistrationInviteError):
+        store.register(
+            "member@example.com", "Member", "correct-horse-123", invite_token=first_token,
+        )
+
+    with store.connect() as db:
+        db.execute("UPDATE users SET role='user' WHERE id=?", (context.user_id,))
+    with pytest.raises(PermissionError, match="admin role required"):
+        store.admin_list_registration_invites(context)
+    with pytest.raises(PermissionError, match="admin role required"):
+        store.admin_create_registration_invite(context, "other@example.com")
+
+    for invalid_hours in (True, 1.5, "24", 0, 721):
+        with pytest.raises(ValueError, match="invite lifetime"):
+            store.create_registration_invite("other@example.com", hours=invalid_hours)
 
 
 def test_bootstrap_registration_succeeds_with_read_only_project_root(lan_server):

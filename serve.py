@@ -41,9 +41,11 @@ from legacy_migration import migrate_legacy_workspace
 from platform_store import (
     AccountSessionContext,
     AccountWorkspaceSetChanged,
+    AdministratorBootstrapRequiredError,
     PlatformIdempotencyError,
     PlatformStore,
     RegistrationClosedError,
+    RegistrationInviteError,
     SessionContext,
 )
 from platform_review import PlatformReviewWorker
@@ -1051,6 +1053,11 @@ def make_handler(app: WikiApp):
                     self.context or self.account_context,
                     _single_query(parsed, "status") or "published",
                 ))
+            if path == "/api/admin/registration-invites":
+                self._require_role("admin")
+                return self._json(200, app.platform.admin_list_registration_invites(
+                    self.context or self.account_context,
+                ))
             if not path.startswith("/api/"):
                 return self._serve_static(path)
 
@@ -1169,12 +1176,24 @@ def make_handler(app: WikiApp):
                         _string(data, "email", maximum=254, required=True),
                         _string(data, "nickname", maximum=80, required=True),
                         _string(data, "password", maximum=1024, required=True),
-                        first_user_only=app.deployment.registration_mode == "bootstrap",
+                        first_user_only=(
+                            app.deployment.registration_mode == "bootstrap" and not invite_token
+                        ),
                         invite_token=invite_token,
                         initial_session=True,
                     )
                 except RegistrationClosedError as exc:
                     raise ApiError(409, "registration is closed", details={"code": "registration_closed"}) from exc
+                except AdministratorBootstrapRequiredError as exc:
+                    raise ApiError(
+                        409, "administrator bootstrap is required",
+                        details={"code": "administrator_bootstrap_required"},
+                    ) from exc
+                except RegistrationInviteError as exc:
+                    raise ApiError(
+                        403, "registration invitation is invalid or expired",
+                        details={"code": "invite_invalid_or_expired"},
+                    ) from exc
                 migration = {"status": "not_needed"}
                 if user["role"] == "admin":
                     try:
@@ -1310,6 +1329,32 @@ def make_handler(app: WikiApp):
                     _string(data, "name", maximum=80, required=True), _string(data, "description", maximum=1000),
                     _string(data, "status", maximum=20, required=True), sort_order,
                 ), scope=f"account:{self.account_context.user_id}")
+                return self._json(200, response)
+            if path == "/api/admin/registration-invites":
+                self._require_role("admin")
+                if app.deployment.registration_mode == "closed":
+                    raise ApiError(409, "registration is closed", details={"code": "registration_closed"})
+                _fields(data, {"email", "hours"}, {"email"})
+                hours = data.get("hours", 72)
+                if type(hours) is not int or not 1 <= hours <= 24 * 30:
+                    raise ApiError(422, "invite lifetime must be between 1 hour and 30 days")
+                invite, token = app.platform.admin_create_registration_invite(
+                    self.context or self.account_context,
+                    _string(data, "email", maximum=254, required=True),
+                    hours=hours,
+                )
+                return self._json(201, {**invite, "token": token})
+            match = re.fullmatch(r"/api/admin/registration-invites/([a-f0-9]{32})/revoke", path)
+            if match:
+                self._require_role("admin")
+                _fields(data, set())
+                response, _ = self._platform_idempotency(
+                    data,
+                    lambda: app.platform.admin_revoke_registration_invite(
+                        self.context or self.account_context, match.group(1),
+                    ),
+                    scope=f"account:{self.account_context.user_id}",
+                )
                 return self._json(200, response)
             match = re.fullmatch(r"/api/admin/public-tags/([a-f0-9]{32})/update", path)
             if match:
