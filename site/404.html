@@ -1,10 +1,10 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-locale="en">
   <head>
     <meta charset="UTF-8" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'self'; object-src 'none'; form-action 'none'"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; base-uri 'self'; object-src 'none'; form-action 'none'"
     />
     <meta name="referrer" content="no-referrer" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -12,14 +12,22 @@
     <base href="/unlimited-wiki/" />
     <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
     <link rel="stylesheet" href="./styles.css" />
-    <title>Page not found · Unlimited Wiki</title>
+    <script src="./language-init.js"></script>
+    <script src="./app.js" defer></script>
+    <title data-i18n="notFound.metaTitle">Page not found · Unlimited Wiki</title>
   </head>
   <body>
     <main class="not-found">
+      <div class="locale-switcher" role="group" aria-label="Language" data-i18n-aria="language.label">
+        <button type="button" data-locale-choice="zh-CN" aria-pressed="false">中</button>
+        <span aria-hidden="true">/</span>
+        <button type="button" data-locale-choice="en" aria-pressed="true">EN</button>
+      </div>
       <img src="./favicon.svg" width="52" height="52" alt="" />
-      <p>404</p>
-      <h1>Page not found</h1>
-      <a class="button button-primary" href="./">Return to Unlimited Wiki</a>
+      <p data-i18n="notFound.label">404</p>
+      <h1 data-i18n="notFound.title">This page is not here.</h1>
+      <p class="not-found-body" data-i18n="notFound.body">The link may have moved. Return home to continue exploring Unlimited Wiki.</p>
+      <a class="button button-primary" href="./" data-i18n="notFound.return">Return to Unlimited Wiki</a>
     </main>
   </body>
 </html>

@@ -141,15 +141,16 @@ def test_pages_content_matches_product_and_readme_contract() -> None:
         "Unlimited Wiki",
         "Raw",
         "Markdown",
-        "协作治理",
         "AI 预审",
         "人工审核",
         "Wiki 广场",
         "Private Workspace",
         "投稿快照",
-        "公开版本",
-        "React 19 + TypeScript + Vite",
-        "Python + SQLite",
+        "公开修订",
+        "默认私有",
+        "强租户隔离",
+        "来源可追溯",
+        "失败可见且可恢复",
     ):
         assert phrase in combined
 
@@ -166,13 +167,66 @@ def test_pages_content_matches_product_and_readme_contract() -> None:
     )
     for command in commands:
         assert command in readme
-        assert command in index
 
     assert combined.count(GITHUB) >= 3
     assert "online demo" not in combined.lower()
-    assert "not a hosted SaaS or multi-node cluster" in combined
-    assert "single-node deployments" in combined
-    assert "shared network filesystem" not in combined.lower()
+    assert "not a hosted SaaS, multi-node cluster, or shared network filesystem" in combined
+    assert "single-node deployment" in combined
+    assert f'href="{GITHUB}#readme"' in index
+
+
+def test_editorial_information_architecture_and_boundary_facts() -> None:
+    index = (SITE / "index.html").read_text(encoding="utf-8")
+    app = (SITE / "app.js").read_text(encoding="utf-8")
+
+    for section_id, number, label_key in (
+        ("capabilities", "01", "capabilities.meta"),
+        ("boundaries", "02", "boundaries.meta"),
+        ("principles", "03", "principles.meta"),
+    ):
+        section = index.split(f'id="{section_id}"', 1)[1].split("</section>", 1)[0]
+        assert f"<span>{number}</span>" in section
+        assert f'data-i18n="{label_key}"' in section
+
+    facts = index.split('<section class="fact-band"', 1)[1].split("</section>", 1)[0]
+    assert facts.count("<article>") == 4
+    for fact_key in ("facts.markdownMeta", "facts.workspaceMeta", "facts.reviewMeta", "facts.licenseMeta"):
+        assert f'data-i18n="{fact_key}"' in facts
+    assert "MIT License" in facts
+
+    capabilities = index.split('class="capability-list"', 1)[1].split("</div>", 1)[0]
+    assert capabilities.count("<article>") == 3
+    mobile_boundaries = index.split('class="boundary-mobile"', 1)[1].split('class="deployment-note"', 1)[0]
+    assert mobile_boundaries.count("<article") == 3
+    assert index.count('<li><strong data-i18n="principles.') == 6
+
+    workflow_keys = ("workflow.raw", "workflow.markdown", "workflow.ai", "workflow.human", "workflow.public")
+    positions = [index.index(f'data-i18n="{key}"') for key in workflow_keys]
+    assert positions == sorted(positions)
+
+    for fact in (
+        "Raw sources and canonical Markdown remain private.",
+        "AI preflight checks quality and policy. It is not publication.",
+        "Public revisions never write back to private sources.",
+        "local or same-host HTTPS reverse-proxy single-node deployment",
+    ):
+        assert fact in app
+
+
+def test_all_visible_copy_has_complete_chinese_and_english_keys() -> None:
+    app = (SITE / "app.js").read_text(encoding="utf-8")
+    zh_block, en_tail = app.split("    en: {", 1)
+    en_block = en_tail.split("\n    }\n  };", 1)[0]
+    key_pattern = re.compile(r'^\s+"([A-Za-z][A-Za-z0-9.]+)":', re.MULTILINE)
+    zh_keys = set(key_pattern.findall(zh_block))
+    en_keys = set(key_pattern.findall(en_block))
+    assert zh_keys == en_keys
+
+    references: set[str] = set()
+    for name in ("index.html", "404.html"):
+        source = (SITE / name).read_text(encoding="utf-8")
+        references.update(re.findall(r'data-i18n(?:-aria|-content)?="([A-Za-z][A-Za-z0-9.]+)"', source))
+    assert references <= zh_keys
 
 
 def test_pages_navigation_assets_and_seo_are_subpath_safe() -> None:
@@ -218,7 +272,6 @@ def test_language_switcher_is_complete_and_accessible() -> None:
     assert 'menuToggle.getAttribute("aria-expanded") === "true"' in app
     assert 'element.setAttribute("aria-label", dictionary[key])' in app
     assert 'element.setAttribute("content", dictionary[key])' in app
-    assert "aria-live=\"polite\"" in index
 
 
 def test_manifest_and_404_are_static_pages_compatible() -> None:
@@ -232,10 +285,15 @@ def test_manifest_and_404_are_static_pages_compatible() -> None:
     assert all(icon["src"].startswith("./") for icon in manifest["icons"])
 
     missing = (SITE / "404.html").read_text(encoding="utf-8")
-    assert '<html lang="en">' in missing
+    assert '<html lang="en" data-locale="en">' in missing
     assert '<base href="/unlimited-wiki/" />' in missing
     assert 'href="./"' in missing
     assert 'src="./favicon.svg"' in missing
+    assert 'src="./language-init.js"' in missing
+    assert 'src="./app.js"' in missing
+    assert 'data-locale-choice="zh-CN"' in missing
+    assert 'data-locale-choice="en"' in missing
+    assert 'data-i18n="notFound.title"' in missing
 
 
 def test_pages_apply_a_strict_meta_csp_before_loading_resources() -> None:
@@ -252,6 +310,7 @@ def test_pages_apply_a_strict_meta_csp_before_loading_resources() -> None:
         },
         "404.html": {
             "default-src": "'none'",
+            "script-src": "'self'",
             "style-src": "'self'",
             "img-src": "'self'",
             "base-uri": "'self'",
@@ -297,6 +356,9 @@ def test_styles_include_focus_responsive_and_reduced_motion_contracts() -> None:
     assert "overflow-x: auto" in styles
     assert "letter-spacing: 0" in styles
     assert "gradient(" not in styles
+    assert 'Georgia, "Times New Roman", serif' in styles
+    assert "ui-monospace" in styles
+    assert "fonts.googleapis.com" not in styles
 
 
 def _workflow_step_block(workflow: str, name: str) -> list[str]:
