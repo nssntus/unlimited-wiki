@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { CopyIcon, DownloadIcon, EyeIcon, EyeOffIcon, KeyRoundIcon, LogOutIcon, MoonIcon, RefreshCwIcon, SaveIcon, Settings2Icon, SunIcon, Trash2Icon, TriangleAlertIcon } from "lucide-react"
 import { toast } from "sonner"
 
-import { apiGet, apiPost, queryKeys, setCsrfToken, type ModelSettings } from "@/lib/api"
+import { apiGet, apiPost, queryKeys, setCsrfToken, type ModelSettings, type SystemStatus } from "@/lib/api"
 import { useTheme } from "@/components/theme-provider"
 import { StatusBadge } from "@/components/markdown-content"
 import { PageFrame, PageTitle } from "@/components/page-frame"
@@ -18,7 +18,6 @@ import { Spinner } from "@/components/ui/spinner"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { useSession } from "@/features/session-context"
 
-type Status = { configured: boolean; provider: string | null; model: string | null; web_fake_ip_allowed: boolean; network: string; queue: { active: number } }
 type ModelCatalog = { models: string[] }
 type ModelForm = { provider?: string; base_url?: string; api_key?: string; model?: string }
 type RecoveryCodeResponse = { recovery_code: string; expires_in_hours: number }
@@ -35,7 +34,7 @@ export function SettingsPage() {
   const canManageModel = hasPermission("model.manage")
   const canManageWorkspace = hasPermission("workspace.manage")
   const client = useQueryClient()
-  const status = useQuery({ queryKey: queryKeys.status, queryFn: () => apiGet<Status>("/api/status") })
+  const status = useQuery({ queryKey: queryKeys.status, queryFn: () => apiGet<SystemStatus>("/api/status") })
   const settings = useQuery({ queryKey: queryKeys.modelSettings, queryFn: () => apiGet<ModelSettings>("/api/settings/model"), enabled: canManageModel })
   const [form, setForm] = useState<ModelForm>({})
   const [models, setModels] = useState<string[]>([])

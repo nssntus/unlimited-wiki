@@ -56,6 +56,20 @@ def test_worker_claim_can_be_limited_to_user_generation_tasks(kb_root: Path):
     assert state.get_task(governance["id"])["status"] == "queued"
 
 
+def test_task_counts_are_exact_beyond_list_limit(kb_root: Path):
+    state = StateStore(kb_root)
+    for index in range(125):
+        state.enqueue_task("generate", f"queued-{index}", {"path": f"concepts/{index}.md"})
+    running = state.claim_task({"generate"})
+    assert running is not None
+    counts = state.task_counts()
+    assert counts["queued"] == 124
+    assert counts["running"] == 1
+    assert counts["by_kind"]["generate"] == {"queued": 124, "running": 1}
+    assert len(state.list_tasks()) == 100
+    assert StateStore.task_counts_at(kb_root) == counts
+
+
 def test_remote_result_never_overwrites_edited_draft(kb_root: Path):
     gate = threading.Event()
 

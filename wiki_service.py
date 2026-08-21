@@ -228,6 +228,16 @@ class LLMConfig:
         return bool(self.base_url and self.model)
 
 
+REMOTE_TASK_KINDS = {"generate", "supplement", "governance"}
+
+
+class RemoteTaskUnavailable(RuntimeError):
+    def __init__(self, kind: str, reason: str):
+        super().__init__("remote worker is unavailable")
+        self.kind = kind
+        self.reason = reason
+
+
 class WikiService:
     def __init__(
         self,
@@ -236,6 +246,7 @@ class WikiService:
         llm_config: LLMConfig | None = None,
         remote_search: Callable[..., list[dict]] | None = None,
         start_worker: bool = True,
+        remote_tasks_enabled: bool = True,
         remote_task_kinds: set[str] | None = None,
         authorize_actor: Callable[[str], bool] | None = None,
         actor_guard: Callable[[str], object] | None = None,
@@ -252,7 +263,8 @@ class WikiService:
         self._ensure_dynamic_registry()
         self.llm = llm_config or LLMConfig()
         self.remote_search = remote_search or websearch.search_sources
-        self.remote_task_kinds = remote_task_kinds or {"generate", "supplement", "governance"}
+        self.remote_tasks_enabled = remote_tasks_enabled
+        self.remote_task_kinds = REMOTE_TASK_KINDS.copy() if remote_task_kinds is None else set(remote_task_kinds)
         self.authorize_actor = authorize_actor
         self.actor_guard = actor_guard
         self.require_task_actor = require_task_actor
@@ -316,6 +328,38 @@ class WikiService:
         with self._intent_lock:
             self.llm = config
         self._wake.set()
+
+    def remote_task_availability(self, kind: str) -> dict:
+        reason = None
+        if not self.remote_tasks_enabled:
+            reason = "disabled"
+        elif kind not in self.remote_task_kinds:
+            reason = "kind_disabled"
+        return {"kind": kind, "available": reason is None, "reason": reason}
+
+    def require_remote_task(self, kind: str) -> None:
+        availability = self.remote_task_availability(kind)
+        if not availability["available"]:
+            raise RemoteTaskUnavailable(kind, str(availability["reason"]))
+
+    def generation_task_requirement(self, preflight: dict) -> dict:
+        if preflight.get("existing_path"):
+            return {"required": False, "kind": None, "available": True, "reason": None}
+        needs_remote = not preflight["local_coverage"]["sufficient"]
+        required = needs_remote or self.llm.configured
+        kind = "supplement" if needs_remote else "generate"
+        availability = self.remote_task_availability(kind)
+        return {
+            "required": required,
+            "kind": kind if required else None,
+            "available": not required or availability["available"],
+            "reason": availability["reason"] if required else None,
+        }
+
+    def require_generation_task(self, preflight: dict) -> None:
+        requirement = self.generation_task_requirement(preflight)
+        if requirement["required"] and not requirement["available"]:
+            raise RemoteTaskUnavailable(str(requirement["kind"]), str(requirement["reason"]))
 
     def set_request_actor(self, user_id: str | None) -> None:
         self._request_context.actor_user_id = user_id
@@ -717,7 +761,7 @@ class WikiService:
         existing = aliases.resolve(self.root, term)
         excerpts = kw.excerpts_for(self.root, term, extra_needles=[heading] if heading else None)
         evidence = kw.coverage_evidence(excerpts, term)
-        return {
+        result = {
             "keyword": term,
             "existing_path": existing,
             "local_coverage": evidence,
@@ -725,6 +769,8 @@ class WikiService:
             "excerpts": excerpts,
             "plan": "open_existing" if existing else ("local_generate" if evidence["sufficient"] else "local_draft_then_remote_supplement"),
         }
+        result["remote_task"] = self.generation_task_requirement(result)
+        return result
 
     def _draft_markdown(self, term: str, excerpts: list[dict], rel: str, category: str, *, task_id: str | None, evidence_status: str) -> str:
         sources = [item for item in excerpts if not item["path"].startswith("raw/")]
@@ -784,6 +830,7 @@ class WikiService:
         preflight = self.preflight_generate(keyword, from_path=from_path, heading=heading, passage=passage)
         if preflight["existing_path"]:
             return {"created": False, "task": None, "article": self.read_article(preflight["existing_path"]), "preflight": preflight}
+        self.require_generation_task(preflight)
         term = preflight["keyword"]
         registry = dc.load_registry(self.root)
         category_item, selected_tags, created_category = self._plan_taxonomy(registry, category, tags)
@@ -1500,6 +1547,8 @@ class WikiService:
             raise ValueError("invalid title")
         if item["status"] in {"ingested", "duplicate"} and disposition not in {"seed", "duplicate", "defer"}:
             raise ValueError("Raw content has already been recorded")
+        if disposition in {"new", "supplement"} and self.llm.configured:
+            self.require_remote_task("governance")
         raw = self.read_raw(raw_path)
         operation_base = f"ingest-{item['byte_hash'][:20]}-{disposition}"
         operation_id = operation_base
@@ -1694,8 +1743,9 @@ class WikiService:
     def retry_task(self, task_id: str) -> dict:
         with self._intent_lock:
             task = self.state.get_task(task_id)
-            if task["kind"] not in self.remote_task_kinds or task.get("error_type") == "feature_removed":
+            if task.get("error_type") == "feature_removed":
                 raise ValueError("task kind is no longer supported")
+            self.require_remote_task(task["kind"])
             payload = dict(task["payload"])
             if payload.get("path"):
                 payload["base_revision"] = self.read_article(str(payload["path"]))["revision"]
@@ -1710,6 +1760,7 @@ class WikiService:
     def enqueue_governance(self) -> dict:
         if not self.llm.configured:
             raise ValueError("AI governance requires a configured model")
+        self.require_remote_task("governance")
         actionable = {"content_quality", "dead_link", "missing_backlink"}
         paths = sorted({item["path"] for item in wiki_ops.lint_wiki(self.root) if item["kind"] in actionable})
         tasks = []

@@ -554,6 +554,33 @@ def test_readiness_reports_missing_frontend_without_leaking_paths(tmp_path: Path
         app.close()
 
 
+def test_readiness_fails_closed_when_task_queue_cannot_be_inspected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    (tmp_path / "viewer" / "dist").mkdir(parents=True)
+    (tmp_path / "viewer" / "dist" / "index.html").write_text("<!doctype html>", encoding="utf-8")
+    app = create_app(tmp_path, tmp_path / "viewer", start_worker=False)
+    try:
+        assert app.service is not None
+        monkeypatch.setattr(
+            app.service.state,
+            "task_counts",
+            lambda: (_ for _ in ()).throw(serve_module.sqlite3.DatabaseError("corrupt queue")),
+        )
+
+        ready, payload = app.readiness()
+
+        assert ready is False
+        assert payload["status"] == "not_ready"
+        assert payload["checks"]["queue_inspection"] is False
+        assert payload["checks"]["remote_tasks"] is False
+        assert payload["checks"]["platform_review"] is False
+        assert payload["capabilities"]["remote_tasks"]["inspection_error"] is True
+        assert "sqlite" not in json.dumps(payload).lower()
+    finally:
+        app.close()
+
+
 def test_registration_invite_is_email_bound_hashed_and_single_use(tmp_path: Path):
     store = PlatformStore(tmp_path)
     store.register("owner@example.com", "Owner", "correct-horse-123", first_user_only=True)

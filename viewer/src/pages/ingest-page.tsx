@@ -4,7 +4,7 @@ import { useLocation, useNavigate } from "react-router-dom"
 import { FileCheck2Icon } from "lucide-react"
 import { toast } from "sonner"
 
-import { apiGet, apiPost, type ArticleSummary, type PrivateTaxonomy, queryKeys, type RawInboxItem } from "@/lib/api"
+import { apiGet, apiPost, currentSystemStatus, type ArticleSummary, type PrivateTaxonomy, queryKeys, type RawInboxItem, type SystemStatus } from "@/lib/api"
 import { CategoryPicker, TagPicker, type TaxonomySelection } from "@/features/taxonomy-picker"
 import { MarkdownContent, StatusBadge } from "@/components/markdown-content"
 import { PageFrame, PageTitle } from "@/components/page-frame"
@@ -27,6 +27,8 @@ export function IngestPage() {
   const preview = useQuery({ queryKey: ["ingest-preview", path], queryFn: () => apiGet<Preview>(`/api/ingest/preview?path=${encodeURIComponent(path)}`) })
   const articles = useQuery({ queryKey: queryKeys.articles, queryFn: () => apiGet<ArticleSummary[]>("/api/articles") })
   const taxonomy = useQuery({ queryKey: queryKeys.taxonomy, queryFn: () => apiGet<PrivateTaxonomy>("/api/taxonomy") })
+  const status = useQuery({ queryKey: queryKeys.status, queryFn: () => apiGet<SystemStatus>("/api/status") })
+  const system = currentSystemStatus(status)
   const [form, setForm] = useState<{ title?: string; disposition?: string; target?: string }>({})
   const [category, setCategory] = useState<TaxonomySelection>({ kind: "inbox", name: "暂不分类" })
   const [tags, setTags] = useState<TaxonomySelection[]>([])
@@ -61,10 +63,17 @@ export function IngestPage() {
   if (preview.isLoading) return <PageFrame><Skeleton className="mx-auto h-96 max-w-5xl" /></PageFrame>
   if (preview.isError || !preview.data) return <PageFrame><div className="mx-auto max-w-3xl text-sm text-destructive">{preview.error?.message || "无法预览"}</div></PageFrame>
   const data = preview.data
+  const governanceAvailable = Boolean(system?.remote_tasks.enabled && system.remote_tasks.allowed_kinds.includes("governance"))
+  const remoteDisposition = ["new", "supplement"].includes(disposition)
+  const requiresGovernance = Boolean(system?.configured && remoteDisposition)
+  const capabilityUnknown = remoteDisposition && !system
   return <PageFrame><div className="mx-auto max-w-5xl"><PageTitle eyebrow={<StatusBadge value="Raw 摄入预览" kind="warn" />} title={data.suggested_title} description={<code className="break-all">{data.raw.path}</code>} />
     {data.raw.status === "integrity_changed" && <Alert variant="destructive" className="mb-6"><AlertTitle>Raw 完整性已变化</AlertTitle><AlertDescription>请将新版本另存为新文件，不能覆盖已摄入证据。</AlertDescription></Alert>}
+    {status.isLoading && remoteDisposition && <Alert className="mb-6"><AlertTitle>正在确认 AI 治理服务</AlertTitle><AlertDescription>选择种子、重复或暂缓不受影响。</AlertDescription></Alert>}
+    {status.isError && remoteDisposition && <Alert variant="destructive" className="mb-6"><AlertTitle>无法确认 AI 治理服务</AlertTitle><AlertDescription>{status.error.message}<Button className="mt-3" variant="outline" onClick={() => status.refetch()}>重试</Button></AlertDescription></Alert>}
+    {requiresGovernance && !governanceAvailable && <Alert variant="destructive" className="mb-6"><AlertTitle>AI 治理服务未启用</AlertTitle><AlertDescription>选择“采用为 Wiki 种子”、记录重复或暂缓仍可继续；当前处置会创建远端治理任务，因此已被暂停。</AlertDescription></Alert>}
     <div className="grid gap-8 lg:grid-cols-[22rem_minmax(0,1fr)]"><section><FieldGroup><Field><FieldLabel htmlFor="ingest-title">正本标题</FieldLabel><Input id="ingest-title" value={title} onChange={(event) => setForm((current) => ({ ...current, title: event.target.value }))} /></Field><FieldSet><FieldLegend>处置</FieldLegend><RadioGroup value={disposition} onValueChange={(value) => value && setForm((current) => ({ ...current, disposition: value }))}>{[["seed","采用为 Wiki 种子"],["new","新建正本"],["supplement","补充正本"],["duplicate","记录重复"],["defer","暂缓"]].map(([value,label]) => <Field key={value} orientation="horizontal"><RadioGroupItem id={`disp-${value}`} value={value} /><FieldLabel htmlFor={`disp-${value}`}>{label}</FieldLabel></Field>)}</RadioGroup><FieldDescription>{disposition === "seed" ? "完整保留原文结构和内容，不经过 AI 摘要或改写。" : "重复与暂缓不会写 Wiki、index 或 log。"}</FieldDescription></FieldSet>{["seed","new"].includes(disposition) && <><Field><FieldLabel>主分类</FieldLabel><CategoryPicker options={(taxonomy.data?.categories ?? []).map((item) => ({ id: item.id, name: item.name }))} value={category} onChange={setCategory} allowInbox /></Field><Field><FieldLabel>标签</FieldLabel><TagPicker options={(taxonomy.data?.tags ?? []).map((name) => ({ id: name.normalize("NFKC").toLocaleLowerCase(), name }))} value={tags} onChange={setTags} /></Field></>}{["supplement","duplicate"].includes(disposition) && <Field><FieldLabel>目标正本</FieldLabel><Select value={target} onValueChange={(value) => value && setForm((current) => ({ ...current, target: value }))}><SelectTrigger className="w-full"><SelectValue placeholder="选择正本" /></SelectTrigger><SelectContent><SelectGroup>{articles.data?.map((item) => <SelectItem key={item.path} value={item.path}>{item.title}</SelectItem>)}</SelectGroup></SelectContent></Select></Field>}</FieldGroup></section>
       <Tabs defaultValue="content"><TabsList><TabsTrigger value="content">正文预览</TabsTrigger><TabsTrigger value="changes">变更预览</TabsTrigger></TabsList><TabsContent value="content" className="mt-4 max-h-[60svh] overflow-y-auto border-l pl-6"><MarkdownContent markdown={data.markdown} fromPath={data.raw.path} /></TabsContent><TabsContent value="changes" className="mt-4"><ul className="flex flex-col gap-3 text-sm">{data.preview_changes.map((item) => <li key={item} className="border-b pb-3">更新 {item}</li>)}</ul></TabsContent></Tabs>
-    </div><div className="sticky bottom-0 mt-8 flex justify-end gap-2 border-t bg-background/95 py-4 backdrop-blur"><Button variant="outline" onClick={() => navigate("/inbox")}>取消</Button><Button disabled={commit.isPending || data.raw.status === "integrity_changed"} onClick={() => commit.mutate()}>{commit.isPending ? <Spinner data-icon="inline-start" /> : <FileCheck2Icon data-icon="inline-start" />}确认处置</Button></div>
+    </div><div className="sticky bottom-0 mt-8 flex justify-end gap-2 border-t bg-background/95 py-4 backdrop-blur"><Button variant="outline" onClick={() => navigate("/inbox")}>取消</Button><Button disabled={commit.isPending || data.raw.status === "integrity_changed" || capabilityUnknown || (requiresGovernance && !governanceAvailable)} onClick={() => commit.mutate()}>{commit.isPending ? <Spinner data-icon="inline-start" /> : <FileCheck2Icon data-icon="inline-start" />}确认处置</Button></div>
   </div></PageFrame>
 }

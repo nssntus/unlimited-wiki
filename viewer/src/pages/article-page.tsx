@@ -4,7 +4,7 @@ import { Link, useLocation, useNavigate } from "react-router-dom"
 import { Clock3Icon, CopyIcon, EllipsisIcon, ExternalLinkIcon, FilePenLineIcon, FilePlus2Icon, InfoIcon, MergeIcon, RefreshCwIcon, SendIcon, Settings2Icon } from "lucide-react"
 import { toast } from "sonner"
 
-import { apiGet, apiPost, type Article, type ArticleSummary, queryKeys, type Task } from "@/lib/api"
+import { apiGet, apiPost, currentSystemStatus, type Article, type ArticleSummary, queryKeys, type SystemStatus, type Task } from "@/lib/api"
 import { GenerationDialog, type GenerationRequest } from "@/features/generation-dialog"
 import { GovernanceDialog } from "@/features/governance-dialog"
 import { MarkdownContent, StatusBadge } from "@/components/markdown-content"
@@ -32,9 +32,14 @@ function stripMetadata(markdown: string) {
   return markdown.replace(/^#\s+.*\n/, "").replace(/^>\s*(Category|Status|Aliases|Sources|Raw|Updated|Archived|Generation|Evidence):.*\n/gim, "").replace(/^\s+/, "")
 }
 
-function taskPresentation(task: Task | null) {
+function taskAvailable(status: SystemStatus | undefined, task: Task) {
+  return Boolean(status?.remote_tasks.enabled && status.remote_tasks.allowed_kinds.includes(task.kind))
+}
+
+function taskPresentation(task: Task | null, status: SystemStatus | undefined) {
   if (!task) return null
-  if (task.status === "queued" || task.status === "running") return { label: "生成中", kind: "warn" as const }
+  if (task.status === "queued") return { label: !status ? "等待服务状态" : taskAvailable(status, task) ? "排队中" : "生成服务未启用", kind: "warn" as const }
+  if (task.status === "running") return { label: "生成中", kind: "warn" as const }
   if (task.status === "failed") return { label: "生成失败", kind: "bad" as const }
   if (task.status === "cancelled") return { label: "生成已取消", kind: "neutral" as const }
   if (task.result?.conflict === true) return { label: "生成冲突", kind: "warn" as const }
@@ -151,13 +156,18 @@ export function ArticlePage() {
   const client = useQueryClient()
   const path = pathFromLocation(location.pathname)
   const articles = useQuery({ queryKey: queryKeys.articles, queryFn: () => apiGet<ArticleSummary[]>("/api/articles") })
+  const status = useQuery({ queryKey: queryKeys.status, queryFn: () => apiGet<SystemStatus>("/api/status") })
+  const system = currentSystemStatus(status)
   const defaultPath = articles.data?.[0]?.path
   const articlePath = path || defaultPath || ""
   const article = useQuery({
     queryKey: queryKeys.article(articlePath),
     queryFn: () => apiGet<Article>(`/api/article?path=${encodeURIComponent(articlePath)}`),
     enabled: Boolean(articlePath),
-    refetchInterval: (query) => ["queued", "running"].includes(query.state.data?.remote_task?.status || "") ? 1500 : false,
+    refetchInterval: (query) => {
+      const task = query.state.data?.remote_task
+      return task && (task.status === "running" || (task.status === "queued" && taskAvailable(system, task))) ? 1500 : false
+    },
   })
   const keywords = useQuery({ queryKey: ["keywords"], queryFn: () => apiGet<{ term: string; path: string | null; title: string; kind: "page" | "missing" }[]>("/api/keywords") })
   const content = useMemo(() => article.data ? stripMetadata(article.data.markdown) : "", [article.data])
@@ -181,7 +191,7 @@ export function ArticlePage() {
   if (article.isError || !article.data) return <PageFrame><Empty className="min-h-[60svh]"><EmptyHeader><EmptyMedia variant="icon"><FilePenLineIcon /></EmptyMedia><EmptyTitle>找不到这篇词条</EmptyTitle><EmptyDescription>{article.error?.message || articlePath}</EmptyDescription></EmptyHeader><EmptyContent><Button variant="outline" onClick={() => navigate("/")}>返回词库</Button></EmptyContent></Empty></PageFrame>
   const data = article.data
   const updatePromptKey = publicationDismissalKey(data, session?.user?.id, session?.workspace?.id) || data.revision
-  const taskState = taskPresentation(data.remote_task)
+  const taskState = taskPresentation(data.remote_task, system)
   const badges = [
     <StatusBadge key="category" value={data.category_label} />,
     <StatusBadge key="status" value={data.content_status} kind={data.content_status === "词条" ? "good" : data.content_status === "草稿" ? "warn" : "bad"} />,
@@ -200,7 +210,10 @@ export function ArticlePage() {
       <PageFrame aside={<MetadataPanel article={data} />}>
         <article className="mx-auto max-w-[760px]">
           {data.redirected_from && <Alert className="mb-6"><InfoIcon /><AlertTitle>已跳转到正本</AlertTitle><AlertDescription>旧路径 {data.redirected_from} 仍可访问，当前正本为 {data.path}。</AlertDescription></Alert>}
-          {data.remote_task && ["queued", "running"].includes(data.remote_task.status) && <Alert className="mb-6"><InfoIcon /><AlertTitle>词条正在生成</AlertTitle><AlertDescription>当前先展示本地草稿；后台任务完成后，本页会自动刷新为生成结果。</AlertDescription></Alert>}
+          {data.remote_task?.status === "queued" && status.isLoading && <Alert className="mb-6"><InfoIcon /><AlertTitle>正在确认后台服务</AlertTitle><AlertDescription>本地草稿和排队记录已保留。</AlertDescription></Alert>}
+          {data.remote_task?.status === "queued" && status.isError && <Alert className="mb-6" variant="destructive"><InfoIcon /><AlertTitle>无法确认后台服务状态</AlertTitle><AlertDescription>{status.error.message}<Button className="mt-3" variant="outline" onClick={() => status.refetch()}>重试</Button></AlertDescription></Alert>}
+          {data.remote_task?.status === "queued" && system && !taskAvailable(system, data.remote_task) && <Alert className="mb-6"><InfoIcon /><AlertTitle>后台生成服务未启用</AlertTitle><AlertDescription>本地草稿和排队记录已保留，但任务不会自动执行。请联系管理员启用对应 Worker，或前往任务页取消。</AlertDescription></Alert>}
+          {data.remote_task && (data.remote_task.status === "running" || (data.remote_task.status === "queued" && taskAvailable(system, data.remote_task))) && <Alert className="mb-6"><InfoIcon /><AlertTitle>{data.remote_task.status === "queued" ? "词条正在排队" : "词条正在生成"}</AlertTitle><AlertDescription>当前先展示本地草稿；后台任务完成后，本页会自动刷新为生成结果。</AlertDescription></Alert>}
           {data.remote_task?.status === "failed" && <Alert variant="destructive" className="mb-6"><InfoIcon /><AlertTitle>词条生成失败</AlertTitle><AlertDescription>{data.remote_task.error_type || "model_error"} · {data.remote_task.error_message || "请在任务中心重试。"}</AlertDescription></Alert>}
           {data.remote_task?.result?.conflict === true && <Alert className="mb-6"><InfoIcon /><AlertTitle>生成结果未覆盖当前正文</AlertTitle><AlertDescription>生成期间正文发生变化，结果已被冲突保护拦截；请在任务中心基于当前正文重试。</AlertDescription></Alert>}
           {data.publication.state === "update_available" && <Alert className="mb-6"><RefreshCwIcon /><AlertTitle>广场版本需要更新</AlertTitle><AlertDescription className="flex flex-wrap items-center justify-between gap-3"><span>当前私有正文或公开可见信息已更新，广场仍展示版本 {data.publication.public_version}。{canWrite ? "是否提交本次更新重新审核？" : "请联系 Editor 或 Owner 提交更新。"}</span>{canWrite && <Button size="sm" render={<Link to={`/share?article=${encodeURIComponent(data.path)}`} />}>提交广场更新</Button>}</AlertDescription></Alert>}

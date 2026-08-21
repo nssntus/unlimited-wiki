@@ -22,6 +22,7 @@ type Preflight = {
   context: { from_path: string; heading: string; passage: string }
   excerpts: { title: string; path: string; text: string }[]
   plan: string
+  remote_task: { required: boolean; kind: string | null; available: boolean; reason: string | null }
 }
 
 export function GenerationDialog({ request, onOpenChange }: { request: GenerationRequest | null; onOpenChange: (open: boolean) => void }) {
@@ -85,6 +86,12 @@ export function GenerationDialog({ request, onOpenChange }: { request: Generatio
               <AlertTitle>{data.local_coverage.sufficient ? "直接使用本地资料" : "先建本地草稿，再后台补证"}</AlertTitle>
               <AlertDescription>{data.local_coverage.sufficient ? "该路径不会发起网页请求。" : "阅读不会等待网络；超时、证书、无结果和模型错误会分别记录。"}</AlertDescription>
             </Alert>
+            {data.remote_task.required && !data.remote_task.available && (
+              <Alert variant="destructive">
+                <AlertTitle>后台生成服务未启用</AlertTitle>
+                <AlertDescription>当前不会创建永久排队的任务。请联系管理员启用对应 Worker 后再试。</AlertDescription>
+              </Alert>
+            )}
             <section className="flex flex-col gap-3">
               <div><h3 className="text-sm font-medium">分类与标签</h3><p className="mt-1 text-sm text-muted-foreground">可以选择已有项或原地创建；暂不分类会保存到收件箱。</p></div>
               <CategoryPicker options={(taxonomy.data?.categories ?? []).map((item) => ({ id: item.id, name: item.name }))} value={category} onChange={setCategory} allowInbox />
@@ -112,7 +119,7 @@ export function GenerationDialog({ request, onOpenChange }: { request: Generatio
         ) : null}
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>取消</Button>
-          <Button disabled={!data || generate.isPending} onClick={() => generate.mutate()}>
+          <Button disabled={!data || generate.isPending || (data.remote_task.required && !data.remote_task.available)} onClick={() => generate.mutate()}>
             {generate.isPending ? <Spinner data-icon="inline-start" /> : <SparklesIcon data-icon="inline-start" />}
             确认生成
           </Button>

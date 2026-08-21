@@ -2386,6 +2386,41 @@ class PlatformStore(SquareMixin):
             raise ValueError("invalid workspace root")
         return root
 
+    def workspace_root_names(self) -> list[str]:
+        with self.connect() as db:
+            rows = db.execute("SELECT root_name FROM workspaces ORDER BY id").fetchall()
+        return [str(row["root_name"]) for row in rows]
+
+    def active_workspace_roots(self) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute("""
+                SELECT workspace.id,workspace.root_name
+                FROM workspaces workspace
+                JOIN organizations organization ON organization.id=workspace.organization_id
+                WHERE workspace.status='active' AND organization.status='active'
+                ORDER BY workspace.created_at,workspace.id
+            """).fetchall()
+        return [dict(row) for row in rows]
+
+    def submission_queue_counts(self, workspace_id: str | None = None) -> dict:
+        params: tuple[object, ...] = ()
+        workspace_clause = ""
+        if workspace_id is not None:
+            workspace_clause = " AND workspace_id=?"
+            params = (workspace_id,)
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT status,COUNT(*) count FROM submissions "
+                "WHERE status IN ('ai_queued','ai_reviewing')" + workspace_clause +
+                " GROUP BY status",
+                params,
+            ).fetchall()
+        counts = {str(row["status"]): int(row["count"]) for row in rows}
+        return {
+            "queued": counts.get("ai_queued", 0),
+            "running": counts.get("ai_reviewing", 0),
+        }
+
     def migration(self, kind: str) -> dict | None:
         with self.connect() as db:
             row = db.execute("SELECT * FROM migrations WHERE kind=?", (kind,)).fetchone()

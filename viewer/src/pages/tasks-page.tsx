@@ -8,7 +8,7 @@ import {
 } from "lucide-react"
 import { toast } from "sonner"
 
-import { apiGet, apiPost, queryKeys, type Task } from "@/lib/api"
+import { apiGet, apiPost, currentSystemStatus, queryKeys, type SystemStatus, type Task } from "@/lib/api"
 import { StatusBadge } from "@/components/markdown-content"
 import { PageFrame, PageTitle } from "@/components/page-frame"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -42,18 +42,30 @@ function taskHref(task: Task) {
   return typeof task.payload.path === "string" ? `/${task.payload.path}` : null
 }
 
+function isTaskAvailable(status: SystemStatus | undefined, task: Task) {
+  return Boolean(status?.remote_tasks.enabled && status.remote_tasks.allowed_kinds.includes(task.kind))
+}
+
+function taskStatusLabel(task: Task, status: SystemStatus | undefined) {
+  if (task.status === "queued") return !status ? "等待服务状态" : isTaskAvailable(status, task) ? "排队中" : "生成服务未启用"
+  if (task.status === "running") return "生成中"
+  return task.status
+}
+
 const actionableTaskKinds = new Set(["generate", "supplement", "governance"])
 
 export function TasksPage() {
   const { hasPermission } = useSession()
   const canWrite = hasPermission("wiki.write")
   const client = useQueryClient()
+  const status = useQuery({ queryKey: queryKeys.status, queryFn: () => apiGet<SystemStatus>("/api/status") })
+  const system = currentSystemStatus(status)
   const tasks = useQuery({
     queryKey: queryKeys.tasks,
     queryFn: () => apiGet<Task[]>("/api/tasks"),
     refetchInterval: (query) =>
       query.state.data?.some((item) =>
-        ["queued", "running"].includes(item.status)
+        item.status === "running" || (item.status === "queued" && isTaskAvailable(system, item))
       )
         ? 1500
         : false,
@@ -83,13 +95,16 @@ export function TasksPage() {
             <Button
               variant="outline"
               size="sm"
-              onClick={() => void tasks.refetch()}
+              onClick={() => void Promise.all([tasks.refetch(), status.refetch()])}
             >
               <RefreshCwIcon data-icon="inline-start" />
               刷新
             </Button>
           }
         />
+        {status.isLoading ? <Alert className="mb-6"><AlertTitle>正在确认后台服务</AlertTitle><AlertDescription>任务记录仍可查看和取消。</AlertDescription></Alert> : null}
+        {status.isError ? <Alert className="mb-6" variant="destructive"><AlertTitle>无法确认后台服务状态</AlertTitle><AlertDescription>{status.error.message}<Button className="mt-3" variant="outline" onClick={() => status.refetch()}>重试</Button></AlertDescription></Alert> : null}
+        {system?.remote_tasks.blocked_queued ? <Alert className="mb-6"><AlertTitle>后台生成服务未启用</AlertTitle><AlertDescription>已有排队任务会原样保留，但不会自动执行。管理员启用对应 Worker 后，可回到这里刷新或取消任务。</AlertDescription></Alert> : null}
         {tasks.isLoading ? (
           <div className="flex flex-col gap-3">
             <Skeleton className="h-28 w-full" />
@@ -104,7 +119,7 @@ export function TasksPage() {
                     <div className="flex items-center gap-2">
                       <h2 className="font-medium">{task.subject}</h2>
                       <StatusBadge
-                        value={task.status}
+                        value={taskStatusLabel(task, system)}
                         kind={statusKind(task.status)}
                       />
                     </div>
@@ -119,6 +134,7 @@ export function TasksPage() {
                       <Button
                         size="sm"
                         variant="outline"
+                        disabled={!isTaskAvailable(system, task)}
                         onClick={() => action.mutate({ task, action: "retry" })}
                       >
                         <RotateCcwIcon data-icon="inline-start" />

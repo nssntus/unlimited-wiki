@@ -16,6 +16,7 @@ from platform_store import PlatformStore
 from platform_review import PlatformReviewWorker, parse_review_result, project_review_result, review_failure
 from publication import public_markdown, snapshot_fingerprint
 from serve import create_app, create_server
+from state_store import StateStore
 
 
 class Client:
@@ -74,8 +75,159 @@ def multi_server(tmp_path: Path):
         app.close()
 
 
+@pytest.fixture
+def worker_disabled_server(tmp_path: Path):
+    (tmp_path / "viewer" / "dist").mkdir(parents=True)
+    (tmp_path / "viewer" / "dist" / "index.html").write_text("<!doctype html><main id='root'></main>", encoding="utf-8")
+    app = create_app(
+        tmp_path,
+        tmp_path / "viewer",
+        start_worker=False,
+        remote_tasks_enabled=False,
+        multi_user=True,
+    )
+    server = create_server(app, host="127.0.0.1", port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://{server.server_address[0]}:{server.server_address[1]}"
+    try:
+        yield app, base
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        app.close()
+
+
 def context_for(app, client: Client):
     return app.platform.resolve_session(client.cookie.split("=", 1)[1])
+
+
+def test_worker_disabled_rejects_remote_tasks_and_reports_blocked_queues(worker_disabled_server):
+    app, base = worker_disabled_server
+    author = Client(base)
+    assert author.register("disabled@example.com", "Disabled")[0] == 201
+    context = context_for(app, author)
+    service = app.workspace_service(context)
+
+    status, payload = author.request("GET", "/api/status")
+    assert status == 200
+    assert payload["remote_tasks"] == {
+        "enabled": False,
+        "allowed_kinds": ["generate", "governance", "supplement"],
+        "queue": {"queued": 0, "running": 0, "by_kind": {}},
+        "blocked_queued": 0,
+    }
+    assert Client(base).request("GET", "/readyz")[0] == 200
+
+    status, error = author.request("POST", "/api/generate", {"keyword": "Needs remote evidence"}, key="disabled-generate")
+    assert status == 503
+    assert error == {
+        "error": "remote worker is unavailable",
+        "code": "remote_worker_unavailable",
+        "kind": "supplement",
+        "reason": "disabled",
+    }
+    assert service.state.list_tasks() == []
+    with service.state.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM idempotency").fetchone()[0] == 0
+
+    queued, _ = service.state.enqueue_task("supplement", "Blocked", {"path": "concepts/blocked.md"})
+    ready_status, ready = Client(base).request("GET", "/readyz")
+    assert ready_status == 503
+    assert ready["capabilities"]["remote_tasks"]["blocked_queued"] == 1
+    assert author.request("POST", f"/api/tasks/{queued['id']}/cancel", {}, key="cancel-blocked")[0] == 200
+    assert Client(base).request("GET", "/readyz")[0] == 200
+
+    article_path, revision = seed_article(app, author, "Disabled review")
+    preview = author.request("POST", "/api/share-previews", {
+        "article_path": article_path,
+        "source_revision": revision,
+        "attribution": "nickname",
+        **public_taxonomy_payload(app),
+    }, key="disabled-preview")[1]
+    submit_status, submit_error = author.request(
+        "POST", "/api/submissions", {"preview_id": preview["preview_id"]}, key="disabled-submit",
+    )
+    assert submit_status == 503
+    assert submit_error["code"] == "remote_worker_unavailable"
+    assert submit_error["kind"] == "platform_review"
+    with app.platform.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM submissions").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM share_previews WHERE id=?", (preview["preview_id"],)).fetchone()[0] == 1
+
+    direct = app.platform.submit_preview(context, preview["preview_id"])
+    ready_status, ready = Client(base).request("GET", "/readyz")
+    assert ready_status == 503
+    assert ready["capabilities"]["platform_review"]["blocked_queued"] == 1
+    app.platform.ai_decide(direct["id"], "failed", {"summary": "test cleanup"})
+    retry_status, retry_error = author.request(
+        "POST", f"/api/submissions/{direct['id']}/ai-retry", {}, key="disabled-ai-retry",
+    )
+    assert retry_status == 503 and retry_error["code"] == "remote_worker_unavailable"
+    assert app.platform.get_submission(context, direct["id"])["status"] == "ai_failed"
+    assert Client(base).request("GET", "/readyz")[0] == 200
+
+
+def test_enabling_worker_after_restart_consumes_unvisited_workspace_queue(tmp_path: Path):
+    viewer = tmp_path / "viewer"
+    (viewer / "dist").mkdir(parents=True)
+    (viewer / "dist" / "index.html").write_text("<!doctype html>", encoding="utf-8")
+    disabled = create_app(
+        tmp_path, viewer, start_worker=False, remote_tasks_enabled=False, multi_user=True,
+    )
+    user, _recovery = disabled.platform.register(
+        "restart-worker@example.com", "Restart worker", "correct-horse-123", first_user_only=True,
+    )
+    with disabled.platform.connect() as db:
+        workspace = db.execute(
+            "SELECT workspace.id,workspace.root_name FROM workspace_members member "
+            "JOIN workspaces workspace ON workspace.id=member.workspace_id "
+            "WHERE member.user_id=? AND member.status='active'",
+            (user["id"],),
+        ).fetchone()
+    state = StateStore(disabled.platform.workspace_root(workspace["root_name"]))
+    task, _created = state.enqueue_task(
+        "generate",
+        "Historical queued task",
+        {
+            "path": "concepts/missing.md",
+            "keyword": "Missing",
+            "category": "_inbox",
+            "needs_web": False,
+            "needs_llm": False,
+        },
+        actor_user_id=user["id"],
+    )
+    disabled.close()
+
+    observer = create_app(
+        tmp_path, viewer, start_worker=False, remote_tasks_enabled=True, multi_user=True,
+    )
+    try:
+        ready, payload = observer.readiness()
+        assert ready is False
+        assert payload["capabilities"]["remote_tasks"]["blocked_queued"] == 1
+    finally:
+        observer.close()
+
+    enabled = create_app(
+        tmp_path, viewer, start_worker=True, remote_tasks_enabled=True, multi_user=True,
+    )
+    try:
+        assert workspace["id"] in enabled._services
+        deadline = time.monotonic() + 5
+        current = state.get_task(task["id"])
+        while current["status"] in {"queued", "running"} and time.monotonic() < deadline:
+            time.sleep(0.02)
+            current = state.get_task(task["id"])
+        assert current["status"] == "failed"
+        assert current["attempts"] == 1
+        ready, payload = enabled.readiness()
+        assert ready is True
+        assert payload["capabilities"]["remote_tasks"]["blocked_queued"] == 0
+    finally:
+        enabled.close()
 
 
 def public_taxonomy_payload(app) -> dict:
